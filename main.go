@@ -49,8 +49,11 @@ func main() {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		log.Printf("model-router %s listening on %s -> %s (model %q, timeout %s)",
-			version.Get(), cfg.Listen, cfg.Backend.BaseURL, cfg.Backend.Model, cfg.Backend.Timeout.Duration())
+		log.Printf("model-router %s listening on %s with %d backend(s)", version.Get(), cfg.Listen, len(cfg.Backends))
+		for _, b := range cfg.Backends {
+			log.Printf("backend: protocol=%s base_url=%s model=%q timeout=%s",
+				b.Protocol, b.BaseURL, b.Model, b.Timeout.Duration())
+		}
 		serveErr <- server.ListenAndServe()
 	}()
 

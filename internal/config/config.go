@@ -16,9 +16,33 @@ import (
 const (
 	// DefaultListen is used when the config file omits listen.
 	DefaultListen = "127.0.0.1:8080"
-	// DefaultTimeout is the upstream timeout when the config file omits backend.timeout.
+	// DefaultTimeout is the upstream timeout when a backend omits timeout.
 	DefaultTimeout = 15 * time.Second
+
+	// ProtocolOpenAI marks a backend that speaks the OpenAI protocol.
+	ProtocolOpenAI = "openai"
+	// ProtocolAnthropic marks a backend that speaks the Anthropic protocol.
+	ProtocolAnthropic = "anthropic"
 )
+
+// Model roles a backend can claim via backends[].roles.
+const (
+	RoleSonnet   = "sonnet"
+	RoleOpus     = "opus"
+	RoleFable    = "fable"
+	RoleHaiku    = "haiku"
+	RoleWildcard = "*"
+)
+
+// IsValidRole reports whether role is one of the supported role values.
+// Callers must pass a normalized (trimmed, lowercased) value.
+func IsValidRole(role string) bool {
+	switch role {
+	case RoleSonnet, RoleOpus, RoleFable, RoleHaiku, RoleWildcard:
+		return true
+	}
+	return false
+}
 
 // Duration is a time.Duration that is written as a string such as "15s" in JSON.
 type Duration time.Duration
@@ -56,15 +80,21 @@ type Config struct {
 	Listen string `json:"listen"`
 	// AuthToken is the Bearer token clients must present to use this proxy.
 	// It is never forwarded upstream.
-	AuthToken string  `json:"auth_token"`
-	Backend   Backend `json:"backend"`
+	AuthToken string `json:"auth_token"`
+	// Backends is ordered; order within a protocol is the routing priority.
+	Backends []Backend `json:"backends"`
 }
 
-// Backend describes the single upstream model backend served in M1.
+// Backend describes one upstream model backend.
 type Backend struct {
-	BaseURL string   `json:"base_url"`
-	APIKey  string   `json:"api_key"`
-	Model   string   `json:"model"`
+	Protocol string   `json:"protocol"`
+	BaseURL  string   `json:"base_url"`
+	APIKey   string   `json:"api_key"`
+	Model    string   `json:"model"`
+	// Matches lists client-facing model aliases that route to this backend.
+	Matches []string `json:"matches"`
+	// Roles lists model roles (sonnet/opus/fable/haiku/*) this backend serves.
+	Roles   []string `json:"roles"`
 	Timeout Duration `json:"timeout"`
 }
 
@@ -101,18 +131,68 @@ func (c *Config) applyDefaults() error {
 		return errors.New("auth_token is required")
 	}
 
-	c.Backend.APIKey = strings.TrimSpace(c.Backend.APIKey)
-	if c.Backend.APIKey == "" {
-		return errors.New("backend.api_key is required")
+	if len(c.Backends) == 0 {
+		return errors.New("backends must contain at least one backend")
+	}
+	for i := range c.Backends {
+		if err := c.Backends[i].applyDefaults(); err != nil {
+			return fmt.Errorf("backends[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func (b *Backend) applyDefaults() error {
+	b.Protocol = strings.ToLower(strings.TrimSpace(b.Protocol))
+	switch b.Protocol {
+	case ProtocolOpenAI, ProtocolAnthropic:
+	default:
+		return fmt.Errorf("protocol must be %q or %q, got %q", ProtocolOpenAI, ProtocolAnthropic, b.Protocol)
 	}
 
-	c.Backend.BaseURL = strings.TrimRight(strings.TrimSpace(c.Backend.BaseURL), "/")
-	if c.Backend.BaseURL == "" {
-		return errors.New("backend.base_url is required")
+	b.APIKey = strings.TrimSpace(b.APIKey)
+	if b.APIKey == "" {
+		return errors.New("api_key is required")
 	}
-	u, err := url.Parse(c.Backend.BaseURL)
+
+	b.Model = strings.TrimSpace(b.Model)
+	if b.Model == "" {
+		return errors.New("model is required")
+	}
+
+	matches := make([]string, 0, len(b.Matches))
+	for _, alias := range b.Matches {
+		if alias = strings.TrimSpace(alias); alias != "" {
+			matches = append(matches, alias)
+		}
+	}
+	if len(matches) == 0 {
+		b.Matches = nil
+	} else {
+		b.Matches = matches
+	}
+
+	roles := make([]string, 0, len(b.Roles))
+	for _, raw := range b.Roles {
+		role := strings.ToLower(strings.TrimSpace(raw))
+		if !IsValidRole(role) {
+			return fmt.Errorf("invalid role %q: must be one of sonnet, opus, fable, haiku, *", raw)
+		}
+		roles = append(roles, role)
+	}
+	if len(roles) == 0 {
+		b.Roles = nil
+	} else {
+		b.Roles = roles
+	}
+
+	b.BaseURL = strings.TrimRight(strings.TrimSpace(b.BaseURL), "/")
+	if b.BaseURL == "" {
+		return errors.New("base_url is required")
+	}
+	u, err := url.Parse(b.BaseURL)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return fmt.Errorf("backend.base_url must be an absolute http(s) URL, got %q", c.Backend.BaseURL)
+		return fmt.Errorf("base_url must be an absolute http(s) URL, got %q", b.BaseURL)
 	}
 	return nil
 }
