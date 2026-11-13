@@ -86,11 +86,10 @@
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | M1 | 项目骨架 + 单模型透传壳子（OpenAI 协议）+ 服务访问认证（FR-4）+ 静态配置 + 构建脚本（先 windows amd64） | 已完成 |
-| M2 | 增加 Anthropic 协议入口 + 多模型列表与排序 | 进行中 |
-| M3 | 模型自动查询/选择（`/v1/models`） | 未开始 |
+| M2 | 增加 Anthropic 协议入口 + 多模型列表与排序（含 matches/roles 模型映射） | 已完成 |
+| M3 | 模型自动查询/选择（`/v1/models`）+ Web 配置页面 | 未开始 |
 | M4 | 回退/降级机制（FR-3 完整实现） | 未开始 |
-| M5 | Web 配置页面 | 未开始 |
-| M6 | 跨平台构建（GitHub Actions）+ Docker（amd64/arm64） | 未开始 |
+| M5 | 跨平台构建（GitHub Actions）+ Docker（amd64/arm64） | 未开始 |
 
 ## 7. M2 增量规格
 
@@ -246,3 +245,289 @@ OpenAI 入口映射保持 M1 不变（401 `invalid_request_error` + `missing_api
 - 不处理（可后续扩展）：`best`（等同 opus）、`sonnet[1m]` / `opus[1m]` 后缀、`opusplan` 特殊模式；这些 `model` 值未命中时按 R5 回退 L[0]。
 
 > 说明：`roles` 与 `matches` 是两种表达方式——`matches` 写精确别名（如 `claude-sonnet-4-5`），`roles` 写角色语义（自动覆盖所有 `claude-sonnet-*` 版本）。二者可同时使用，判断顺序保证显式别名优先。
+
+## 8. M3 增量规格（模型自动查询/选择 + Web 配置页）
+
+> 本节由产品经理（主代理）在 M3 启动前规格化，是 M3 派发与验收的需求依据。
+> 用户已拍板三项决策：① 配置生效 = 保存文件 + 重载按钮（进程内重读，不重启）；② 管理页认证 = 独立管理员账号密码（与 auth_token 分离）；③ `/v1/models` = 只列配置声明的模型，不真正调上游。
+
+### 8.1 配置结构新增（管理账号）
+
+`Config` 新增两个顶层字段：
+
+```json
+{
+  "listen": "127.0.0.1:18080",
+  "auth_token": "...",
+  "admin_user": "admin",
+  "admin_password": "...",
+  "backends": ["..."]
+}
+```
+
+- `admin_user`：管理员登录名，可选，默认 `admin`。
+- `admin_password`：管理员密码，可选；**非空则启用 Web 管理页并强制认证，空则管理页禁用**（`/admin` 与 `/api/*` 返回 404，不暴露管理面）。
+- 校验：`admin_user` 省略置为 `admin`；`admin_password` 仅 trim 空格，不设长度下限。
+- 向后兼容：现有仅含 `listen`/`auth_token`/`backends` 的配置，缺省 `admin_password` 时管理页禁用、模型入口照常工作，**不启动失败**。
+
+### 8.2 `/v1/models` 端点
+
+- 路径 `GET /v1/models`，按入口协议返回对应标准格式（**本地生成，不转发上游**）：
+  - OpenAI 入口（认证 `Authorization: Bearer <auth_token>`）→ `{"object":"list","data":[{"id":<model>,"object":"model","created":<unix秒>,"owned_by":"model-router"}]}`
+  - Anthropic 入口（认证 `x-api-key: <auth_token>`）→ `{"data":[{"id":<model>,"type":"model","display_name":<model>,"created_at":"<RFC3339>"}],"has_more":false,"first_id":<首项id>,"last_id":<末项id>}`
+- 模型清单（按入口协议过滤 backend 后聚合）：对每个匹配协议的 backend 依次收集 ① `backend.model` ② `matches` 每项 ③ `roles` 中具体角色（`sonnet`/`opus`/`fable`/`haiku`，**不含 `*`**）；按出现顺序去重。
+- 认证失败：返回对应协议格式的 401（复用现有错误体逻辑，格式由入口路径决定）。
+- 方法限定 `GET`；其他方法（POST 等）→ 405。
+- 不调用上游 `/v1/models`（用户拍板）。
+
+### 8.3 Web 配置页（`/admin`）
+
+- 内嵌静态页面（`go:embed`），纯 Go 无 cgo，**不依赖外部 CDN**（离线可用）。
+- `GET /admin`（或 `/admin/`）→ 返回管理页 HTML；页面用原生 HTML+JS（fetch），不引入前端构建工具链。
+- 页面功能：
+  1. 展示当前生效配置：`listen`、`auth_token`、`admin_user`、`admin_password`、`backends` 数组（每项 protocol/base_url/api_key/model/timeout/matches/roles）。
+  2. 编辑配置：增/删/改 backend，编辑 auth_token 与 admin 账号密码。
+  3. 「保存」→ `PUT /api/config` 写回文件（不生效）。
+  4. 「重载」→ `POST /api/reload` 重读文件并生效。
+- 页面静态资源（HTML/JS/CSS）由 Claude Code 编写，随二进制内嵌。
+
+### 8.4 管理 REST API
+
+- 全部走 **HTTP Basic Auth**（`admin_user`:`admin_password`），失败返回 401 + `WWW-Authenticate: Basic realm="model-router"`；`admin_password` 为空时这些路径 404。
+- `GET /api/config` → 返回**当前生效**配置的完整 JSON（含真实 `api_key`/`auth_token`，已认证管理员可见，用于编辑回填）。
+- `PUT /api/config` → 接收完整新配置 JSON，**校验通过后写回**启动时 `-config` 指定的文件（原子写：临时文件 + rename），**不触发生效**；校验失败返回 400 + 错误信息，不写文件。
+- `POST /api/reload` → 重读 `-config` 指定文件，校验通过则**原子切换**到新配置（重建 handler），返回成功；失败返回 400/500，保持旧配置不变。
+
+### 8.5 重载机制
+
+- 进程启动时记住 `-config` 文件路径；`reload` 针对该路径重读。
+- 并发安全：当前生效的 handler/config 用原子机制（如 `atomic.Value`/`sync.RWMutex`）持有；reload 时整体替换，在途请求继续用旧 handler 完成，新请求走新 handler，进程不重启。
+- reload 失败（文件不存在/解析错误/校验失败）：返回错误，**不改变**当前生效配置。
+- 配置序列化：`Duration` 需能序列化回 `"15s"` 字符串（当前仅实现反序列化，需补 `MarshalJSON`），保证 `PUT /api/config` 写回的文件可被再次 `Load`。
+
+### 8.6 路由与认证优先级
+
+按路径分派，再各自认证（保持「认证优先于路由」）：
+
+| 路径 | 认证 | 处理 |
+|---|---|---|
+| `/admin`、`/admin/...` | admin Basic Auth | 静态页面/资源 |
+| `/api/config`、`/api/reload` | admin Basic Auth | 管理 REST API |
+| `/v1/chat/completions` | OpenAI Bearer auth_token | 现有转发 |
+| `/v1/messages` | Anthropic x-api-key auth_token | 现有转发 |
+| `/v1/models` | 按入口协议认证 | 本地生成模型列表 |
+| 其他 | — | 404（统一 OpenAI 格式，保持 B1） |
+
+- `admin_password` 为空时：`/admin*`、`/api/*` 一律 404（管理面禁用）。
+- admin 路径先判 Basic Auth；模型路径按协议判 token。
+
+### 8.7 明确不做（M3 边界）
+
+- 不调用上游 `/v1/models` 自动发现（用户拍板，仅列配置声明模型）。
+- 不自动监控文件变化热加载（仅手动 reload）。
+- 不做 session/cookie 登录（M3 用 Basic Auth）。
+- 不做协议转换。
+- 不实现回退降级（FR-3，M4）。
+- 不实现跨平台 CI/Docker（M5）。
+
+### 8.8 验收标准
+
+- `go build`/`go vet`/`go test` 退出码 0。
+- 单测覆盖：`/v1/models` 双协议格式与过滤去重、admin Basic Auth 401、`PUT /api/config` 校验与写回、`POST /api/reload` 成功/失败切换、`Duration` 序列化往返。
+- 端到端（主代理补）：真实配置下 `GET /v1/models` 返回配置声明模型；PUT 改配置 → reload 生效；admin 认证失败 401；无 `admin_password` 时 `/admin` `/api` 404。
+- `config.example.json` 补 `admin_user`/`admin_password` 示例；README/CHANGELOG/design/tests 同步。
+- `-version` 仍 `0.0.1-rc`。
+- 环境变量覆盖：设置 `MODEL_ROUTER_AUTH_TOKEN` 等变量后启动/reload，生效值以环境变量为准。
+
+### 8.9 环境变量覆盖（`listen`/`auth_token`/`admin_user`/`admin_password`，M3 之后增量）
+
+> 本节为 M3 收尾后的增量需求（用户 m00734 提出，为 Docker 部署准备），**不属当前 M3 任务范围**，待 M3 验收后另行派发。
+
+为方便 Docker 部署（NFR-2），四个顶层标量字段支持用环境变量覆盖配置文件值：
+
+| 字段 | 环境变量 | 说明 |
+|---|---|---|
+| `listen` | `MODEL_ROUTER_LISTEN` | 监听地址 |
+| `auth_token` | `MODEL_ROUTER_AUTH_TOKEN` | 客户端访问 token |
+| `admin_user` | `MODEL_ROUTER_ADMIN_USER` | 管理员登录名 |
+| `admin_password` | `MODEL_ROUTER_ADMIN_PASSWORD` | 管理员密码 |
+
+- **优先级**：环境变量 > 配置文件；环境变量**非空**才覆盖（未设置或空值 = 忽略，沿用配置文件值）。
+- **应用时机**：在 JSON 解析之后、应用默认值与校验（`applyDefaults`）**之前**统一覆盖，使环境变量值参与后续 trim / 必填校验 / 默认值逻辑；`POST /api/reload` 重读同样遵守。
+- **fail-closed 不变**：覆盖后仍执行现有必填校验（`auth_token` 最终为空 → 启动/reload 失败）；`backends` 数组不支持环境变量，仍必须写在配置文件。
+- **只覆盖不写回**：环境变量只影响内存中的生效配置，不修改 `-config` 文件本身；`GET /api/config` 返回覆盖后的生效值。
+- 覆盖值同样经 trim 空格处理（沿用 `applyDefaults`）。
+
+## 9. 配置页可视化升级（M3.1：实例化配置结构 + 引导式 UI + 连接测试/模型查询）
+
+> 本节由产品经理（主代理）规格化，是 M3 配置页升级的派发与验收依据。
+> 用户需求（m00958 + m00963 问答 + m00978）：
+> ① 配置页按 openai/anthropic 分两个 tab，添加提供商（base_url/api_key）后可测试连接、查询上游模型（成功后列模型列表），openai 勾选/输入多个模型，anthropic 按 4 角色 + 托底选择/输入模型，保留 JSON 高级编辑。
+> ② 用户拍板「实例」语义：添加提供商 = 新增一个实例（同一供应商可用不同 api_key 建多个实例），每个实例有各自映射，回退降级以实例为粒度。
+> ③ JSON 编辑后需校验，校验通过才能保存。
+
+### 9.1 配置结构演进：`backends` → `instances`
+
+`Config` 顶层废弃 `backends []Backend`，改为 `instances []Instance`。一个 `Instance` = 一个「提供商实例」（协议 + base_url + api_key + timeout），承载一组模型映射。
+
+```json
+{
+  "listen": "127.0.0.1:18080",
+  "auth_token": "...",
+  "admin_user": "admin",
+  "admin_password": "...",
+  "instances": [
+    {
+      "protocol": "openai",
+      "base_url": "https://api.deepseek.com",
+      "api_key": "sk-...",
+      "timeout": "15s",
+      "models": ["deepseek-v4-flash", "deepseek-v4-pro"]
+    },
+    {
+      "protocol": "anthropic",
+      "base_url": "https://api.deepseek.com/anthropic",
+      "api_key": "sk-...",
+      "timeout": "15s",
+      "roles": {
+        "sonnet": "deepseek-v4-flash",
+        "opus": "deepseek-v4-pro",
+        "fable": "deepseek-v4-pro",
+        "haiku": "deepseek-v4-flash",
+        "*": "deepseek-v4-flash"
+      }
+    }
+  ]
+}
+```
+
+字段与校验：
+- `protocol`（必填）：`openai` / `anthropic`，小写归一化。
+- `base_url`（必填）：去尾部斜杠，绝对 http(s) URL（沿用 §7 校验）。
+- `api_key`（必填）：非空。
+- `timeout`（可选）：默认 15s（沿用 Duration 语义）。
+- `models`（**openai 实例专用**）：字符串数组，至少 1 项，去空去重、保留顺序；该实例对外提供的模型（精确匹配）。
+- `roles`（**anthropic 实例专用**）：对象，键 ∈ {`sonnet`,`opus`,`fable`,`haiku`,`*`}，值为实际模型名（非空），至少 1 项；角色→模型映射。
+- 互斥：`openai` 实例必须 `models` 且不得有 `roles`；`anthropic` 实例必须 `roles` 且不得有 `models`。违反 → 启动/校验失败。
+- 废弃字段：`Backend.model`（由 `models` / `roles` 值取代）、`Backend.matches`（由 `roles` 的 `claude-<role>-` 前缀覆盖，见 §7.8）、`Backend.roles` 数组（由 `Instance.roles` 对象取代）。旧 `backends` 字段不再识别，出现即解析失败（实现方可给出「请迁移到 instances」的友好报错）。
+
+### 9.2 路由语义（实例展开）
+
+运行时把 `instances` 展开成扁平「路由条目」，保持 §7 的匹配顺序与改写规则：
+
+- **展开**：按 `instances` 顺序、实例内声明顺序展开。
+  - openai 实例 `models` 每项 → 条目 `{protocol=openai, base_url, api_key, model=<项>}`；
+  - anthropic 实例 `roles` 每个键值 → 条目 `{protocol=anthropic, base_url, api_key, model=<值>, role=<键>}`。
+- **精确匹配 R4a**：请求 `model` 精确命中任一条目的 `model`（openai 的 models 项，或 anthropic 的 roles 值）→ 转发到该条目，**不改写**。
+- **角色匹配 R4c**：请求 `model` 精确等于角色名（`sonnet`/`opus`/`fable`/`haiku`）或以 `claude-<role>-` 开头 → 命中声明该角色的 anthropic 条目（`role` 匹配）→ 转发并**改写** body 顶层 `model` = 条目 `model`。
+- **托底 R4d**：请求 `model` 是合法字符串、未命中任何精确/角色，且存在声明 `role="*"` 的条目 → 命中第一个 → 转发并**改写** = 该条目 `model`。
+- **回退 R5**：都未命中 → 转发到展开后首条目，**不改写**。
+- 判定顺序（对展开后条目逐个）：R4a → R4c → R4d；显式精确优先于角色，具体角色优先于托底。冲突（多实例声明同一角色/`*`）→ 按实例顺序取第一个（同 B6）。
+- 无对应协议实例 → 502（同 §7.2）；`instances` 为空 → 启动失败（fail-closed）。
+
+### 9.3 Web 配置页（可视化 + JSON 高级编辑）
+
+在 §8.3 基础上重做前端，两种模式共存：
+
+**可视化模式（默认）**：
+- 两个 tab：**OpenAI** / **Anthropic**，各自管理该协议的实例列表。
+- 「添加实例」表单：`base_url`、`api_key`、`timeout`（可选）。添加后生成实例卡片。
+- 实例卡片操作：
+  - 「测试连接」→ `POST /api/probe/test`（见 9.4），展示连通结果（延迟/错误）。
+  - 「查询模型」→ `POST /api/probe/models`（见 9.4），成功后列出上游模型清单供选择；失败提示「该上游不支持模型列表查询，请手动输入」。
+  - OpenAI 实例：模型清单勾选（可多选）或手动输入模型名，生成 `models`。
+  - Anthropic 实例：4 个角色（sonnet/opus/fable/haiku）+ 托底（*），每个从模型清单选择或手动输入，生成 `roles`。
+- 「保存」→ 序列化为 `instances` 配置 → `PUT /api/config`；「重载」→ `POST /api/reload`。
+
+**JSON 高级模式（保留）**：
+- 一个 JSON 编辑框（回填当前生效配置）。
+- 「校验」→ `POST /api/config/validate`（见 9.4，dry-run，不保存），通过才启用「保存」。
+- 「保存」→ `PUT /api/config`（后端仍会再校验）。
+
+### 9.4 管理 REST API 新增
+
+全部走 admin Basic Auth（同 §8.4），`admin_password` 空则 404。
+
+- `POST /api/probe/test`：body `{protocol, base_url, api_key, timeout?}` → 探测上游连通性，**按协议区分探测端点**：
+  - `openai`：`GET {base_url}/v1/models`（`Authorization: Bearer`）。
+  - `anthropic`：`POST {base_url}/v1/messages` 最小请求（`{"model":"ping","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}`，`x-api-key` + `anthropic-version: 2023-06-01`）。原因：部分 Anthropic 兼容上游（如 DeepSeek）**未实现 `/v1/models`**，用真实存在的 messages 端点探测更可靠。
+  - 判定：网络错误/超时 → `ok:false`（不可达）；`401`/`403` → `ok:false`（api_key 无效）；`404` → `ok:false`（base_url 路径无效）；其余 HTTP 响应（`2xx`/`400`/`422`/`429`）→ `ok:true`（`400`/`422` 表示认证通过、端点存在，仅探测占位 model 无效，属预期）。返回 `{ok, latency_ms, message}`。不修改配置、不缓存。
+- `POST /api/probe/models`：body `{protocol, base_url, api_key, timeout?}` → 调上游模型列表 `GET {base_url}/v1/models`（openai `Authorization: Bearer` / anthropic `x-api-key` + `anthropic-version: 2023-06-01`），解析 `data[].id` → 返回 `{models: [...]}`；上游不支持（404/无 data，DeepSeek anthropic 入口即属此类）→ 返回明确错误，前端引导手动输入。
+- `POST /api/config/validate`：body 完整配置 JSON → 走 `Parse` 全量校验（含 fail-closed、instances 结构、互斥、环境变量覆盖语义），**不写回、不生效** → 通过返回 200 `{ok:true}`，失败返回 400 `{ok:false, error}`。
+
+### 9.5 边界（明确不做）
+
+- 不实现回退降级 FR-3（M4；但 `instances` 结构已为其铺垫「实例粒度回退」）。
+- probe 不持久化、不缓存结果；不做自动连接健康检查（M4）。
+- 不做 session/cookie 登录（仍 Basic Auth）。
+- 不做协议转换；不做跨平台 CI/Docker（M5）。
+- `/v1/models` 对外入口仍只列配置声明模型、不调上游（§8.2 不变；probe 是管理面独立能力）。
+
+### 9.6 验收标准
+
+- `go build`/`go vet`/`go test` 退出码 0。
+- 单测：`instances` 解析与校验（互斥、必填、roles 键合法性、models 去空去重）；实例展开路由（精确/角色/托底/回退/502）；`/api/probe/test`、`/api/probe/models`（httptest mock 上游）；`/api/config/validate`（通过/失败）；旧 `backends` 字段报错。
+- 端到端（主代理补）：真实配置下可视化流程（添加实例→probe→保存→reload→路由验证）；JSON 校验通过才可保存；`config.local.json` / `config.example.json` 迁移为 `instances` 结构且路由行为不变。
+- `config.example.json` 改为 `instances` 结构示例；README/CHANGELOG/design/tests 同步；`-version` 仍 `0.0.1-rc`。
+- 迁移：`config.local.json`（5 个后端）→ 2 个实例（1 openai + 1 anthropic），角色映射与托底行为与迁移前一致。
+
+## §10 供应商预设（Provider Presets）
+
+### 10.1 目标
+
+「增加实例」改为两步：先弹「选择供应商」框（内置供应商或「自定义」）。内置供应商为**纯数据预设**，用通用 `models_override` 机制解决「部分供应商的 Anthropic 兼容入口未实现 `/v1/models`」的问题（如 DeepSeek），不做 hardcode 特判。
+
+### 10.2 内置供应商清单
+
+内置 11 个供应商（数据，可后续增改）。`base_url` 为公开文档常见值，DeepSeek 已实测确认：
+
+| id | name | openai_base_url | anthropic_base_url | models_override |
+|---|---|---|---|---|
+| deepseek | DeepSeek | https://api.deepseek.com | https://api.deepseek.com/anthropic | anthropic → {base_url: https://api.deepseek.com, auth: bearer} |
+| openai | OpenAI | https://api.openai.com/v1 | — | — |
+| anthropic | Anthropic | — | https://api.anthropic.com | — |
+| zhipu | 智谱 GLM | https://open.bigmodel.cn/api/paas/v4 | https://open.bigmodel.cn/api/anthropic | — |
+| volcengine | 火山方舟(豆包) | https://ark.cn-beijing.volces.com/api/v3 | https://ark.cn-beijing.volces.com/api/anthropic | — |
+| moonshot | 月之暗面 Kimi | https://api.moonshot.cn/v1 | https://api.moonshot.cn/anthropic | — |
+| dashscope | 通义千问 | https://dashscope.aliyuncs.com/compatible-mode/v1 | — | — |
+| siliconflow | 硅基流动 | https://api.siliconflow.cn/v1 | — | — |
+| groq | Groq | https://api.groq.com/openai/v1 | — | — |
+| mistral | Mistral | https://api.mistral.ai/v1 | — | — |
+| xai | xAI Grok | https://api.x.ai/v1 | — | — |
+
+- `models_override` 语义：声明「某协议实例拉取模型列表时，改从哪个 base_url + 认证方式拉」。目前仅 DeepSeek 需要（其 anthropic 入口无 `/v1/models`，模型列表从 openai 入口 `GET /v1/models` 拉，`auth=bearer`）。其他供应商若后续发现同类问题，仅在数据里补一条 override，不改逻辑。
+- 「自定义」不是供应商，是选择框里的独立入口（`provider` 留空）。
+
+### 10.3 数据结构与校验
+
+- 新包 `internal/providers`：内置供应商清单（硬编码数据）+ 查询 `List()` / `Get(id)`；通过 `GET /api/providers` 暴露（admin Basic Auth，`admin_password` 空则 404）。
+- `Instance` 新增可选字段 `provider`（内置供应商 id，字符串，空=自定义）。
+  - 校验：非空时必须是已知内置供应商 id，否则启动失败（fail-closed）；空=自定义，合法。
+  - `provider` 仅作「来源标记 + models_override 判定」，不影响路由/转发（转发仍用实例自己的 `base_url`/`api_key`）。
+
+### 10.4 probe/models 的 override
+
+- `POST /api/probe/models` body 新增可选 `provider` 字段。
+- 拉模型列表时：若 `provider` 非空、该供应商对该 `protocol` 声明了 `models_override` → 用 `override.base_url` 发起 `GET /v1/models`，认证按 `override.auth`（`bearer` → `Authorization: Bearer <api_key>`；`x-api-key` → `x-api-key` + `anthropic-version`）；否则按现有逻辑（`base_url` + `protocol` 认证）。
+- `POST /api/probe/test` 不变（仍按协议区分探测端点，不涉及 provider）。
+
+### 10.5 UI 交互
+
+- 「增加实例」→ 先弹「选择供应商」框：列内置供应商（name + 支持的协议）+「自定义」。
+- 选内置供应商 → 按当前 tab 的 protocol 自动填该供应商对应协议的 `base_url`，实例记 `provider`；若该协议无对应 base_url（如 Anthropic tab 选了仅 openai 的供应商）→ 提示不支持并阻止。
+- 选「自定义」→ 手动填 `base_url`，`provider` 留空。
+- 「查询模型」请求带当前 `provider`，让后端走 override（DeepSeek anthropic 页从 openai `/v1/models` 拉模型）。
+- 保存后实例带 `provider` 字段；JSON 高级编辑同样支持该字段。
+
+### 10.6 边界（明确不做）
+
+- 不做供应商账号/OAuth；内置清单为静态数据，不做联网自动更新。
+- 不联网校验 base_url（已有 probe 能力覆盖）。
+- 供应商「是否支持某协议」以内置数据声明为准，不动态探测。
+
+### 10.7 验收标准
+
+- `go build`/`go vet`/`go test` 退出码 0。
+- 单测：`providers` 清单完整性（11 个 + id 唯一）；`Instance.provider` 校验（合法/非法/空）；`probe/models` 的 override 分支（DeepSeek anthropic 走 openai base_url + bearer）；无 override 时走原逻辑；`GET /api/providers` 返回清单。
+- 端到端（主代理补）：`GET /api/providers` 返回 11 供应商；真实 DeepSeek anthropic 实例「查询模型」从 `https://api.deepseek.com/v1/models` 拉到 `deepseek-flash`/`deepseek-v4-pro`；UI 选择框 + base_url 自动带入 + 自定义手动填。
+- README/CHANGELOG/design/tests 同步；`-version` 仍 `0.0.1-rc`。

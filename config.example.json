@@ -1,46 +1,39 @@
 {
   "listen": "127.0.0.1:18080",
   "auth_token": "replace-with-your-client-token",
-  "backends": [
+  "admin_user": "admin",
+  "admin_password": "replace-with-your-admin-password",
+  "instances": [
     {
       "protocol": "openai",
       "base_url": "https://api.deepseek.com",
       "api_key": "sk-replace-with-your-deepseek-key",
-      "model": "deepseek-chat",
-      "timeout": "15s"
-    },
-    {
-      "protocol": "openai",
-      "base_url": "https://api.deepseek.com",
-      "api_key": "sk-replace-with-your-deepseek-key",
-      "model": "deepseek-reasoner",
-      "timeout": "15s"
+      "provider": "deepseek",
+      "timeout": "15s",
+      "models": ["deepseek-flash", "deepseek-v4-pro"]
     },
     {
       "protocol": "anthropic",
       "base_url": "https://api.deepseek.com/anthropic",
       "api_key": "sk-replace-with-your-deepseek-key",
-      "model": "deepseek-v4-flash",
-      "matches": ["claude-sonnet-4-5", "claude-sonnet-4"],
-      "roles": ["sonnet", "haiku"],
-      "timeout": "15s"
+      "provider": "deepseek",
+      "timeout": "15s",
+      "roles": {
+        "sonnet": "deepseek-v4-flash",
+        "opus": "deepseek-v4-pro",
+        "fable": "deepseek-v4-pro",
+        "haiku": "deepseek-v4-flash"
+      }
     },
     {
       "protocol": "anthropic",
       "base_url": "https://api.deepseek.com/anthropic",
       "api_key": "sk-replace-with-your-deepseek-key",
-      "model": "deepseek-v4-pro",
-      "matches": ["claude-opus-4-1", "claude-opus-4"],
-      "roles": ["opus", "fable"],
-      "timeout": "15s"
-    },
-    {
-      "protocol": "anthropic",
-      "base_url": "https://api.deepseek.com/anthropic",
-      "api_key": "sk-replace-with-your-deepseek-key",
-      "model": "deepseek-chat",
-      "roles": ["*"],
-      "timeout": "15s"
+      "provider": "deepseek",
+      "timeout": "15s",
+      "roles": {
+        "*": "deepseek-v4-flash"
+      }
     }
   ]
 }

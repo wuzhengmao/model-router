@@ -33,14 +33,14 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	handler, err := proxy.New(cfg)
+	app, err := proxy.NewServer(*configPath, cfg)
 	if err != nil {
 		log.Fatalf("init proxy: %v", err)
 	}
 
 	server := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           handler,
+		Handler:           app,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -49,10 +49,15 @@ func main() {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		log.Printf("model-router %s listening on %s with %d backend(s)", version.Get(), cfg.Listen, len(cfg.Backends))
-		for _, b := range cfg.Backends {
-			log.Printf("backend: protocol=%s base_url=%s model=%q timeout=%s",
-				b.Protocol, b.BaseURL, b.Model, b.Timeout.Duration())
+		log.Printf("model-router %s listening on %s with %d instance(s)", version.Get(), cfg.Listen, len(cfg.Instances))
+		for _, inst := range cfg.Instances {
+			log.Printf("instance: protocol=%s base_url=%s models=%v roles=%v timeout=%s",
+				inst.Protocol, inst.BaseURL, inst.Models, inst.Roles, inst.Timeout.Duration())
+		}
+		if cfg.AdminPassword == "" {
+			log.Printf("admin UI disabled (admin_password is empty)")
+		} else {
+			log.Printf("admin UI enabled at /admin for user %q", cfg.AdminUser)
 		}
 		serveErr <- server.ListenAndServe()
 	}()

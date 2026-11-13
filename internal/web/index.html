@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>model-router 配置</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #12151c;
+    --panel: #1b2130;
+    --panel-2: #222a3b;
+    --text: #e6ebf5;
+    --muted: #9aa7bd;
+    --accent: #5b8cff;
+    --danger: #ff6b6b;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --border: #2d374d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  main { max-width: 1180px; margin: 0 auto; display: grid; gap: 16px; }
+  header { max-width: 1180px; margin: 0 auto 20px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 14px; }
+  #status { color: var(--muted); }
+  #status.ok { color: var(--ok); }
+  #status.error { color: var(--danger); }
+  .mode-switch { margin-left: auto; display: flex; gap: 8px; }
+  .mode-switch button { background: var(--panel-2); border: 1px solid var(--border); }
+  .mode-switch button.active { background: var(--accent); border-color: var(--accent); }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+  label { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; }
+  input, select, textarea {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font: inherit;
+    width: 100%;
+  }
+  textarea { min-height: 480px; font-family: ui-monospace, Consolas, monospace; font-size: 13px; line-height: 1.5; resize: vertical; }
+  input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  .hint { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+  .proto-tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  .proto-tabs button { background: var(--panel-2); border: 1px solid var(--border); }
+  .proto-tabs button.active { background: var(--accent); border-color: var(--accent); }
+  .instance {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    margin-bottom: 12px;
+    background: var(--panel-2);
+  }
+  .instance-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 8px; flex-wrap: wrap; }
+  .instance-head strong { font-weight: 600; }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+  button {
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button.secondary { background: var(--panel-2); border: 1px solid var(--border); }
+  button.danger { background: transparent; border: 1px solid var(--danger); color: var(--danger); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:hover:not(:disabled) { filter: brightness(1.08); }
+  .result { font-size: 12px; color: var(--muted); min-height: 18px; margin-top: 8px; }
+  .result.ok { color: var(--ok); }
+  .result.err { color: var(--danger); }
+  .model-picker { margin-top: 12px; }
+  .model-picker h3 { font-size: 12px; color: var(--muted); margin: 0 0 8px; font-weight: 500; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px; font-size: 12px; color: var(--text); }
+  .chip input { width: auto; }
+  .roles { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-top: 12px; }
+  .empty { color: var(--muted); padding: 6px 0; }
+  .inline-note { color: var(--muted); font-size: 12px; }
+  .modal {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, .6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    z-index: 10;
+  }
+  .modal-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    width: min(560px, 100%);
+    max-height: 80vh;
+    overflow: auto;
+    padding: 20px;
+  }
+  .provider-option {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    background: var(--panel-2);
+    cursor: pointer;
+    color: var(--text);
+  }
+  .provider-option input { width: auto; padding: 0; margin: 0; flex: none; }
+  .provider-option .protocols { margin-left: auto; display: flex; gap: 6px; }
+  .badge, .provider-tag {
+    font-size: 11px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 8px;
+    color: var(--muted);
+  }
+  .modal-error { color: var(--danger); font-size: 12px; min-height: 18px; margin: 8px 0; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>model-router 配置</h1>
+  <span id="status">加载中…</span>
+  <div class="mode-switch">
+    <button type="button" id="mode-visual" class="active">可视化配置</button>
+    <button type="button" id="mode-json">JSON 高级</button>
+  </div>
+</header>
+
+<main>
+  <section id="visual-pane">
+    <div class="card">
+      <h2>基础配置</h2>
+      <div class="grid">
+        <label>监听地址 (listen)
+          <input id="listen" placeholder="127.0.0.1:18080">
+        </label>
+        <label>访问 token (auth_token)
+          <input id="auth_token" placeholder="客户端访问 token">
+        </label>
+        <label>管理员用户名 (admin_user)
+          <input id="admin_user" placeholder="admin">
+        </label>
+        <label>管理员密码 (admin_password)
+          <input id="admin_password" type="password" placeholder="留空则禁用管理页">
+        </label>
+      </div>
+      <p class="hint">保存只写回配置文件；点击「重载生效」后新配置才会在本进程内生效。</p>
+    </div>
+
+    <div class="card">
+      <div class="instance-head">
+        <h2 style="margin:0">提供商实例</h2>
+        <button type="button" id="add-instance">+ 添加实例</button>
+      </div>
+      <div class="proto-tabs">
+        <button type="button" data-protocol="openai" class="active">OpenAI</button>
+        <button type="button" data-protocol="anthropic">Anthropic</button>
+      </div>
+      <div id="instances"></div>
+      <div id="no-instances" class="empty" hidden>该协议还没有实例，点击「添加实例」开始。</div>
+      <p class="hint">「查询模型」会请求上游 <code>/v1/models</code>；若上游不支持，请手动输入模型名。</p>
+      <div class="actions">
+        <button type="button" id="save-visual">保存到文件</button>
+        <button type="button" id="reload-visual" class="secondary">重载生效</button>
+        <button type="button" id="refresh-visual" class="secondary">重新读取</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="json-pane" hidden>
+    <div class="card">
+      <h2>JSON 高级编辑</h2>
+      <p class="hint">编辑完整配置 JSON。先点「校验」，通过后「保存」才会启用；保存只写文件，需再点「重载生效」。</p>
+      <textarea id="json-editor" spellcheck="false"></textarea>
+      <div class="result" id="json-result"></div>
+      <div class="actions">
+        <button type="button" id="validate-json" class="secondary">校验</button>
+        <button type="button" id="save-json" disabled>保存到文件</button>
+        <button type="button" id="reload-json" class="secondary">重载生效</button>
+        <button type="button" id="refresh-json" class="secondary">重新读取</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="provider-modal" class="modal" hidden>
+  <div class="modal-card">
+    <h2>选择供应商</h2>
+    <p class="hint">内置供应商会自动填写当前协议（<span id="provider-protocol-label">OpenAI</span>）的 base_url；选择「自定义」后手动填写。</p>
+    <div id="provider-options"></div>
+    <div class="modal-error" id="provider-error"></div>
+    <div class="actions">
+      <button type="button" id="provider-cancel" class="secondary">取消</button>
+      <button type="button" id="provider-confirm">确定</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var ROLE_KEYS = ['sonnet', 'opus', 'fable', 'haiku', '*'];
+  var ROLE_LABELS = {
+    sonnet: 'sonnet（中端）',
+    opus: 'opus（高端）',
+    fable: 'fable',
+    haiku: 'haiku（轻量）',
+    '*': '* 托底',
+  };
+
+  var statusEl = document.getElementById('status');
+  var visualPane = document.getElementById('visual-pane');
+  var jsonPane = document.getElementById('json-pane');
+  var instancesEl = document.getElementById('instances');
+  var noInstancesEl = document.getElementById('no-instances');
+  var jsonEditor = document.getElementById('json-editor');
+  var jsonResult = document.getElementById('json-result');
+  var saveJSONButton = document.getElementById('save-json');
+  var providerModal = document.getElementById('provider-modal');
+  var providerOptions = document.getElementById('provider-options');
+  var providerError = document.getElementById('provider-error');
+  var providerProtocolLabel = document.getElementById('provider-protocol-label');
+
+  var base = {
+    listen: document.getElementById('listen'),
+    auth_token: document.getElementById('auth_token'),
+    admin_user: document.getElementById('admin_user'),
+    admin_password: document.getElementById('admin_password'),
+  };
+
+  var config = null;
+  var instances = [];
+  var activeProtocol = 'openai';
+  var providerPresets = [];
+
+  function setStatus(message, kind) {
+    statusEl.textContent = message;
+    statusEl.className = kind || '';
+  }
+
+  function setResult(el, message, kind) {
+    el.textContent = message;
+    el.className = 'result' + (kind ? ' ' + kind : '');
+  }
+
+  async function api(path, options) {
+    var opts = options || {};
+    var headers = { 'Content-Type': 'application/json' };
+    Object.assign(headers, opts.headers || {});
+    var res = await fetch(path, { method: opts.method || 'GET', headers: headers, body: opts.body });
+    var text = await res.text();
+    var data = null;
+    if (text) {
+      try { data = JSON.parse(text); } catch (e) { data = text; }
+    }
+    if (!res.ok) {
+      var detail = data && data.error ? data.error : (text || res.statusText);
+      throw new Error(res.status + ' ' + detail);
+    }
+    return data;
+  }
+
+  function splitList(value) {
+    var out = [];
+    String(value || '').split(',').forEach(function (part) {
+      var item = part.trim();
+      if (item !== '' && out.indexOf(item) === -1) {
+        out.push(item);
+      }
+    });
+    return out;
+  }
+
+  function newInstance(protocol) {
+    return {
+      protocol: protocol,
+      base_url: '',
+      api_key: '',
+      provider: '',
+      timeout: '15s',
+      models: [],
+      roles: {},
+      remoteModels: [],
+      result: '',
+      resultKind: '',
+    };
+  }
+
+  function normalizeInstance(raw) {
+    var inst = newInstance((raw.protocol || 'openai').toLowerCase());
+    inst.base_url = raw.base_url || '';
+    inst.api_key = raw.api_key || '';
+    inst.provider = String(raw.provider || '').toLowerCase();
+    inst.timeout = raw.timeout || '15s';
+    if (Array.isArray(raw.models)) {
+      inst.models = raw.models.slice();
+    }
+    if (raw.roles && typeof raw.roles === 'object') {
+      Object.keys(raw.roles).forEach(function (key) {
+        inst.roles[key] = String(raw.roles[key]);
+      });
+    }
+    return inst;
+  }
+
+  function renderVisual(cfg) {
+    config = cfg || {};
+    Object.keys(base).forEach(function (key) {
+      base[key].value = config[key] || '';
+    });
+    instances = (Array.isArray(config.instances) ? config.instances : []).map(normalizeInstance);
+    renderInstances();
+  }
+
+  function renderInstances() {
+    instancesEl.textContent = '';
+    var shown = instances.filter(function (inst) { return inst.protocol === activeProtocol; });
+    noInstancesEl.hidden = shown.length !== 0;
+    shown.forEach(function (inst) {
+      instancesEl.appendChild(buildInstanceCard(inst));
+    });
+  }
+
+  function field(labelText, value, placeholder, type) {
+    var label = document.createElement('label');
+    label.textContent = labelText;
+    var input = document.createElement('input');
+    input.type = type || 'text';
+    input.value = value || '';
+    input.placeholder = placeholder || '';
+    label.appendChild(input);
+    return { label: label, input: input };
+  }
+
+  function btn(text, className) {
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = text;
+    if (className) {
+      button.className = className;
+    }
+    return button;
+  }
+
+  function providerName(id) {
+    for (var i = 0; i < providerPresets.length; i++) {
+      if (providerPresets[i].id === id) {
+        return providerPresets[i].name;
+      }
+    }
+    return id;
+  }
+
+  function protocolBaseURL(preset, protocol) {
+    return protocol === 'openai' ? (preset.openai_base_url || '') : (preset.anthropic_base_url || '');
+  }
+
+  async function loadProviders() {
+    try {
+      var data = await api('/api/providers');
+      providerPresets = Array.isArray(data) ? data : ((data && data.providers) || []);
+    } catch (err) {
+      providerPresets = [];
+    }
+  }
+
+  function openProviderModal() {
+    providerError.textContent = '';
+    providerProtocolLabel.textContent = activeProtocol === 'openai' ? 'OpenAI' : 'Anthropic';
+    providerOptions.textContent = '';
+
+    providerPresets.forEach(function (preset) {
+      var label = document.createElement('label');
+      label.className = 'provider-option';
+      var radio = document.createElement('input');
+      radio.type = 'radio';
+      radio.name = 'provider-choice';
+      radio.value = preset.id;
+      var name = document.createElement('span');
+      name.textContent = preset.name;
+      var protocols = document.createElement('span');
+      protocols.className = 'protocols';
+      ['openai', 'anthropic'].forEach(function (protocol) {
+        if (protocolBaseURL(preset, protocol)) {
+          var badge = document.createElement('span');
+          badge.className = 'badge';
+          badge.textContent = protocol === 'openai' ? 'OpenAI' : 'Anthropic';
+          protocols.appendChild(badge);
+        }
+      });
+      if (protocols.children.length === 0) {
+        var none = document.createElement('span');
+        none.className = 'badge';
+        none.textContent = '不支持';
+        protocols.appendChild(none);
+      }
+      label.appendChild(radio);
+      label.appendChild(name);
+      label.appendChild(protocols);
+      providerOptions.appendChild(label);
+    });
+
+    var customLabel = document.createElement('label');
+    customLabel.className = 'provider-option';
+    var customRadio = document.createElement('input');
+    customRadio.type = 'radio';
+    customRadio.name = 'provider-choice';
+    customRadio.value = '';
+    customRadio.checked = true;
+    var customName = document.createElement('span');
+    customName.textContent = '自定义（手动填写 base_url）';
+    customLabel.appendChild(customRadio);
+    customLabel.appendChild(customName);
+    providerOptions.appendChild(customLabel);
+
+    providerModal.hidden = false;
+  }
+
+  function closeProviderModal() {
+    providerModal.hidden = true;
+  }
+
+  function confirmProvider() {
+    var selected = providerOptions.querySelector('input[name="provider-choice"]:checked');
+    var value = selected ? selected.value : '';
+    if (value === '') {
+      instances.push(newInstance(activeProtocol));
+      renderInstances();
+      closeProviderModal();
+      return;
+    }
+
+    var preset = null;
+    for (var i = 0; i < providerPresets.length; i++) {
+      if (providerPresets[i].id === value) {
+        preset = providerPresets[i];
+        break;
+      }
+    }
+    if (!preset) {
+      providerError.textContent = '供应商数据未加载，请刷新后重试。';
+      return;
+    }
+    var baseURL = protocolBaseURL(preset, activeProtocol);
+    if (!baseURL) {
+      providerError.textContent = '该供应商不支持当前协议（' + (activeProtocol === 'openai' ? 'OpenAI' : 'Anthropic') + '）。';
+      return;
+    }
+
+    var inst = newInstance(activeProtocol);
+    inst.provider = preset.id;
+    inst.base_url = baseURL;
+    instances.push(inst);
+    renderInstances();
+    closeProviderModal();
+  }
+
+  function buildInstanceCard(inst) {
+    var card = document.createElement('div');
+    card.className = 'instance';
+
+    var head = document.createElement('div');
+    head.className = 'instance-head';
+    var title = document.createElement('strong');
+    title.textContent = inst.protocol === 'anthropic' ? 'Anthropic 实例' : 'OpenAI 实例';
+    title.textContent += inst.provider ? ' · ' + providerName(inst.provider) : ' · 自定义';
+    head.appendChild(title);
+    var remove = btn('删除', 'danger');
+    head.appendChild(remove);
+    card.appendChild(head);
+
+    var grid = document.createElement('div');
+    grid.className = 'grid';
+    var baseURL = field('base_url', inst.base_url, 'https://api.deepseek.com');
+    var apiKey = field('api_key', inst.api_key, 'sk-...', 'password');
+    var timeout = field('timeout（可选）', inst.timeout, '15s');
+    [baseURL.label, apiKey.label, timeout.label].forEach(function (node) { grid.appendChild(node); });
+    card.appendChild(grid);
+
+    baseURL.input.addEventListener('input', function () { inst.base_url = baseURL.input.value; });
+    apiKey.input.addEventListener('input', function () { inst.api_key = apiKey.input.value; });
+    timeout.input.addEventListener('input', function () { inst.timeout = timeout.input.value; });
+
+    var actions = document.createElement('div');
+    actions.className = 'actions';
+    var testButton = btn('测试连接', 'secondary');
+    var modelsButton = btn('查询模型', 'secondary');
+    actions.appendChild(testButton);
+    actions.appendChild(modelsButton);
+    card.appendChild(actions);
+
+    var result = document.createElement('div');
+    result.className = 'result';
+    result.textContent = inst.result || '';
+    if (inst.resultKind) {
+      result.className += ' ' + inst.resultKind;
+    }
+    card.appendChild(result);
+
+    var picker = document.createElement('div');
+    picker.className = 'model-picker';
+    if (inst.protocol === 'openai') {
+      picker.appendChild(buildOpenAIPicker(inst, result));
+    } else {
+      picker.appendChild(buildAnthropicPicker(inst));
+    }
+    card.appendChild(picker);
+
+    remove.addEventListener('click', function () {
+      instances = instances.filter(function (item) { return item !== inst; });
+      renderInstances();
+    });
+
+    testButton.addEventListener('click', function () { probeTest(inst, result); });
+    modelsButton.addEventListener('click', function () {
+      probeModels(inst, result).then(function (loaded) {
+        if (loaded) {
+          renderInstances();
+        }
+      });
+    });
+
+    return card;
+  }
+
+  function buildOpenAIPicker(inst, resultEl) {
+    var wrap = document.createElement('div');
+
+    var heading = document.createElement('h3');
+    heading.textContent = '模型列表（勾选或手动输入）';
+    wrap.appendChild(heading);
+
+    var chips = document.createElement('div');
+    chips.className = 'chips';
+    if (inst.remoteModels.length === 0) {
+      var empty = document.createElement('span');
+      empty.className = 'inline-note';
+      empty.textContent = '尚未查询上游模型，可直接在下方手动输入。';
+      chips.appendChild(empty);
+    }
+    inst.remoteModels.forEach(function (model) {
+      var chip = document.createElement('label');
+      chip.className = 'chip';
+      var box = document.createElement('input');
+      box.type = 'checkbox';
+      box.value = model;
+      box.checked = inst.models.indexOf(model) !== -1;
+      var text = document.createElement('span');
+      text.textContent = model;
+      chip.appendChild(box);
+      chip.appendChild(text);
+      chips.appendChild(chip);
+
+      box.addEventListener('change', function () {
+        if (box.checked) {
+          if (inst.models.indexOf(model) === -1) {
+            inst.models.push(model);
+          }
+        } else {
+          inst.models = inst.models.filter(function (item) { return item !== model; });
+        }
+        modelsInput.value = inst.models.join(', ');
+        setResult(resultEl, inst.models.length ? '已选择 ' + inst.models.length + ' 个模型。' : '', '');
+      });
+    });
+    wrap.appendChild(chips);
+
+    var modelsField = field('models（逗号分隔）', inst.models.join(', '), 'deepseek-chat, deepseek-reasoner');
+    var modelsInput = modelsField.input;
+    wrap.appendChild(modelsField.label);
+    modelsInput.addEventListener('input', function () {
+      inst.models = splitList(modelsInput.value);
+      Array.prototype.forEach.call(chips.querySelectorAll('input[type="checkbox"]'), function (box) {
+        box.checked = inst.models.indexOf(box.value) !== -1;
+      });
+    });
+
+    return wrap;
+  }
+
+  function buildAnthropicPicker(inst) {
+    var wrap = document.createElement('div');
+    var heading = document.createElement('h3');
+    heading.textContent = '角色映射（选择或手动输入实际模型）';
+    wrap.appendChild(heading);
+
+    var datalistID = 'models-' + Math.random().toString(36).slice(2);
+    var datalist = document.createElement('datalist');
+    datalist.id = datalistID;
+    inst.remoteModels.forEach(function (model) {
+      var option = document.createElement('option');
+      option.value = model;
+      datalist.appendChild(option);
+    });
+    wrap.appendChild(datalist);
+
+    var roles = document.createElement('div');
+    roles.className = 'roles';
+    ROLE_KEYS.forEach(function (role) {
+      var roleField = field(ROLE_LABELS[role], inst.roles[role] || '', role === '*' ? '托底模型（可选）' : '模型名');
+      roleField.input.setAttribute('list', datalistID);
+      roles.appendChild(roleField.label);
+      roleField.input.addEventListener('input', function () {
+        var value = roleField.input.value.trim();
+        if (value === '') {
+          delete inst.roles[role];
+        } else {
+          inst.roles[role] = value;
+        }
+      });
+    });
+    wrap.appendChild(roles);
+    return wrap;
+  }
+
+  function probePayload(inst) {
+    if (!inst.base_url.trim() || !inst.api_key.trim()) {
+      throw new Error('请先填写 base_url 与 api_key');
+    }
+    var payload = {
+      protocol: inst.protocol,
+      base_url: inst.base_url.trim(),
+      api_key: inst.api_key.trim(),
+    };
+    if (inst.provider) {
+      payload.provider = inst.provider;
+    }
+    if (inst.timeout.trim() !== '') {
+      payload.timeout = inst.timeout.trim();
+    }
+    return payload;
+  }
+
+  async function probeTest(inst, resultEl) {
+    setResult(resultEl, '正在测试连接…', '');
+    try {
+      var data = await api('/api/probe/test', { method: 'POST', body: JSON.stringify(probePayload(inst)) });
+      if (data && data.ok) {
+        inst.result = '连接成功（' + data.latency_ms + ' ms）';
+        inst.resultKind = 'ok';
+      } else {
+        inst.result = '连接失败：' + ((data && data.message) || '未知错误');
+        inst.resultKind = 'err';
+      }
+    } catch (err) {
+      inst.result = '连接失败：' + err.message;
+      inst.resultKind = 'err';
+    }
+    setResult(resultEl, inst.result, inst.resultKind);
+  }
+
+  async function probeModels(inst, resultEl) {
+    setResult(resultEl, '正在查询上游模型…', '');
+    try {
+      var data = await api('/api/probe/models', { method: 'POST', body: JSON.stringify(probePayload(inst)) });
+      inst.remoteModels = (data && Array.isArray(data.models)) ? data.models : [];
+      inst.result = '已获取 ' + inst.remoteModels.length + ' 个上游模型。';
+      inst.resultKind = 'ok';
+      setResult(resultEl, inst.result, inst.resultKind);
+      return true;
+    } catch (err) {
+      inst.remoteModels = [];
+      inst.result = '该上游不支持模型列表查询，请手动输入。（' + err.message + '）';
+      inst.resultKind = 'err';
+      setResult(resultEl, inst.result, inst.resultKind);
+      return true;
+    }
+  }
+
+  function buildConfigFromVisual() {
+    return {
+      listen: base.listen.value.trim(),
+      auth_token: base.auth_token.value.trim(),
+      admin_user: base.admin_user.value.trim(),
+      admin_password: base.admin_password.value,
+      instances: instances.map(function (inst) {
+        var out = {
+          protocol: inst.protocol,
+          base_url: inst.base_url.trim(),
+          api_key: inst.api_key.trim(),
+        };
+        if (inst.provider) {
+          out.provider = inst.provider;
+        }
+        var timeout = inst.timeout.trim();
+        if (timeout !== '') {
+          out.timeout = timeout;
+        }
+        if (inst.protocol === 'openai') {
+          out.models = inst.models.slice();
+        } else {
+          out.roles = Object.assign({}, inst.roles);
+        }
+        return out;
+      }),
+    };
+  }
+
+  async function saveVisual() {
+    try {
+      var payload = buildConfigFromVisual();
+      await api('/api/config', { method: 'PUT', body: JSON.stringify(payload) });
+      setStatus('已保存到配置文件。点击「重载生效」使其生效。', 'ok');
+    } catch (err) {
+      setStatus('保存失败：' + err.message, 'error');
+    }
+  }
+
+  async function reloadConfig() {
+    try {
+      await api('/api/reload', { method: 'POST' });
+      setStatus('已重载生效。', 'ok');
+      await load();
+    } catch (err) {
+      setStatus('重载失败（仍使用旧配置）：' + err.message, 'error');
+    }
+  }
+
+  async function load() {
+    try {
+      setStatus('加载中…');
+      var data = await api('/api/config');
+      renderVisual(data);
+      setStatus('已加载当前生效配置。', 'ok');
+    } catch (err) {
+      setStatus('加载失败：' + err.message, 'error');
+    }
+  }
+
+  function setJSONSaveEnabled(enabled) {
+    saveJSONButton.disabled = !enabled;
+  }
+
+  async function validateJSON() {
+    var parsed;
+    try {
+      parsed = JSON.parse(jsonEditor.value);
+    } catch (err) {
+      setJSONSaveEnabled(false);
+      setResult(jsonResult, 'JSON 语法错误：' + err.message, 'err');
+      return;
+    }
+    try {
+      await api('/api/config/validate', { method: 'POST', body: JSON.stringify(parsed) });
+      setJSONSaveEnabled(true);
+      setResult(jsonResult, '校验通过，可以保存。', 'ok');
+    } catch (err) {
+      setJSONSaveEnabled(false);
+      setResult(jsonResult, '校验失败：' + err.message, 'err');
+    }
+  }
+
+  async function saveJSON() {
+    if (saveJSONButton.disabled) {
+      return;
+    }
+    try {
+      await api('/api/config', { method: 'PUT', body: jsonEditor.value });
+      setStatus('JSON 已保存到配置文件。点击「重载生效」使其生效。', 'ok');
+    } catch (err) {
+      setStatus('保存失败：' + err.message, 'error');
+    }
+  }
+
+  function switchMode(mode) {
+    var jsonMode = mode === 'json';
+    if (jsonMode) {
+      jsonEditor.value = JSON.stringify(buildConfigFromVisual(), null, 2);
+      setJSONSaveEnabled(false);
+      setResult(jsonResult, '', '');
+    } else {
+      var parsed = null;
+      try {
+        parsed = JSON.parse(jsonEditor.value);
+      } catch (err) {
+        setStatus('JSON 当前无法解析，保留可视化状态。', 'error');
+      }
+      if (parsed && parsed.instances) {
+        renderVisual(parsed);
+      }
+    }
+    visualPane.hidden = jsonMode;
+    jsonPane.hidden = !jsonMode;
+    document.getElementById('mode-visual').className = jsonMode ? '' : 'active';
+    document.getElementById('mode-json').className = jsonMode ? 'active' : '';
+  }
+
+  function switchProtocol(protocol) {
+    activeProtocol = protocol;
+    Array.prototype.forEach.call(document.querySelectorAll('.proto-tabs button'), function (button) {
+      button.className = button.dataset.protocol === protocol ? 'active' : '';
+    });
+    renderInstances();
+  }
+
+  document.querySelectorAll('.proto-tabs button').forEach(function (button) {
+    button.addEventListener('click', function () { switchProtocol(button.dataset.protocol); });
+  });
+
+  document.getElementById('add-instance').addEventListener('click', openProviderModal);
+  document.getElementById('provider-cancel').addEventListener('click', closeProviderModal);
+  document.getElementById('provider-confirm').addEventListener('click', confirmProvider);
+  document.getElementById('save-visual').addEventListener('click', saveVisual);
+  document.getElementById('reload-visual').addEventListener('click', reloadConfig);
+  document.getElementById('refresh-visual').addEventListener('click', load);
+
+  document.getElementById('mode-visual').addEventListener('click', function () { switchMode('visual'); });
+  document.getElementById('mode-json').addEventListener('click', function () { switchMode('json'); });
+  document.getElementById('validate-json').addEventListener('click', validateJSON);
+  document.getElementById('save-json').addEventListener('click', saveJSON);
+  document.getElementById('reload-json').addEventListener('click', reloadConfig);
+  document.getElementById('refresh-json').addEventListener('click', function () {
+    load().then(function () {
+      jsonEditor.value = JSON.stringify(buildConfigFromVisual(), null, 2);
+      setJSONSaveEnabled(false);
+      setResult(jsonResult, '', '');
+    });
+  });
+  jsonEditor.addEventListener('input', function () {
+    setJSONSaveEnabled(false);
+    setResult(jsonResult, '内容已修改，请重新校验。', '');
+  });
+
+  loadProviders();
+  load();
+})();
+</script>
+</body>
+</html>
