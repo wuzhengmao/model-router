@@ -1,0 +1,37 @@
+# 构建产物
+/bin/
+/dist/
+/build/
+*.exe
+*.test
+*.out
+
+# Go 工作区
+go.work
+go.work.sum
+
+# 依赖 vendor（如启用）
+/vendor/
+
+# 本地配置与密钥（不要把真实 key 提交进仓库）
+config.local.*
+*.local.yaml
+*.local.yml
+*.local.json
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# Claude Code 委派留痕（本地诊断，不入库）
+.claude-runs/
+
+# meow-memory 外部预置记忆库，不入库
+.dsh-meow/

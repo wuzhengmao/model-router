@@ -1,0 +1,10 @@
+{
+  "listen": "127.0.0.1:18080",
+  "auth_token": "replace-with-your-client-token",
+  "backend": {
+    "base_url": "https://api.openai.com",
+    "api_key": "sk-replace-with-your-key",
+    "model": "gpt-4o-mini",
+    "timeout": "15s"
+  }
+}
