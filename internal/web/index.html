@@ -66,6 +66,10 @@
     margin-bottom: 12px;
     background: var(--panel-2);
   }
+  .instance.dragging { opacity: .45; }
+  .instance.drag-over { outline: 2px dashed var(--accent); outline-offset: 2px; }
+  .drag-handle { cursor: grab; user-select: none; }
+  .drag-handle:active { cursor: grabbing; }
   .instance-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 8px; flex-wrap: wrap; }
   .instance-head strong { font-weight: 600; }
   .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
@@ -170,6 +174,26 @@
     </div>
 
     <div class="card">
+      <h2>回退参数</h2>
+      <div class="grid">
+        <label>失败阈值 (failure_threshold)
+          <input id="failure_threshold" type="number" min="1" step="1" inputmode="numeric" placeholder="3">
+        </label>
+        <label>回退时长 (degrade_duration)
+          <input id="degrade_duration" placeholder="5m">
+        </label>
+        <label>最低吞吐 token/s (min_tokens_per_second)
+          <input id="min_tokens_per_second" type="number" min="0" step="any" placeholder="30">
+        </label>
+        <label>空闲超时 (idle_timeout)
+          <input id="idle_timeout" placeholder="30s">
+        </label>
+      </div>
+      <p class="hint">失败阈值 ≥1；回退时长如 5m / 30s / 1h（必须 &gt;0）；最低吞吐 ≥0，填 0 表示禁用吞吐判定，留空使用默认 30；空闲超时如 30s，填 0 表示禁用空闲超时判定，留空使用默认 30s。</p>
+      <div class="result" id="fallback-error"></div>
+    </div>
+
+    <div class="card">
       <div class="instance-head">
         <h2 style="margin:0">提供商实例</h2>
         <button type="button" id="add-instance">+ 添加实例</button>
@@ -180,7 +204,7 @@
       </div>
       <div id="instances"></div>
       <div id="no-instances" class="empty" hidden>该协议还没有实例，点击「添加实例」开始。</div>
-      <p class="hint">「查询模型」会请求上游 <code>/v1/models</code>；若上游不支持，请手动输入模型名。</p>
+      <p class="hint">各组内实例顺序即回退候选顺序（越靠前越优先），拖动实例标题可在组内调整顺序。「查询模型」会请求上游 <code>/v1/models</code>；若上游不支持，请手动输入模型名。</p>
       <div class="actions">
         <button type="button" id="save-visual">保存到文件</button>
         <button type="button" id="reload-visual" class="secondary">重载生效</button>
@@ -192,7 +216,7 @@
   <section id="json-pane" hidden>
     <div class="card">
       <h2>JSON 高级编辑</h2>
-      <p class="hint">编辑完整配置 JSON。先点「校验」，通过后「保存」才会启用；保存只写文件，需再点「重载生效」。</p>
+      <p class="hint">编辑完整配置 JSON（含 fallback 与分组 instances）。先点「校验」，通过后「保存」才会启用；保存只写文件，需再点「重载生效」。</p>
       <textarea id="json-editor" spellcheck="false"></textarea>
       <div class="result" id="json-result"></div>
       <div class="actions">
@@ -251,10 +275,19 @@
     admin_password: document.getElementById('admin_password'),
   };
 
+  var fallbackFields = {
+    failure_threshold: document.getElementById('failure_threshold'),
+    degrade_duration: document.getElementById('degrade_duration'),
+    min_tokens_per_second: document.getElementById('min_tokens_per_second'),
+    idle_timeout: document.getElementById('idle_timeout'),
+  };
+  var fallbackErrorEl = document.getElementById('fallback-error');
+
   var config = null;
   var instances = [];
   var activeProtocol = 'openai';
   var providerPresets = [];
+  var draggedInstance = null;
 
   function setStatus(message, kind) {
     statusEl.textContent = message;
@@ -309,8 +342,8 @@
     };
   }
 
-  function normalizeInstance(raw) {
-    var inst = newInstance((raw.protocol || 'openai').toLowerCase());
+  function normalizeInstance(raw, protocol) {
+    var inst = newInstance(protocol);
     inst.base_url = raw.base_url || '';
     inst.api_key = raw.api_key || '';
     inst.provider = String(raw.provider || '').toLowerCase();
@@ -326,12 +359,103 @@
     return inst;
   }
 
+  var DURATION_UNITS = {
+    ns: 1e-9,
+    us: 1e-6,
+    'µs': 1e-6,
+    'μs': 1e-6,
+    ms: 1e-3,
+    s: 1,
+    m: 60,
+    h: 3600,
+  };
+
+  function durationSeconds(value) {
+    var re = /([0-9]+(?:\.[0-9]+)?)(ns|us|µs|μs|ms|s|m|h)/g;
+    var total = 0;
+    var matched = false;
+    var last = 0;
+    var match;
+    while ((match = re.exec(value)) !== null) {
+      if (match.index !== last) {
+        return -1;
+      }
+      matched = true;
+      last = re.lastIndex;
+      total += parseFloat(match[1]) * DURATION_UNITS[match[2]];
+    }
+    if (!matched || last !== value.length) {
+      return -1;
+    }
+    return total;
+  }
+
+  function hasOwn(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key);
+  }
+
+  function setFallbackError(message) {
+    fallbackErrorEl.textContent = message || '';
+    fallbackErrorEl.className = 'result' + (message ? ' err' : '');
+  }
+
+  function renderFallback(cfg) {
+    var fb = (cfg && cfg.fallback) || {};
+    fallbackFields.failure_threshold.value = hasOwn(fb, 'failure_threshold') ? String(fb.failure_threshold) : '3';
+    fallbackFields.degrade_duration.value = hasOwn(fb, 'degrade_duration') ? String(fb.degrade_duration) : '5m';
+    fallbackFields.min_tokens_per_second.value = hasOwn(fb, 'min_tokens_per_second') ? String(fb.min_tokens_per_second) : '30';
+    fallbackFields.idle_timeout.value = hasOwn(fb, 'idle_timeout') ? String(fb.idle_timeout) : '30s';
+    setFallbackError('');
+  }
+
+  function readFallbackInputs() {
+    var out = {};
+    var threshold = fallbackFields.failure_threshold.value.trim();
+    if (threshold !== '') {
+      if (!/^[0-9]+$/.test(threshold) || parseInt(threshold, 10) < 1) {
+        throw new Error('失败阈值必须是 ≥1 的整数');
+      }
+      out.failure_threshold = parseInt(threshold, 10);
+    }
+    var duration = fallbackFields.degrade_duration.value.trim();
+    if (duration !== '') {
+      if (durationSeconds(duration) <= 0) {
+        throw new Error('回退时长必须是 >0 的时长（如 5m、30s、1h）');
+      }
+      out.degrade_duration = duration;
+    }
+    var tps = fallbackFields.min_tokens_per_second.value.trim();
+    if (tps !== '') {
+      var value = Number(tps);
+      if (!isFinite(value) || value < 0) {
+        throw new Error('最低吞吐必须是 ≥0 的数字');
+      }
+      out.min_tokens_per_second = value;
+    }
+    var idle = fallbackFields.idle_timeout.value.trim();
+    if (idle !== '') {
+      if (durationSeconds(idle) < 0) {
+        throw new Error('空闲超时必须是 ≥0 的时长（如 30s，0 表示禁用）');
+      }
+      out.idle_timeout = idle;
+    }
+    return out;
+  }
+
   function renderVisual(cfg) {
     config = cfg || {};
     Object.keys(base).forEach(function (key) {
       base[key].value = config[key] || '';
     });
-    instances = (Array.isArray(config.instances) ? config.instances : []).map(normalizeInstance);
+    renderFallback(config);
+    var groups = config.instances || {};
+    instances = [];
+    (Array.isArray(groups.openai) ? groups.openai : []).forEach(function (raw) {
+      instances.push(normalizeInstance(raw, 'openai'));
+    });
+    (Array.isArray(groups.anthropic) ? groups.anthropic : []).forEach(function (raw) {
+      instances.push(normalizeInstance(raw, 'anthropic'));
+    });
     renderInstances();
   }
 
@@ -478,6 +602,28 @@
     closeProviderModal();
   }
 
+  function reorderInstances(dragged, target, after) {
+    var protocol = dragged.protocol;
+    var same = instances.filter(function (item) { return item.protocol === protocol; });
+    same = same.filter(function (item) { return item !== dragged; });
+    var index = same.indexOf(target);
+    if (index === -1) {
+      return;
+    }
+    if (after) {
+      index += 1;
+    }
+    same.splice(index, 0, dragged);
+
+    var next = 0;
+    instances = instances.map(function (item) {
+      if (item.protocol === protocol) {
+        return same[next++];
+      }
+      return item;
+    });
+  }
+
   function buildInstanceCard(inst) {
     var card = document.createElement('div');
     card.className = 'instance';
@@ -487,6 +633,9 @@
     var title = document.createElement('strong');
     title.textContent = inst.protocol === 'anthropic' ? 'Anthropic 实例' : 'OpenAI 实例';
     title.textContent += inst.provider ? ' · ' + providerName(inst.provider) : ' · 自定义';
+    title.className = 'drag-handle';
+    title.draggable = true;
+    title.title = '拖动排序（越靠前优先级越高）';
     head.appendChild(title);
     var remove = btn('删除', 'danger');
     head.appendChild(remove);
@@ -541,6 +690,46 @@
           renderInstances();
         }
       });
+    });
+
+    title.addEventListener('dragstart', function (event) {
+      draggedInstance = inst;
+      card.classList.add('dragging');
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', 'instance');
+      }
+    });
+    title.addEventListener('dragend', function () {
+      draggedInstance = null;
+      card.classList.remove('dragging');
+      Array.prototype.forEach.call(document.querySelectorAll('.instance'), function (el) {
+        el.classList.remove('drag-over');
+      });
+    });
+    card.addEventListener('dragover', function (event) {
+      if (!draggedInstance || draggedInstance === inst || draggedInstance.protocol !== inst.protocol) {
+        return;
+      }
+      event.preventDefault();
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = 'move';
+      }
+      card.classList.add('drag-over');
+    });
+    card.addEventListener('dragleave', function () {
+      card.classList.remove('drag-over');
+    });
+    card.addEventListener('drop', function (event) {
+      if (!draggedInstance || draggedInstance === inst || draggedInstance.protocol !== inst.protocol) {
+        return;
+      }
+      event.preventDefault();
+      var rect = card.getBoundingClientRect();
+      var after = event.clientY > rect.top + rect.height / 2;
+      reorderInstances(draggedInstance, inst, after);
+      draggedInstance = null;
+      renderInstances();
     });
 
     return card;
@@ -690,38 +879,58 @@
     }
   }
 
-  function buildConfigFromVisual() {
-    return {
+  function buildConfigWithoutFallback() {
+    var out = {
       listen: base.listen.value.trim(),
       auth_token: base.auth_token.value.trim(),
       admin_user: base.admin_user.value.trim(),
       admin_password: base.admin_password.value,
-      instances: instances.map(function (inst) {
-        var out = {
-          protocol: inst.protocol,
-          base_url: inst.base_url.trim(),
-          api_key: inst.api_key.trim(),
-        };
-        if (inst.provider) {
-          out.provider = inst.provider;
-        }
-        var timeout = inst.timeout.trim();
-        if (timeout !== '') {
-          out.timeout = timeout;
-        }
-        if (inst.protocol === 'openai') {
-          out.models = inst.models.slice();
-        } else {
-          out.roles = Object.assign({}, inst.roles);
-        }
-        return out;
-      }),
+      instances: { openai: [], anthropic: [] },
     };
+    instances.forEach(function (inst) {
+      var item = {
+        base_url: inst.base_url.trim(),
+        api_key: inst.api_key.trim(),
+      };
+      if (inst.provider) {
+        item.provider = inst.provider;
+      }
+      var timeout = inst.timeout.trim();
+      if (timeout !== '') {
+        item.timeout = timeout;
+      }
+      if (inst.protocol === 'openai') {
+        item.models = inst.models.slice();
+        out.instances.openai.push(item);
+      } else {
+        item.roles = Object.assign({}, inst.roles);
+        out.instances.anthropic.push(item);
+      }
+    });
+    return out;
+  }
+
+  function buildConfigFromVisual() {
+    var out = buildConfigWithoutFallback();
+    var fallback = readFallbackInputs();
+    if (Object.keys(fallback).length > 0) {
+      out.fallback = fallback;
+    }
+    return out;
   }
 
   async function saveVisual() {
+    var payload;
     try {
-      var payload = buildConfigFromVisual();
+      payload = buildConfigFromVisual();
+    } catch (err) {
+      setFallbackError(err.message);
+      setStatus('保存失败：' + err.message, 'error');
+      return;
+    }
+    setFallbackError('');
+    try {
+      await api('/api/config/validate', { method: 'POST', body: JSON.stringify(payload) });
       await api('/api/config', { method: 'PUT', body: JSON.stringify(payload) });
       setStatus('已保存到配置文件。点击「重载生效」使其生效。', 'ok');
     } catch (err) {
@@ -788,7 +997,18 @@
   function switchMode(mode) {
     var jsonMode = mode === 'json';
     if (jsonMode) {
-      jsonEditor.value = JSON.stringify(buildConfigFromVisual(), null, 2);
+      var built;
+      try {
+        built = buildConfigFromVisual();
+      } catch (err) {
+        setFallbackError(err.message);
+        setStatus('回退参数有误，JSON 中沿用已加载的回退参数：' + err.message, 'error');
+        built = buildConfigWithoutFallback();
+        if (config && config.fallback) {
+          built.fallback = config.fallback;
+        }
+      }
+      jsonEditor.value = JSON.stringify(built, null, 2);
       setJSONSaveEnabled(false);
       setResult(jsonResult, '', '');
     } else {
@@ -821,6 +1041,9 @@
   });
 
   document.getElementById('add-instance').addEventListener('click', openProviderModal);
+  Object.keys(fallbackFields).forEach(function (key) {
+    fallbackFields[key].addEventListener('input', function () { setFallbackError(''); });
+  });
   document.getElementById('provider-cancel').addEventListener('click', closeProviderModal);
   document.getElementById('provider-confirm').addEventListener('click', confirmProvider);
   document.getElementById('save-visual').addEventListener('click', saveVisual);

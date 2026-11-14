@@ -5,27 +5,29 @@ OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理
 > 当前版本：`0.0.1-rc`（M3-providers：供应商预设 + 实例 provider 标记 + 通用 models_override）
 > 需求：[docs/requirements.md](docs/requirements.md) ｜ 设计：[docs/design.md](docs/design.md) ｜ 测试：[docs/tests.md](docs/tests.md) ｜ 变更：[CHANGELOG.md](CHANGELOG.md)
 
-## 能力范围（M1 ～ M3.1）
+## 能力范围（M1 ～ M4）
 
 - 两个协议入口，互不转换：`POST /v1/chat/completions`（OpenAI）、`POST /v1/messages`（Anthropic）。
 - **服务访问认证**：OpenAI 入口 `Authorization: Bearer <auth_token>`；Anthropic 入口 `x-api-key: <auth_token>`；失败 401（按入口协议错误体）。
-- **实例化配置**：配置 `instances` 有序数组；每个实例 = 协议 + `base_url` + `api_key` + `timeout`，并声明自己的模型映射（OpenAI 用 `models` 数组，Anthropic 用 `roles` 对象）。
+- **实例化配置**：配置 `instances` 按协议分组为 `openai` / `anthropic` 两个有序数组；每个实例 = `base_url` + `api_key` + `timeout`，并声明自己的模型映射（OpenAI 用 `models` 数组，Anthropic 用 `roles` 对象）。
+- **回退参数可配置**：顶层 `fallback` 对象可设置 `failure_threshold`（默认 3）、`degrade_duration`（默认 `5m`）、`min_tokens_per_second`（默认 30，0=禁用吞吐判定）、`idle_timeout`（默认 `30s`，0=禁用流式空闲超时）。
 - **供应商预设**：内置 11 个供应商（deepseek/openai/anthropic/zhipu/volcengine/moonshot/dashscope/siliconflow/groq/mistral/xai）。实例可用可选 `provider` 标记来源；`provider` 只影响「查询模型」的端点判定（通用 `models_override` 机制），不影响路由/转发。
 - **实例展开路由**：
   - 精确匹配（R4a）：请求 `model` 等于某个声明的模型 → 转发该实例，**不改写**。
   - 角色匹配（R4c）：`model` 等于 `sonnet`/`opus`/`fable`/`haiku` 或以 `claude-<role>-` 开头 → 命中声明该角色的条目，改写顶层 `model` 为实例映射的模型。
   - 托底（R4d）：未命中精确/角色且存在 `"*"` 角色 → 命中第一个，改写顶层 `model`。
   - 回退（R5）：都未命中 → 转发展开后的首条目，不改写。
+- **实例粒度回退降级（M4）**：每个协议下实例按配置顺序构成候选链；连接失败/超时自动在本次请求内回退到下一候选；连续失败 3 次进入 5 分钟持续回退（跳过该实例）；回退期结束后首次探测失败立即重新计时；成功清零。吞吐低于 30 token/s 会在响应完成后记录失败（已发出的响应不回退）。
 - **透传**：方法、路径、查询串、请求体（别名/角色命中时仅改顶层 `model`）与非认证请求头原样转发；响应原样回传，SSE 逐块 flush。
 - **上游认证分离**：OpenAI 实例使用 `Authorization: Bearer <api_key>`，Anthropic 实例使用 `x-api-key: <api_key>`；客户端 token 永不外传。
 - **模型列表 `/v1/models`**：本地聚合配置声明的模型（Anthropic 不含 `*` 托底值），按认证头判定协议并返回对应格式；不调上游。
-- **Web 配置页 `/admin`**：可视化模式（OpenAI/Anthropic 双 tab、添加实例时先选供应商或自定义、测试连接、查询上游模型、勾选/手动填写）+ JSON 高级模式（校验通过才可保存）。
+- **Web 配置页 `/admin`**：可视化模式（回退参数输入框、OpenAI/Anthropic 双 tab、添加实例时先选供应商或自定义、实例卡片可拖动排序、测试连接、查询上游模型、勾选/手动填写）+ JSON 高级模式（含 `fallback` 与分组 `instances`；校验通过才可保存）。
 - **管理 API**：`GET/PUT /api/config`、`POST /api/reload`、`POST /api/config/validate`、`POST /api/probe/test`、`POST /api/probe/models`、`GET /api/providers`；HTTP Basic Auth。
 - **手动重载**：重读 `-config` 文件并原子切换，进程不重启；失败保留旧配置。
 - **环境变量覆盖**：`listen`/`auth_token`/`admin_user`/`admin_password` 可用 `MODEL_ROUTER_*` 覆盖。
 - 版本号单一来源，构建通过 `-ldflags` 注入；`-version` 输出构建版本。
 
-M4 及之后（回退降级、跨平台 CI/Docker）见需求文档第 6 节。
+M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
 
 ## 快速开始
 
@@ -37,30 +39,38 @@ M4 及之后（回退降级、跨平台 CI/Docker）见需求文档第 6 节。
      "auth_token": "replace-with-your-client-token",
      "admin_user": "admin",
      "admin_password": "replace-with-your-admin-password",
-     "instances": [
-       {
-         "protocol": "openai",
-         "base_url": "https://api.deepseek.com",
-         "api_key": "sk-...",
-         "provider": "deepseek",
-         "timeout": "15s",
-         "models": ["deepseek-chat", "deepseek-reasoner"]
-       },
-       {
-         "protocol": "anthropic",
-         "base_url": "https://api.deepseek.com/anthropic",
-         "api_key": "sk-...",
-         "provider": "deepseek",
-         "timeout": "15s",
-         "roles": {
-           "sonnet": "deepseek-v4-flash",
-           "opus": "deepseek-v4-pro",
-           "fable": "deepseek-v4-pro",
-           "haiku": "deepseek-v4-flash",
-           "*": "deepseek-chat"
+     "fallback": {
+       "failure_threshold": 3,
+       "degrade_duration": "5m",
+       "min_tokens_per_second": 30,
+       "idle_timeout": "30s"
+     },
+     "instances": {
+       "openai": [
+         {
+           "base_url": "https://api.deepseek.com",
+           "api_key": "sk-...",
+           "provider": "deepseek",
+           "timeout": "15s",
+           "models": ["deepseek-chat", "deepseek-reasoner"]
          }
-       }
-     ]
+       ],
+       "anthropic": [
+         {
+           "base_url": "https://api.deepseek.com/anthropic",
+           "api_key": "sk-...",
+           "provider": "deepseek",
+           "timeout": "15s",
+           "roles": {
+             "sonnet": "deepseek-v4-flash",
+             "opus": "deepseek-v4-pro",
+             "fable": "deepseek-v4-pro",
+             "haiku": "deepseek-v4-flash",
+             "*": "deepseek-chat"
+           }
+         }
+       ]
+     }
    }
    ```
 
@@ -103,21 +113,39 @@ M4 及之后（回退降级、跨平台 CI/Docker）见需求文档第 6 节。
 | `auth_token` | 是 | — | 客户端访问本代理的 token；OpenAI 入口走 Bearer，Anthropic 入口走 `x-api-key` |
 | `admin_user` | 否 | `admin` | 管理页/管理 API 的 Basic Auth 用户名 |
 | `admin_password` | 否 | 空（管理面禁用） | 管理页/管理 API 的 Basic Auth 密码 |
-| `instances` | 是 | — | 实例有序数组，非空；顺序即路由优先级 |
+| `fallback` | 否 | 见下 | 回退状态机参数 |
+| `instances` | 是 | — | 分组对象 `{openai:[...], anthropic:[...]}`；两组顺序各自即优先级，总数 ≥1 |
 
-`instances[]` 字段：
+`fallback` 字段（可视化页面顶部「回退参数」区块可直接编辑；JSON 模式同样可编辑）：
+
+| 字段 | 默认 | 校验 |
+|---|---|---|
+| `failure_threshold` | 3 | 整数 ≥1 |
+| `degrade_duration` | `5m` | Duration 字符串 >0 |
+| `min_tokens_per_second` | 30 | 浮点 ≥0；0 = 禁用吞吐判定（留空=缺省 30） |
+| `idle_timeout` | `30s` | Duration ≥0；0 = 禁用流式空闲超时（留空=缺省 30s） |
+
+`instances.openai[]` 字段：
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `protocol` | 是 | `openai` / `anthropic`（大小写不敏感，归一化小写） |
 | `base_url` | 是 | 绝对 http(s) URL；去尾部 `/` |
-| `api_key` | 是 | 上游密钥；OpenAI 用 `Authorization: Bearer`，Anthropic 用 `x-api-key` |
+| `api_key` | 是 | 上游密钥，使用 `Authorization: Bearer` |
 | `provider` | 否 | 内置供应商 id（见下节）；非空必须是已知 id，否则启动失败；空=自定义 |
 | `timeout` | 否 | 连接/等待响应头超时，默认 `15s` |
-| `models` | openai 必填 | 该实例对外提供的模型列表；去空去重、保留顺序；不得同时出现 `roles` |
-| `roles` | anthropic 必填 | 角色→实际模型映射，键 ∈ `sonnet`/`opus`/`fable`/`haiku`/`*`，值非空；不得同时出现 `models` |
+| `models` | 是 | 模型列表；去空去重、保留顺序；不得出现 `roles` |
 
-旧字段 `backends` 已废弃：出现即解析失败并提示迁移到 `instances`。`matches`/角色数组等旧写法也随 `backends` 一并废弃。
+`instances.anthropic[]` 字段：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `base_url` | 是 | 绝对 http(s) URL；去尾部 `/` |
+| `api_key` | 是 | 上游密钥，使用 `x-api-key` |
+| `provider` | 否 | 同上 |
+| `timeout` | 否 | 同上 |
+| `roles` | 是 | 角色→实际模型映射，键 ∈ `sonnet`/`opus`/`fable`/`haiku`/`*`，值非空；不得出现 `models` |
+
+实例内不再有 `protocol` 字段（由所在分组决定）；出现即解析失败。旧 `instances` 数组形态会报错并提示迁移为分组结构；旧字段 `backends` / `matches` 等同样已废弃。
 
 ### 供应商预设
 
@@ -141,7 +169,7 @@ M4 及之后（回退降级、跨平台 CI/Docker）见需求文档第 6 节。
 
 ## 路由规则
 
-运行时按 `instances` 顺序展开为扁平条目：OpenAI 实例的每个 `models` 项一条；Anthropic 实例的每个 `roles` 键值一条（展开顺序固定为 sonnet、opus、fable、haiku、`*`）。
+运行时按 `instances` 分组展开：`instances.openai` 的每个实例按 `models` 展开，`instances.anthropic` 的每个实例按 `roles` 键值展开（组内顺序即候选优先级，角色展开顺序固定为 sonnet、opus、fable、haiku、`*`）。
 
 | 场景 | 行为 |
 |---|---|
@@ -155,6 +183,25 @@ M4 及之后（回退降级、跨平台 CI/Docker）见需求文档第 6 节。
 | 请求体超过 10 MiB | 413，不转发 |
 
 判定顺序：对展开后的条目逐条检查 R4a → R4c；全部未命中后再扫描 `*`（R4d）；仍无则 R5。显式模型优先于角色，具体角色优先于托底。
+
+## 回退降级（实例粒度，M4）
+
+- 先按路由规则确定**基础实例**，再从基础实例开始按该协议实例顺序构建**候选链**（每个候选给出上游模型与是否需要改写）：
+  - OpenAI：实例含请求 `model` → 原样；不含 → 改用该实例 `models[0]` 并改写。
+  - Anthropic：实例含角色 R → 用 `roles[R]` 并改写；不含但有 `*` → 用 `roles["*"]` 并改写；两者皆无 → 跳过。
+  - R5（无 model/非字符串/null/非法 JSON/未命中）：以首个实例为基础，候选链覆盖该协议实例；Anthropic 只取声明 `*` 的实例；**正文不改写**。
+- 每个实例维护连续失败次数与持续回退截止时间（参数来自顶层 `fallback`，默认 3 次 / 5 分钟 / 30 token/s）：
+  1. 跳过仍在持续回退期的实例；
+  2. 连接失败 / 超时（实例 `timeout`，默认 15s）→ 本次请求立即尝试下一候选（临时回退）；
+  3. 连续失败 ≥ `failure_threshold` 次 → 进入持续回退 `degrade_duration`，后续请求跳过该实例；
+  4. 回退期结束后的首次探测若再失败 → 立即重新计时；成功则清零恢复；
+  5. 所有候选都在回退中 → 强制尝试链头一次；全部失败 → 502。
+- 吞吐：非流式响应完成后统计 `usage` 的 `completion_tokens`（OpenAI）/`output_tokens`（Anthropic），`tokens/耗时 < min_tokens_per_second` 记为失败（仅影响后续请求，已发出的响应不回退）。流式响应在流结束时按 SSE 中出现的 usage 做同样判定，但**不打断流**。`min_tokens_per_second=0` 禁用该判定。
+- 空闲超时（M4.1）：流式响应 committed 后，连续 `idle_timeout`（默认 30s）无新数据块 → 终止上游读取并记实例失败：
+  - Anthropic：先补 `content_block_stop`（若在块内），再补 `message_delta`（`stop_reason=pause_turn`）与 `message_stop`，客户端 SDK 可自动续接。
+  - OpenAI：直接中断客户端连接（流截断，不补 `[DONE]`）。
+  - 首字节等待仍由实例 `timeout` 控制；`idle_timeout=0` 禁用空闲判定。
+- 回退状态仅在进程内存；重启或 reload（重建 handler）后清零。
 
 ## 模型列表 `/v1/models`
 

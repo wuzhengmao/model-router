@@ -803,7 +803,7 @@ func TestRouteWildcardFallback(t *testing.T) {
 		assertModelRewritten(t, body, firstCaptured().body, "first-model")
 	})
 
-	t.Run("missing or non-string model does not use wildcard", func(t *testing.T) {
+	t.Run("R5 chain uses wildcard candidates and keeps the body untouched", func(t *testing.T) {
 		bodies := []string{
 			`{}`,
 			`{"model":123}`,
@@ -815,8 +815,8 @@ func TestRouteWildcardFallback(t *testing.T) {
 		}
 		for _, body := range bodies {
 			t.Run(body, func(t *testing.T) {
-				first, firstCaptured, firstCalls := newBackend(t, http.StatusOK, nil, `{"backend":"first"}`)
-				wildcard, _, wildcardCalls := newBackend(t, http.StatusOK, nil, `{"backend":"wildcard"}`)
+				first, _, firstCalls := newBackend(t, http.StatusOK, nil, `{"backend":"first"}`)
+				wildcard, wildcardCaptured, wildcardCalls := newBackend(t, http.StatusOK, nil, `{"backend":"wildcard"}`)
 				proxyServer := newProxy(t, serviceToken,
 					anthropicInstance(first.URL, "first-key", map[string]string{"sonnet": "first-model"}),
 					anthropicInstance(wildcard.URL, "wildcard-key", map[string]string{"*": "wildcard-model"}),
@@ -826,13 +826,15 @@ func TestRouteWildcardFallback(t *testing.T) {
 				if resp.StatusCode != http.StatusOK {
 					t.Fatalf("proxy status = %d, want 200", resp.StatusCode)
 				}
-				if got := firstCalls(); got != 1 {
-					t.Errorf("first backend calls = %d, want 1 (R5)", got)
+				// §11.2 R5: instances without "*" are skipped; the wildcard
+				// instance is the candidate and the body is not rewritten.
+				if got := firstCalls(); got != 0 {
+					t.Errorf("first backend calls = %d, want 0 (no wildcard)", got)
 				}
-				if got := wildcardCalls(); got != 0 {
-					t.Errorf("wildcard backend calls = %d, want 0", got)
+				if got := wildcardCalls(); got != 1 {
+					t.Errorf("wildcard backend calls = %d, want 1", got)
 				}
-				if got := firstCaptured().body; got != body {
+				if got := wildcardCaptured().body; got != body {
 					t.Errorf("backend body = %q, want verbatim %q", got, body)
 				}
 			})
@@ -1146,13 +1148,15 @@ const adminTestConfig = `{
 	"auth_token": "tok",
 	"admin_user": "admin",
 	"admin_password": "secret",
-	"instances": [{
-		"protocol": "openai",
-		"base_url": "https://api.example",
-		"api_key": "sk-real",
-		"models": ["gpt-real"],
-		"timeout": "15s"
-	}]
+	"fallback": {"failure_threshold": 3, "degrade_duration": "5m", "min_tokens_per_second": 30},
+	"instances": {
+		"openai": [{
+			"base_url": "https://api.example",
+			"api_key": "sk-real",
+			"models": ["gpt-real"],
+			"timeout": "15s"
+		}]
+	}
 }`
 
 const adminNewConfig = `{
@@ -1160,12 +1164,13 @@ const adminNewConfig = `{
 	"auth_token": "new-token",
 	"admin_user": "admin",
 	"admin_password": "secret",
-	"instances": [{
-		"protocol": "openai",
-		"base_url": "https://api.new",
-		"api_key": "new-key",
-		"models": ["new-model"]
-	}]
+	"instances": {
+		"openai": [{
+			"base_url": "https://api.new",
+			"api_key": "new-key",
+			"models": ["new-model"]
+		}]
+	}
 }`
 
 func newAdminServer(t *testing.T, configJSON string) (*httptest.Server, string) {
@@ -1221,7 +1226,7 @@ func modelIDs(t *testing.T, resp *http.Response) []string {
 func TestAdminDisabled(t *testing.T) {
 	server, _ := newAdminServer(t, `{
 		"auth_token": "tok",
-		"instances": [{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m"]}]
+		"instances": {"openai": [{"base_url": "https://example.com", "api_key": "k", "models": ["m"]}]}
 	}`)
 
 	cases := []struct {
@@ -1465,10 +1470,25 @@ func TestValidateConfig(t *testing.T) {
 	})
 
 	t.Run("invalid instance rejected", func(t *testing.T) {
-		invalid := `{"auth_token":"tok","instances":[{"protocol":"openai","base_url":"https://example.com","api_key":"k"}]}`
+		invalid := `{"auth_token":"tok","instances":{"openai":[{"base_url":"https://example.com","api_key":"k"}]}}`
 		resp := sendBasic(t, http.MethodPost, server.URL+"/api/config/validate", invalid, "admin", "secret")
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+	})
+
+	t.Run("legacy instances array rejected", func(t *testing.T) {
+		legacy := `{"auth_token":"tok","instances":[{"protocol":"openai","base_url":"https://example.com","api_key":"k","models":["m"]}]}`
+		resp := sendBasic(t, http.MethodPost, server.URL+"/api/config/validate", legacy, "admin", "secret")
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", resp.StatusCode)
+		}
+		var result validateResult
+		if err := json.Unmarshal([]byte(readBody(t, resp)), &result); err != nil {
+			t.Fatalf("validate response is not JSON: %v", err)
+		}
+		if result.OK || !strings.Contains(result.Error, "分组结构") {
+			t.Errorf("result = %+v, want grouped-instances migration hint", result)
 		}
 	})
 }

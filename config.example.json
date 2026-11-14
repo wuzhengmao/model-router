@@ -3,37 +3,44 @@
   "auth_token": "replace-with-your-client-token",
   "admin_user": "admin",
   "admin_password": "replace-with-your-admin-password",
-  "instances": [
-    {
-      "protocol": "openai",
-      "base_url": "https://api.deepseek.com",
-      "api_key": "sk-replace-with-your-deepseek-key",
-      "provider": "deepseek",
-      "timeout": "15s",
-      "models": ["deepseek-flash", "deepseek-v4-pro"]
-    },
-    {
-      "protocol": "anthropic",
-      "base_url": "https://api.deepseek.com/anthropic",
-      "api_key": "sk-replace-with-your-deepseek-key",
-      "provider": "deepseek",
-      "timeout": "15s",
-      "roles": {
-        "sonnet": "deepseek-v4-flash",
-        "opus": "deepseek-v4-pro",
-        "fable": "deepseek-v4-pro",
-        "haiku": "deepseek-v4-flash"
+  "fallback": {
+    "failure_threshold": 3,
+    "degrade_duration": "5m",
+    "min_tokens_per_second": 30,
+    "idle_timeout": "30s"
+  },
+  "instances": {
+    "openai": [
+      {
+        "base_url": "https://api.deepseek.com",
+        "api_key": "sk-replace-with-your-deepseek-key",
+        "provider": "deepseek",
+        "timeout": "15s",
+        "models": ["deepseek-chat", "deepseek-reasoner"]
       }
-    },
-    {
-      "protocol": "anthropic",
-      "base_url": "https://api.deepseek.com/anthropic",
-      "api_key": "sk-replace-with-your-deepseek-key",
-      "provider": "deepseek",
-      "timeout": "15s",
-      "roles": {
-        "*": "deepseek-v4-flash"
+    ],
+    "anthropic": [
+      {
+        "base_url": "https://api.deepseek.com/anthropic",
+        "api_key": "sk-replace-with-your-deepseek-key",
+        "provider": "deepseek",
+        "timeout": "15s",
+        "roles": {
+          "sonnet": "deepseek-v4-flash",
+          "opus": "deepseek-v4-pro",
+          "fable": "deepseek-v4-pro",
+          "haiku": "deepseek-v4-flash"
+        }
+      },
+      {
+        "base_url": "https://api.deepseek.com/anthropic",
+        "api_key": "sk-replace-with-your-deepseek-key",
+        "provider": "deepseek",
+        "timeout": "15s",
+        "roles": {
+          "*": "deepseek-chat"
+        }
       }
-    }
-  ]
+    ]
+  }
 }

@@ -49,9 +49,34 @@
 - M3-providers `probe/models` 支持可选 `provider`：命中该协议 models_override 时改用 override 的 base_url/auth 拉 `GET /v1/models`，否则沿用实例 base_url 与原认证；未知 provider → 400。`probe/test` 不涉及 provider。
 - M3-providers 配置页：新增实例先弹「选择供应商」框（内置供应商 + 自定义），选内置按当前 tab 自动填 base_url 并记录 provider，不支持当前协议时阻止；「查询模型」请求携带 provider；保存/JSON 高级编辑均保留该字段。
 - M3-providers 测试：providers 清单完整性（11 个、id 唯一、base_url/override 合法）、Get/override/ModelsSource 解析、Instance.provider 合法/空/非法、`GET /api/providers` 清单与鉴权、probe/models 无 override 回退与未知 provider 拒绝。
+- M4 实例粒度回退降级（§11）：候选链（基础实例 + 按实例顺序的后续候选，含上游模型与改写标记）；OpenAI 精确/`models[0]` 改写，Anthropic 角色/`*` 改写与不可服务实例跳过，R5 候选链不改写正文。
+- M4 回退状态机：每实例 `consecutiveFailures` + `degradedUntil`（`sync.Mutex` 保护）；跳过持续回退实例、连接/超时本次请求立即临时回退、连续失败 3 次进入 5 分钟持续回退、回退期探测失败立即重新计时、成功清零、全部降级强制尝试链头。
+- M4 失败判定：连接失败与 dial/响应头超时在响应前触发回退；非流式响应按 usage 计算 `tokens/elapsed < 30` 记录失败（响应已发出不回退）；SSE 不做吞吐判定。
+- M4 配置页实例拖动排序：实例卡片标题可拖动（HTML5 drag & drop），保存时按界面顺序序列化 `instances`。
+- M4 测试：候选链（OpenAI 精确/改写/基础实例、Anthropic 角色/`*`/跳过/精确、R5 无 `*` 兜底）、状态机（临时回退、<3 重试主实例、≥3 持续回退、回退期探测失败重新计时、成功恢复、全降级强制链头）、并发（20 并发 + race detector）、吞吐（OpenAI `completion_tokens` / Anthropic `output_tokens` / 无 usage 不判失败）。
+- M4-config `fallback` 配置对象（§12.2）：`failure_threshold`（默认 3，≥1）、`degrade_duration`（默认 `5m`，>0）、`min_tokens_per_second`（默认 30，≥0，0=禁用吞吐判定）；整体可省略，非法值启动/validate 失败；状态机参数改从配置读取。
+- M4-config `instances` 分组结构：顶层改为 `{"openai":[...],"anthropic":[...]}`；实例不再含 `protocol` 字段（由分组决定），两组合计至少 1 个实例；旧数组形态报错提示迁移为分组结构。
+- M4-config 运行时适配：配置解析后内部仍保持带协议标记的有序切片（`config.Instances`），`proxy` 的候选链/状态机/路由/`/v1/models`/probe 逻辑不变，仅回退参数来源改为 `Config.Fallback`。
+- M4-config 配置页：可视化模式从 `instances.openai` / `instances.anthropic` 读取，拖动排序在组内生效、按组序列化；JSON 模式展示并保留 `fallback` 与分组结构。
+- M4-config 测试：fallback 缺省/显式/`min_tokens_per_second=0`/非法值；分组解析与保序、空组合计 0 失败、实例含 `protocol` 报错、旧数组迁移提示；配置驱动的阈值/回退时长/禁用吞吐行为。
+- M4-fallback-ui 可视化回退参数：页面顶部新增「回退参数」区块（failure_threshold / degrade_duration / min_tokens_per_second），加载时从 `fallback` 回填（显式 0 显示 0、缺失显示默认 3/5m/30）；保存时前端校验（阈值 ≥1、Go 风格时长 >0、吞吐 ≥0）并入 `config.fallback`，通过后再调用 `/api/config/validate` 兜底；留空字段不写入（走默认）。
+- M4-fallback-ui 交互细节：非法值就地提示并阻止保存；切到 JSON 模式遇到非法输入时使用已加载的 fallback；输入变更清除错误提示。
+- M4.1 `fallback.idle_timeout`（默认 `30s`，0=禁用）：OptionalDuration 支持显式 0，负值/非法值启动失败；`Fallback.Values()` 返回生效值，配置页新增「空闲超时」输入框（加载回填、保存校验、留空走默认）。
+- M4.1 流式空闲超时：committed 后按 chunk 到达 Reset 的 `time.AfterFunc` 计时；超时关闭上游读取并记实例失败。Anthropic 补发 `content_block_stop`（若在块内）+ `message_delta(stop_reason=pause_turn)` + `message_stop`；OpenAI 通过 Hijack 直接中断客户端连接（不补 `[DONE]`）。
+- M4.1 流式吞吐：SSE 解析 `usage.output_tokens` / `completion_tokens`，流结束后低于 `min_tokens_per_second` 仅记失败、不打断；非流式逻辑不变。
+- M4.1 测试：idle_timeout 缺省/显式/0/非法；Anthropic 静默流收到 pause_turn 收尾（含 content_block_stop 与 usage）；OpenAI 静默流连接截断；OpenAI 慢速流完整结束且仅记失败；配置驱动的 idle_timeout 生效。
 
 ### Changed
 
+- M4.1 流式响应会先移除上游 `Content-Length`（补发收尾事件时需要 chunked 帧）；SSE 响应头其余字段仍原样透传。
+- M4.1 流式吞吐判定由“跳过”改为“按 SSE usage 判定但从不打断流”。
+- M4-fallback-ui 可视化「保存到文件」流程改为先 `POST /api/config/validate` 再 `PUT /api/config`；`fallback` 不再原样透传已加载对象，而是由三个输入框序列化。
+- M4-config 配置不兼容变更：`instances` 由混合数组改为分组对象，实例移除 `protocol` 字段；旧配置需迁移（出现旧数组会得到「分组结构」错误提示）。
+- M4-config `proxy.New` 现在从 `Config.Fallback` 读取 3 个回退参数；`NewWithOptions` 仍可注入测试用参数（0 表示沿用配置）。
+- M4-config `config.example.json` 迁移为 `fallback` + 分组 `instances`。
+- M4 路由执行由「单条 route」改为「候选链 + 状态机」；`proxy.New` 保持兼容，新增 `proxy.NewWithOptions` 供阈值/时钟注入（默认 3 次 / 5 分钟 / 30 token/s）。
+- M4 Anthropic R5（无可用 model）候选链改为「声明 `*` 的实例」且不改写正文；无任何 `*` 时兜底尝试第一个实例，保持 M3 R5 行为。
+- M4 reload 会重建 handler，因此回退计数/持续回退状态随 reload 清零（仅进程内存，无需持久化）。
 - M3.1 配置结构不兼容变更：移除 `backends` 与 `matches`，改为 `instances`（OpenAI `models` / Anthropic `roles`）；旧配置需迁移，出现 `backends` 会得到迁移提示。
 - M3.1 配置示例与文档迁移为 `instances`：`config.example.json` 为 1 个 openai 实例（2 个模型）+ 2 个 anthropic 实例（角色映射与 `*` 托底）；README/design/tests 同步更新。
 - M3.1 运行时内部结构由 `backend`/`matches`/`roles[]` 改为展开后的 route 条目；Anthropic roles 因 JSON 对象无顺序，展开顺序固定为 sonnet→opus→fable→haiku→`*`（同一实例内条目共用上游，路由结果不受影响）。

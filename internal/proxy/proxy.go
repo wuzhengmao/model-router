@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -56,15 +57,12 @@ var hopByHopHeaders = []string{
 	"Upgrade",
 }
 
-// roleOrder is the deterministic expansion order for anthropic role maps.
-// JSON objects have no preserved order, and entries of one instance share the
-// same upstream, so the order only affects the published /v1/models sequence.
-var roleOrder = []string{
+// concreteRoles is the canonical order for concrete anthropic roles.
+var concreteRoles = []string{
 	config.RoleSonnet,
 	config.RoleOpus,
 	config.RoleFable,
 	config.RoleHaiku,
-	config.RoleWildcard,
 }
 
 type protocol string
@@ -74,34 +72,90 @@ const (
 	protocolAnthropic protocol = config.ProtocolAnthropic
 )
 
-// route is one flattened model mapping from an instance.
-type route struct {
+// instanceRuntime is one configured instance plus its in-memory fallback state.
+type instanceRuntime struct {
 	baseURL *url.URL
 	apiKey  string
-	model   string
-	role    string // anthropic role (including "*"); empty for openai
+	models  []string
+	roles   map[string]string
 	client  *http.Client
+
+	mu                  sync.Mutex
+	consecutiveFailures int
+	degradedUntil       time.Time
+}
+
+// Fallback defaults (kept for compatibility; the effective values come from
+// config.Fallback, §12.2).
+const (
+	DefaultFailureThreshold   = config.DefaultFailureThreshold
+	DefaultDegradeDuration    = config.DefaultDegradeDuration
+	DefaultMinTokensPerSecond = config.DefaultMinTokensPerSecond
+)
+
+// Options tunes the fallback state machine. Zero values select defaults.
+type Options struct {
+	Now                func() time.Time
+	FailureThreshold   int
+	DegradeDuration    time.Duration
+	MinTokensPerSecond float64
+	IdleTimeout        time.Duration
 }
 
 // Handler routes OpenAI and Anthropic requests to their configured instances
 // without translating the protocol.
 type Handler struct {
-	authToken  string
-	byProtocol map[protocol][]*route
+	authToken          string
+	byProtocol         map[protocol][]*instanceRuntime
+	now                func() time.Time
+	failureThreshold   int
+	degradeDuration    time.Duration
+	minTokensPerSecond float64
+	idleTimeout        time.Duration
 }
 
-// New builds a Handler from the configured instances.
+// New builds a Handler with the default fallback parameters.
 func New(cfg *config.Config) (*Handler, error) {
+	return NewWithOptions(cfg, Options{})
+}
+
+// NewWithOptions builds a Handler from the configured instances.
+func NewWithOptions(cfg *config.Config, opts Options) (*Handler, error) {
 	if cfg.AuthToken == "" {
 		return nil, errors.New("auth_token is required")
 	}
 	if len(cfg.Instances) == 0 {
 		return nil, errors.New("instances must contain at least one instance")
 	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	fallback := cfg.Fallback.Values()
+	threshold := fallback.FailureThreshold
+	degradeDuration := fallback.DegradeDuration
+	minTokensPerSecond := fallback.MinTokensPerSecond
+	idleTimeout := fallback.IdleTimeout
+	if opts.FailureThreshold > 0 {
+		threshold = opts.FailureThreshold
+	}
+	if opts.DegradeDuration > 0 {
+		degradeDuration = opts.DegradeDuration
+	}
+	if opts.MinTokensPerSecond != 0 {
+		minTokensPerSecond = opts.MinTokensPerSecond
+	}
+	if opts.IdleTimeout > 0 {
+		idleTimeout = opts.IdleTimeout
+	}
 
 	h := &Handler{
-		authToken:  cfg.AuthToken,
-		byProtocol: make(map[protocol][]*route),
+		authToken:          cfg.AuthToken,
+		byProtocol:         make(map[protocol][]*instanceRuntime),
+		now:                opts.Now,
+		failureThreshold:   threshold,
+		degradeDuration:    degradeDuration,
+		minTokensPerSecond: minTokensPerSecond,
+		idleTimeout:        idleTimeout,
 	}
 	for i, inst := range cfg.Instances {
 		proto := protocol(strings.ToLower(strings.TrimSpace(inst.Protocol)))
@@ -118,49 +172,66 @@ func New(cfg *config.Config) (*Handler, error) {
 		if base.Host == "" || (base.Scheme != "http" && base.Scheme != "https") {
 			return nil, fmt.Errorf("instances[%d]: base_url must be an absolute http(s) URL, got %q", i, inst.BaseURL)
 		}
-		client := newClient(inst.Timeout.Duration())
 
+		ir := &instanceRuntime{
+			baseURL: base,
+			apiKey:  inst.APIKey,
+			client:  newClient(inst.Timeout.Duration()),
+		}
 		switch proto {
 		case protocolOpenAI:
 			for _, model := range inst.Models {
-				model = strings.TrimSpace(model)
-				if model == "" {
-					continue
+				if model = strings.TrimSpace(model); model != "" {
+					ir.models = append(ir.models, model)
 				}
-				h.byProtocol[proto] = append(h.byProtocol[proto], &route{
-					baseURL: base,
-					apiKey:  inst.APIKey,
-					model:   model,
-					client:  client,
-				})
 			}
 		case protocolAnthropic:
-			roles := make(map[string]string, len(inst.Roles))
+			ir.roles = make(map[string]string, len(inst.Roles))
 			for rawRole, rawModel := range inst.Roles {
 				role := strings.ToLower(strings.TrimSpace(rawRole))
 				if !config.IsValidRole(role) {
 					return nil, fmt.Errorf("instances[%d]: invalid role %q", i, rawRole)
 				}
 				if model := strings.TrimSpace(rawModel); model != "" {
-					roles[role] = model
+					ir.roles[role] = model
 				}
-			}
-			for _, role := range roleOrder {
-				model, ok := roles[role]
-				if !ok {
-					continue
-				}
-				h.byProtocol[proto] = append(h.byProtocol[proto], &route{
-					baseURL: base,
-					apiKey:  inst.APIKey,
-					model:   model,
-					role:    role,
-					client:  client,
-				})
 			}
 		}
+		h.byProtocol[proto] = append(h.byProtocol[proto], ir)
 	}
 	return h, nil
+}
+
+func (inst *instanceRuntime) isDegraded(now time.Time) bool {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	return now.Before(inst.degradedUntil)
+}
+
+func (inst *instanceRuntime) recordSuccess() {
+	inst.mu.Lock()
+	inst.consecutiveFailures = 0
+	inst.degradedUntil = time.Time{}
+	inst.mu.Unlock()
+}
+
+func (inst *instanceRuntime) recordFailure(now time.Time, threshold int, duration time.Duration) {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	inst.consecutiveFailures++
+	if !inst.degradedUntil.IsZero() && !now.Before(inst.degradedUntil) {
+		// Recovery probe after the degradation window failed: re-time without
+		// waiting for the failure count again.
+		inst.degradedUntil = now.Add(duration)
+		return
+	}
+	if inst.consecutiveFailures >= threshold {
+		inst.degradedUntil = now.Add(duration)
+	}
+}
+
+func (h *Handler) recordFailure(inst *instanceRuntime) {
+	inst.recordFailure(h.now(), h.failureThreshold, h.degradeDuration)
 }
 
 func newClient(timeout time.Duration) *http.Client {
@@ -195,8 +266,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	routes := h.byProtocol[proto]
-	if len(routes) == 0 {
+	insts := h.byProtocol[proto]
+	if len(insts) == 0 {
 		writeProtocolError(w, proto, http.StatusBadGateway, "no instance configured for protocol "+string(proto))
 		return
 	}
@@ -212,17 +283,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	selected, forwardBody := selectRoute(routes, body)
-
-	start := time.Now()
-	status, err := h.forward(w, r, proto, selected, forwardBody)
-	if err != nil {
-		// The response may already be partially written; just record the failure.
-		log.Printf("%s %s failed: %v", r.Method, r.URL.Path, err)
-		return
-	}
-	log.Printf("%s %s -> model=%q (%s) %d in %s",
-		r.Method, r.URL.Path, selected.model, proto, status, time.Since(start).Round(time.Millisecond))
+	h.serveChain(w, r, proto, insts, body)
 }
 
 // protocolForPath returns the protocol of the entrypoint. /v1/models has no
@@ -279,11 +340,18 @@ func (h *Handler) modelList(proto protocol) []string {
 		seen[name] = true
 		models = append(models, name)
 	}
-	for _, rt := range h.byProtocol[proto] {
-		if proto == protocolAnthropic && rt.role == config.RoleWildcard {
+	for _, inst := range h.byProtocol[proto] {
+		if proto == protocolAnthropic {
+			for _, role := range concreteRoles {
+				if model, ok := inst.roles[role]; ok {
+					add(model)
+				}
+			}
 			continue
 		}
-		add(rt.model)
+		for _, model := range inst.models {
+			add(model)
+		}
 	}
 	return models
 }
@@ -388,35 +456,231 @@ func (h *Handler) writeAuthError(w http.ResponseWriter, proto protocol, r *http.
 	writeOpenAIError(w, http.StatusUnauthorized, "invalid_request_error", code, message)
 }
 
-// selectRoute picks a flattened route by the request body's top-level model:
-// exact model match wins without rewriting; a concrete role match (role name or
-// claude-<role>- prefix) rewrites; then the first "*" route rewrites; anything
-// unusable or unmatched falls back to the first route untouched.
-func selectRoute(routes []*route, body []byte) (*route, []byte) {
-	model, ok := requestModel(body)
-	if !ok {
-		return routes[0], body
-	}
-	for _, rt := range routes {
-		if rt.model == model {
-			return rt, body
-		}
-		if rt.role != "" && rt.role != config.RoleWildcard && matchesRole(model, rt.role) {
-			return rt, rewriteModel(body, rt.model)
-		}
-	}
-	for _, rt := range routes {
-		if rt.role == config.RoleWildcard {
-			return rt, rewriteModel(body, rt.model)
-		}
-	}
-	return routes[0], body
+type matchKind int
+
+const (
+	matchExact matchKind = iota
+	matchRole
+	matchWildcard
+	matchFallback
+)
+
+// candidate is one instance that can serve the request, plus the upstream model
+// to use and whether the request body's "model" must be rewritten.
+type candidate struct {
+	inst    *instanceRuntime
+	model   string
+	rewrite bool
 }
 
-// matchesRole reports whether model names role exactly ("sonnet") or as an
-// official-style id ("claude-sonnet-*").
-func matchesRole(model, role string) bool {
-	return model == role || strings.HasPrefix(model, "claude-"+role+"-")
+// serveChain runs the fallback state machine: skip degraded instances, try
+// candidates in order, retry on pre-response failures, and record outcomes.
+func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto protocol, insts []*instanceRuntime, body []byte) {
+	start := time.Now()
+	chain := buildChain(proto, insts, body)
+	now := h.now()
+
+	attempted := false
+	for _, cand := range chain {
+		if cand.inst.isDegraded(now) {
+			continue
+		}
+		attempted = true
+		committed, err := h.tryCandidate(w, r, proto, cand, body)
+		if committed {
+			if err != nil {
+				log.Printf("%s %s response committed with error: %v", r.Method, r.URL.Path, err)
+			} else {
+				log.Printf("%s %s -> model=%q (%s) in %s",
+					r.Method, r.URL.Path, cand.model, proto, time.Since(start).Round(time.Millisecond))
+			}
+			return
+		}
+		log.Printf("%s %s candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.baseURL, err)
+	}
+
+	if !attempted && len(chain) > 0 {
+		// All candidates are in sustained degradation: force the chain head once.
+		cand := chain[0]
+		committed, err := h.tryCandidate(w, r, proto, cand, body)
+		if committed {
+			if err != nil {
+				log.Printf("%s %s forced response committed with error: %v", r.Method, r.URL.Path, err)
+			} else {
+				log.Printf("%s %s -> model=%q (%s, forced) in %s",
+					r.Method, r.URL.Path, cand.model, proto, time.Since(start).Round(time.Millisecond))
+			}
+			return
+		}
+		log.Printf("%s %s forced candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.baseURL, err)
+	}
+
+	writeProtocolError(w, proto, http.StatusBadGateway, "upstream request failed")
+}
+
+// buildChain determines the base instance per §9.2 and collects the fallback
+// candidates from it, each with its upstream model and rewrite flag (§11.2).
+func buildChain(proto protocol, insts []*instanceRuntime, body []byte) []*candidate {
+	model, usable := requestModel(body)
+	if !usable {
+		return fallbackChain(proto, insts)
+	}
+	base, kind := findBase(proto, insts, model)
+	from := insts[base:]
+	switch kind {
+	case matchExact:
+		return exactChain(proto, from, model)
+	case matchRole:
+		role, _ := requestRole(model)
+		return roleChain(from, role)
+	case matchWildcard:
+		return wildcardChain(from)
+	default:
+		return fallbackChain(proto, insts)
+	}
+}
+
+// findBase returns the first instance that can handle the request (R4a → R4c →
+// R4d), mirroring the M3 routing rules.
+func findBase(proto protocol, insts []*instanceRuntime, model string) (int, matchKind) {
+	role, hasRole := "", false
+	if proto == protocolAnthropic {
+		role, hasRole = requestRole(model)
+	}
+	for i, inst := range insts {
+		if inst.hasModel(model) {
+			return i, matchExact
+		}
+		if hasRole && inst.hasRole(role) {
+			return i, matchRole
+		}
+	}
+	if proto == protocolAnthropic {
+		for i, inst := range insts {
+			if inst.hasWildcard() {
+				return i, matchWildcard
+			}
+		}
+	}
+	return 0, matchFallback
+}
+
+// exactChain: the request model matched, so instances that declare it keep the
+// body untouched; the rest rewrite to their first model (openai) or wildcard
+// (anthropic), or are skipped when they cannot map the request.
+func exactChain(proto protocol, insts []*instanceRuntime, model string) []*candidate {
+	out := make([]*candidate, 0, len(insts))
+	for _, inst := range insts {
+		if proto == protocolAnthropic {
+			if inst.hasModel(model) {
+				out = append(out, &candidate{inst: inst, model: model})
+			} else if wildcard, ok := inst.roles[config.RoleWildcard]; ok {
+				out = append(out, &candidate{inst: inst, model: wildcard, rewrite: true})
+			}
+			continue
+		}
+		if len(inst.models) == 0 {
+			continue
+		}
+		if contains(inst.models, model) {
+			out = append(out, &candidate{inst: inst, model: model})
+		} else {
+			out = append(out, &candidate{inst: inst, model: inst.models[0], rewrite: true})
+		}
+	}
+	return out
+}
+
+// roleChain: every instance declaring the role (or a wildcard) can serve it.
+func roleChain(insts []*instanceRuntime, role string) []*candidate {
+	out := make([]*candidate, 0, len(insts))
+	for _, inst := range insts {
+		if model, ok := inst.roles[role]; ok {
+			out = append(out, &candidate{inst: inst, model: model, rewrite: true})
+		} else if wildcard, ok := inst.roles[config.RoleWildcard]; ok {
+			out = append(out, &candidate{inst: inst, model: wildcard, rewrite: true})
+		}
+	}
+	return out
+}
+
+func wildcardChain(insts []*instanceRuntime) []*candidate {
+	out := make([]*candidate, 0, len(insts))
+	for _, inst := range insts {
+		if model, ok := inst.roles[config.RoleWildcard]; ok {
+			out = append(out, &candidate{inst: inst, model: model, rewrite: true})
+		}
+	}
+	return out
+}
+
+// fallbackChain (R5): all instances are candidates, but the body stays verbatim.
+func fallbackChain(proto protocol, insts []*instanceRuntime) []*candidate {
+	out := make([]*candidate, 0, len(insts))
+	for _, inst := range insts {
+		if proto == protocolAnthropic {
+			if model, ok := inst.roles[config.RoleWildcard]; ok {
+				out = append(out, &candidate{inst: inst, model: model})
+			}
+			continue
+		}
+		if len(inst.models) > 0 {
+			out = append(out, &candidate{inst: inst, model: inst.models[0]})
+		}
+	}
+	if len(out) == 0 && len(insts) > 0 {
+		// Safety net for R5 when no anthropic instance declares "*": keep M3
+		// behavior and still attempt the first instance with the body untouched.
+		out = append(out, &candidate{inst: insts[0]})
+	}
+	return out
+}
+
+func (inst *instanceRuntime) hasModel(model string) bool {
+	for _, declared := range inst.models {
+		if declared == model {
+			return true
+		}
+	}
+	for _, mapped := range inst.roles {
+		if mapped == model {
+			return true
+		}
+	}
+	return false
+}
+
+func (inst *instanceRuntime) hasRole(role string) bool {
+	_, ok := inst.roles[role]
+	return ok
+}
+
+func (inst *instanceRuntime) hasWildcard() bool {
+	return inst.hasRole(config.RoleWildcard)
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+// requestRole maps a role name or claude-<role>- id to the concrete role.
+func requestRole(model string) (string, bool) {
+	for _, role := range concreteRoles {
+		if model == role {
+			return role, true
+		}
+	}
+	for _, role := range concreteRoles {
+		if strings.HasPrefix(model, "claude-"+role+"-") {
+			return role, true
+		}
+	}
+	return "", false
 }
 
 // requestModel extracts a top-level string "model" field. Missing, null and
@@ -461,22 +725,31 @@ func rewriteModel(body []byte, model string) []byte {
 	return rewritten
 }
 
-func (h *Handler) forward(w http.ResponseWriter, r *http.Request, proto protocol, rt *route, body []byte) (int, error) {
-	target, err := url.JoinPath(rt.baseURL.String(), r.URL.Path)
+// tryCandidate attempts one candidate. committed reports that a response was
+// (at least partially) written to the client, so no further candidate may be
+// tried. A non-nil error with committed=false is a retryable pre-response
+// failure (connection/dial/response-header errors).
+func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto protocol, cand *candidate, body []byte) (committed bool, err error) {
+	attemptBody := body
+	if cand.rewrite {
+		attemptBody = rewriteModel(body, cand.model)
+	}
+
+	target, err := url.JoinPath(cand.inst.baseURL.String(), r.URL.Path)
 	if err != nil {
-		writeProtocolError(w, proto, http.StatusBadGateway, "cannot build upstream URL")
-		return 0, fmt.Errorf("join upstream URL: %w", err)
+		h.recordFailure(cand.inst)
+		return false, fmt.Errorf("join upstream URL: %w", err)
 	}
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
 
-	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(body))
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(attemptBody))
 	if err != nil {
-		writeProtocolError(w, proto, http.StatusBadGateway, "cannot build upstream request")
-		return 0, fmt.Errorf("build upstream request: %w", err)
+		h.recordFailure(cand.inst)
+		return false, fmt.Errorf("build upstream request: %w", err)
 	}
-	outReq.ContentLength = int64(len(body))
+	outReq.ContentLength = int64(len(attemptBody))
 
 	copyHeader(outReq.Header, r.Header)
 	removeHopByHop(outReq.Header)
@@ -486,26 +759,133 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, proto protocol
 	outReq.Header.Del("Authorization")
 	if proto == protocolAnthropic {
 		outReq.Header.Del("x-api-key")
-		outReq.Header.Set("x-api-key", rt.apiKey)
+		outReq.Header.Set("x-api-key", cand.inst.apiKey)
 	} else {
-		outReq.Header.Set("Authorization", "Bearer "+rt.apiKey)
+		outReq.Header.Set("Authorization", "Bearer "+cand.inst.apiKey)
 	}
 
-	resp, err := rt.client.Do(outReq)
+	attemptStart := time.Now()
+	resp, err := cand.inst.client.Do(outReq)
 	if err != nil {
-		writeProtocolError(w, proto, http.StatusBadGateway, "upstream request failed")
-		return 0, fmt.Errorf("upstream request: %w", err)
+		h.recordFailure(cand.inst)
+		return false, fmt.Errorf("upstream request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	copyHeader(w.Header(), resp.Header)
 	removeHopByHop(w.Header())
+	streaming := isEventStream(resp.Header)
+	if streaming {
+		// Appending platform-generated tail events requires chunked framing.
+		w.Header().Del("Content-Length")
+	}
 	w.WriteHeader(resp.StatusCode)
 
-	if err := copyBody(w, resp.Body); err != nil {
-		return resp.StatusCode, fmt.Errorf("copy response body: %w", err)
+	if streaming {
+		outcome, streamErr := h.copySSE(w, resp.Body, h.idleTimeout)
+		elapsed := time.Since(attemptStart)
+		if outcome.idle {
+			if proto == protocolAnthropic && !outcome.state.finished {
+				if err := writePauseTurnTail(w, &outcome.state); err != nil {
+					h.recordFailure(cand.inst)
+					return true, fmt.Errorf("write pause_turn tail: %w", err)
+				}
+			} else if proto == protocolOpenAI {
+				truncateClientConnection(w)
+			}
+			h.recordFailure(cand.inst)
+			log.Printf("instance %s idle for %s; stream terminated", cand.inst.baseURL, h.idleTimeout)
+			return true, nil
+		}
+		if streamErr != nil {
+			h.recordFailure(cand.inst)
+			return true, fmt.Errorf("copy response body: %w", streamErr)
+		}
+		if outcome.state.hasTokens && elapsed > 0 &&
+			float64(outcome.state.tokens)/elapsed.Seconds() < h.minTokensPerSecond {
+			h.recordFailure(cand.inst)
+			log.Printf("instance %s slow stream: %d tokens in %s",
+				cand.inst.baseURL, outcome.state.tokens, elapsed.Round(time.Millisecond))
+		} else {
+			cand.inst.recordSuccess()
+		}
+		return true, nil
 	}
-	return resp.StatusCode, nil
+
+	var tokens int
+	var tokensOK bool
+	capture := &cappedBuffer{limit: tokenCaptureLimit}
+	copyErr := copyBodyTee(w, resp.Body, capture)
+	if !capture.truncated {
+		tokens, tokensOK = parseUsageTokens(proto, capture.bytes())
+	}
+	elapsed := time.Since(attemptStart)
+
+	if copyErr != nil {
+		h.recordFailure(cand.inst)
+		return true, fmt.Errorf("copy response body: %w", copyErr)
+	}
+	if tokensOK && elapsed > 0 && float64(tokens)/elapsed.Seconds() < h.minTokensPerSecond {
+		h.recordFailure(cand.inst)
+		log.Printf("instance %s slow: %d tokens in %s", cand.inst.baseURL, tokens, elapsed.Round(time.Millisecond))
+	} else {
+		cand.inst.recordSuccess()
+	}
+	return true, nil
+}
+
+func isEventStream(header http.Header) bool {
+	return strings.HasPrefix(strings.ToLower(header.Get("Content-Type")), "text/event-stream")
+}
+
+const tokenCaptureLimit = 4 << 20 // 4 MiB
+
+// cappedBuffer captures a response body up to limit; truncated bodies are not
+// parsed for usage to avoid mis-measuring throughput.
+type cappedBuffer struct {
+	buf       []byte
+	limit     int
+	truncated bool
+}
+
+func (b *cappedBuffer) Write(p []byte) (int, error) {
+	if b.truncated {
+		return len(p), nil
+	}
+	remaining := b.limit - len(b.buf)
+	if len(p) > remaining {
+		b.buf = append(b.buf, p[:remaining]...)
+		b.truncated = true
+		return len(p), nil
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+func (b *cappedBuffer) bytes() []byte { return b.buf }
+
+// parseUsageTokens extracts completion_tokens (openai) or output_tokens
+// (anthropic); ok=false means the usage field was absent or unparseable.
+func parseUsageTokens(proto protocol, body []byte) (int, bool) {
+	var payload struct {
+		Usage struct {
+			CompletionTokens *int `json:"completion_tokens"`
+			OutputTokens     *int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return 0, false
+	}
+	if proto == protocolAnthropic {
+		if payload.Usage.OutputTokens != nil {
+			return *payload.Usage.OutputTokens, true
+		}
+		return 0, false
+	}
+	if payload.Usage.CompletionTokens != nil {
+		return *payload.Usage.CompletionTokens, true
+	}
+	return 0, false
 }
 
 // copyBody streams the upstream body to the client, flushing after each chunk
@@ -530,6 +910,205 @@ func copyBody(w http.ResponseWriter, src io.Reader) error {
 			return err
 		}
 	}
+}
+
+// copyBodyTee streams like copyBody while capturing the bytes for usage parsing.
+func copyBodyTee(w http.ResponseWriter, src io.Reader, capture io.Writer) error {
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			if _, cerr := capture.Write(buf[:n]); cerr != nil {
+				return cerr
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// sseState tracks the minimal Anthropic/OpenAI stream state needed for the
+// pause_turn tail and streaming throughput judgement.
+type sseState struct {
+	pending    []byte
+	inBlock    bool
+	blockIndex int
+	tokens     int
+	hasTokens  bool
+	finished   bool
+}
+
+func (s *sseState) feed(chunk []byte) {
+	s.pending = append(s.pending, chunk...)
+	for {
+		idx := bytes.IndexByte(s.pending, '\n')
+		if idx < 0 {
+			return
+		}
+		line := strings.TrimRight(string(s.pending[:idx]), "\r")
+		s.pending = append([]byte(nil), s.pending[idx+1:]...)
+		s.processLine(line)
+	}
+}
+
+func (s *sseState) processLine(line string) {
+	if !strings.HasPrefix(line, "data:") {
+		return
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if payload == "" {
+		return
+	}
+	if payload == "[DONE]" {
+		s.finished = true
+		return
+	}
+	var event struct {
+		Type  string `json:"type"`
+		Index *int   `json:"index"`
+		Usage struct {
+			CompletionTokens *int `json:"completion_tokens"`
+			OutputTokens     *int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		return
+	}
+	if event.Usage.CompletionTokens != nil {
+		s.tokens = *event.Usage.CompletionTokens
+		s.hasTokens = true
+	}
+	if event.Usage.OutputTokens != nil {
+		s.tokens = *event.Usage.OutputTokens
+		s.hasTokens = true
+	}
+	switch event.Type {
+	case "content_block_start":
+		s.inBlock = true
+		if event.Index != nil {
+			s.blockIndex = *event.Index
+		}
+	case "content_block_stop":
+		s.inBlock = false
+	case "message_stop":
+		s.finished = true
+	}
+}
+
+type sseOutcome struct {
+	idle  bool
+	state sseState
+}
+
+// copySSE streams an SSE body, resetting the idle timer on every chunk. When
+// idle > 0 and no chunk arrives for that long, it closes the upstream body and
+// reports outcome.idle; the caller then emits protocol-specific tail events.
+func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle time.Duration) (sseOutcome, error) {
+	var outcome sseOutcome
+	var idleHit atomic.Bool
+	var timer *time.Timer
+	if idle > 0 {
+		timer = time.AfterFunc(idle, func() {
+			idleHit.Store(true)
+			_ = body.Close()
+		})
+		defer timer.Stop()
+	}
+
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := body.Read(buf)
+		if n > 0 {
+			outcome.state.feed(buf[:n])
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return outcome, werr
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if timer != nil {
+				timer.Reset(idle)
+			}
+		}
+		if err == io.EOF {
+			return outcome, nil
+		}
+		if err != nil {
+			if idleHit.Load() {
+				outcome.idle = true
+				return outcome, nil
+			}
+			return outcome, err
+		}
+	}
+}
+
+// writePauseTurnTail emits Anthropic's graceful stop for an idle stream so the
+// client SDK can continue with pause_turn.
+func writePauseTurnTail(w http.ResponseWriter, state *sseState) error {
+	var builder strings.Builder
+	if state.inBlock {
+		data, err := json.Marshal(map[string]any{
+			"type":  "content_block_stop",
+			"index": state.blockIndex,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(&builder, "event: content_block_stop\ndata: %s\n\n", data)
+	}
+
+	tokens := 0
+	if state.hasTokens {
+		tokens = state.tokens
+	}
+	data, err := json.Marshal(map[string]any{
+		"type": "message_delta",
+		"delta": map[string]any{
+			"stop_reason":   "pause_turn",
+			"stop_sequence": nil,
+		},
+		"usage": map[string]any{"output_tokens": tokens},
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(&builder, "event: message_delta\ndata: %s\n\n", data)
+	builder.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+
+	if _, err := io.WriteString(w, builder.String()); err != nil {
+		return err
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
+}
+
+// truncateClientConnection aborts the client connection without a terminating
+// chunk, so an OpenAI SSE consumer sees a truncated stream and decides on retry.
+func truncateClientConnection(w http.ResponseWriter) {
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		return
+	}
+	conn, _, err := hijacker.Hijack()
+	if err != nil {
+		return
+	}
+	_ = conn.Close()
 }
 
 func copyHeader(dst, src http.Header) {

@@ -24,13 +24,14 @@ func writeConfig(t *testing.T, contents string) string {
 func TestLoadAppliesDefaults(t *testing.T) {
 	path := writeConfig(t, `{
 		"auth_token": "client-token",
-		"instances": [{
-			"protocol": "OpenAI",
-			"base_url": "http://127.0.0.1:9000/",
-			"api_key": " sk-test ",
-			"provider": " DeepSeek ",
-			"models": [" gpt-a ", "", "gpt-b", "gpt-a"]
-		}]
+		"instances": {
+			"openai": [{
+				"base_url": "http://127.0.0.1:9000/",
+				"api_key": " sk-test ",
+				"provider": " DeepSeek ",
+				"models": [" gpt-a ", "", "gpt-b", "gpt-a"]
+			}]
+		}
 	}`)
 
 	cfg, err := config.Load(path)
@@ -46,12 +47,25 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if cfg.AdminUser != "admin" || cfg.AdminPassword != "" {
 		t.Errorf("admin credentials = %q/%q, want admin/empty", cfg.AdminUser, cfg.AdminPassword)
 	}
+	if cfg.Fallback.FailureThreshold != config.DefaultFailureThreshold {
+		t.Errorf("failure_threshold = %d, want %d", cfg.Fallback.FailureThreshold, config.DefaultFailureThreshold)
+	}
+	if got := cfg.Fallback.DegradeDuration.Duration(); got != config.DefaultDegradeDuration {
+		t.Errorf("degrade_duration = %s, want %s", got, config.DefaultDegradeDuration)
+	}
+	if cfg.Fallback.MinTokensPerSecond != config.DefaultMinTokensPerSecond {
+		t.Errorf("min_tokens_per_second = %v, want %v", cfg.Fallback.MinTokensPerSecond, config.DefaultMinTokensPerSecond)
+	}
+	if got := cfg.Fallback.IdleTimeout.Duration(); got != config.DefaultIdleTimeout {
+		t.Errorf("idle_timeout = %s, want %s", got, config.DefaultIdleTimeout)
+	}
+
 	if len(cfg.Instances) != 1 {
 		t.Fatalf("len(instances) = %d, want 1", len(cfg.Instances))
 	}
 	inst := cfg.Instances[0]
 	if inst.Protocol != config.ProtocolOpenAI {
-		t.Errorf("protocol = %q, want normalized %q", inst.Protocol, config.ProtocolOpenAI)
+		t.Errorf("protocol = %q, want %q (derived from group)", inst.Protocol, config.ProtocolOpenAI)
 	}
 	if got := inst.Timeout.Duration(); got != config.DefaultTimeout {
 		t.Errorf("timeout = %s, want default %s", got, config.DefaultTimeout)
@@ -69,60 +83,60 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if !reflect.DeepEqual(inst.Models, wantModels) {
 		t.Errorf("models = %v, want %v (trimmed, de-duplicated, order kept)", inst.Models, wantModels)
 	}
-	if len(inst.Roles) != 0 {
-		t.Errorf("roles = %v, want empty for openai instance", inst.Roles)
-	}
 }
 
 func TestLoadPreservesInstanceOrder(t *testing.T) {
 	path := writeConfig(t, `{
 		"listen": "127.0.0.1:18080",
 		"auth_token": "client-token",
-		"instances": [
-			{
-				"protocol": "Anthropic",
-				"base_url": "https://anthropic.example",
-				"api_key": "sk-ant",
-				"timeout": "20s",
-				"roles": {"sonnet": "claude-a"}
-			},
-			{
-				"protocol": "openai",
-				"base_url": "https://openai.example",
-				"api_key": "sk-oai",
-				"timeout": "1m",
-				"models": ["gpt-a"]
-			}
-		]
+		"instances": {
+			"openai": [
+				{"base_url": "https://openai-a.example", "api_key": "k1", "timeout": "1m", "models": ["gpt-a"]},
+				{"base_url": "https://openai-b.example", "api_key": "k2", "models": ["gpt-b"]}
+			],
+			"anthropic": [
+				{"base_url": "https://anthropic.example", "api_key": "k3", "timeout": "20s", "roles": {"sonnet": "claude-a"}}
+			]
+		}
 	}`)
 
 	cfg, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if len(cfg.Instances) != 2 {
-		t.Fatalf("len(instances) = %d, want 2", len(cfg.Instances))
+	if len(cfg.Instances) != 3 {
+		t.Fatalf("len(instances) = %d, want 3", len(cfg.Instances))
 	}
-	if cfg.Instances[0].Protocol != config.ProtocolAnthropic || cfg.Instances[1].Protocol != config.ProtocolOpenAI {
-		t.Errorf("order not preserved: %+v", cfg.Instances)
+	if got := cfg.Instances[0].Protocol; got != config.ProtocolOpenAI {
+		t.Errorf("instances[0].protocol = %q, want openai", got)
 	}
-	if got := cfg.Instances[0].Timeout.Duration(); got != 20*time.Second {
-		t.Errorf("instances[0] timeout = %s, want 20s", got)
+	if got := cfg.Instances[0].BaseURL; got != "https://openai-a.example" {
+		t.Errorf("instances[0] = %q, want first openai instance", got)
 	}
-	if got := cfg.Instances[1].Timeout.Duration(); got != time.Minute {
-		t.Errorf("instances[1] timeout = %s, want 1m", got)
+	if got := cfg.Instances[1].BaseURL; got != "https://openai-b.example" {
+		t.Errorf("instances[1] = %q, want second openai instance", got)
+	}
+	if got := cfg.Instances[2].Protocol; got != config.ProtocolAnthropic {
+		t.Errorf("instances[2].protocol = %q, want anthropic", got)
+	}
+	if got := cfg.Instances[0].Timeout.Duration(); got != time.Minute {
+		t.Errorf("openai[0] timeout = %s, want 1m", got)
+	}
+	if got := cfg.Instances[2].Timeout.Duration(); got != 20*time.Second {
+		t.Errorf("anthropic[0] timeout = %s, want 20s", got)
 	}
 }
 
 func TestLoadNormalizesAnthropicRoles(t *testing.T) {
 	path := writeConfig(t, `{
 		"auth_token": "client-token",
-		"instances": [{
-			"protocol": "anthropic",
-			"base_url": "https://example.com",
-			"api_key": "k",
-			"roles": {" Sonnet ": " deepseek-flash ", "HAIKU": "deepseek-pro", "*": " deepseek-flash "}
-		}]
+		"instances": {
+			"anthropic": [{
+				"base_url": "https://example.com",
+				"api_key": "k",
+				"roles": {" Sonnet ": " deepseek-flash ", "HAIKU": "deepseek-pro", "*": " deepseek-flash "}
+			}]
+		}
 	}`)
 
 	cfg, err := config.Load(path)
@@ -139,13 +153,113 @@ func TestLoadNormalizesAnthropicRoles(t *testing.T) {
 	}
 }
 
+func TestFallbackExplicit(t *testing.T) {
+	path := writeConfig(t, `{
+		"auth_token": "t",
+		"fallback": {
+			"failure_threshold": 5,
+			"degrade_duration": "1m",
+			"min_tokens_per_second": 0,
+			"idle_timeout": "45s"
+		},
+		"instances": {"openai": [{"base_url": "https://example.com", "api_key": "k", "models": ["m"]}]}
+	}`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Fallback.FailureThreshold != 5 {
+		t.Errorf("failure_threshold = %d, want 5", cfg.Fallback.FailureThreshold)
+	}
+	if got := cfg.Fallback.DegradeDuration.Duration(); got != time.Minute {
+		t.Errorf("degrade_duration = %s, want 1m", got)
+	}
+	if cfg.Fallback.MinTokensPerSecond != 0 {
+		t.Errorf("min_tokens_per_second = %v, want explicit 0 (disabled)", cfg.Fallback.MinTokensPerSecond)
+	}
+	if got := cfg.Fallback.IdleTimeout.Duration(); got != 45*time.Second {
+		t.Errorf("idle_timeout = %s, want 45s", got)
+	}
+	values := cfg.Fallback.Values()
+	if values.FailureThreshold != 5 || values.DegradeDuration != time.Minute ||
+		values.MinTokensPerSecond != 0 || values.IdleTimeout != 45*time.Second {
+		t.Errorf("effective fallback = %+v, want 5/1m/0/45s", values)
+	}
+
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	for _, want := range []string{
+		`"failure_threshold":5`,
+		`"degrade_duration":"1m"`,
+		`"min_tokens_per_second":0`,
+		`"idle_timeout":"45s"`,
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("marshaled config = %s, want %s", data, want)
+		}
+	}
+}
+
+func TestFallbackIdleZero(t *testing.T) {
+	path := writeConfig(t, `{
+		"auth_token": "t",
+		"fallback": {"idle_timeout": "0s"},
+		"instances": {"openai": [{"base_url": "https://example.com", "api_key": "k", "models": ["m"]}]}
+	}`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Fallback.IdleTimeout != 0 {
+		t.Errorf("idle_timeout = %s, want explicit 0 (disabled)", cfg.Fallback.IdleTimeout.Duration())
+	}
+	if got := cfg.Fallback.Values().IdleTimeout; got != 0 {
+		t.Errorf("effective idle_timeout = %s, want 0", got)
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if !strings.Contains(string(data), `"idle_timeout":"0s"`) {
+		t.Errorf("marshaled config = %s, want idle_timeout 0s", data)
+	}
+}
+
+func TestFallbackInvalid(t *testing.T) {
+	cases := map[string]string{
+		"threshold_zero":     `{"failure_threshold":0}`,
+		"threshold_negative": `{"failure_threshold":-1}`,
+		"duration_zero":      `{"degrade_duration":"0s"}`,
+		"duration_negative":  `{"degrade_duration":"-5m"}`,
+		"duration_invalid":   `{"degrade_duration":"soon"}`,
+		"tps_negative":       `{"min_tokens_per_second":-1}`,
+		"idle_negative":      `{"idle_timeout":"-5s"}`,
+		"idle_invalid":       `{"idle_timeout":"abc"}`,
+		"unknown_field":      `{"failure_treshold":3}`,
+	}
+	for name, fallback := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := writeConfig(t, `{
+				"auth_token": "t",
+				"fallback": `+fallback+`,
+				"instances": {"openai": [{"base_url": "https://example.com", "api_key": "k", "models": ["m"]}]}
+			}`)
+			if _, err := config.Load(path); err == nil {
+				t.Fatalf("load config succeeded, want error for %s", name)
+			}
+		})
+	}
+}
+
 func TestDurationJSONRoundTrip(t *testing.T) {
 	cfg, err := config.Parse([]byte(`{
 		"auth_token": "token",
-		"instances": [
-			{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m"], "timeout": "20s"},
-			{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m2"]}
-		]
+		"instances": {"openai": [
+			{"base_url": "https://example.com", "api_key": "k", "models": ["m"], "timeout": "20s"},
+			{"base_url": "https://example.com", "api_key": "k", "models": ["m2"]}
+		]}
 	}`))
 	if err != nil {
 		t.Fatalf("parse config: %v", err)
@@ -177,7 +291,7 @@ func TestDurationJSONRoundTrip(t *testing.T) {
 func TestLoadAdminDefaults(t *testing.T) {
 	path := writeConfig(t, `{
 		"auth_token": "token",
-		"instances": [{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m"]}]
+		"instances": {"openai": [{"base_url": "https://example.com", "api_key": "k", "models": ["m"]}]}
 	}`)
 	cfg, err := config.Load(path)
 	if err != nil {
@@ -194,7 +308,7 @@ func TestLoadAdminDefaults(t *testing.T) {
 		"auth_token": "token",
 		"admin_user": "  Admin  ",
 		"admin_password": "  secret  ",
-		"instances": [{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m"]}]
+		"instances": {"openai": [{"base_url": "https://example.com", "api_key": "k", "models": ["m"]}]}
 	}`)
 	cfg, err = config.Load(path)
 	if err != nil {
@@ -211,23 +325,15 @@ func TestSaveRoundTrip(t *testing.T) {
 		"auth_token": "token",
 		"admin_user": "admin",
 		"admin_password": "secret",
-		"instances": [
-			{
-				"protocol": "openai",
-				"base_url": "https://api.deepseek.com",
-				"api_key": "sk-test",
-				"provider": "deepseek",
-				"models": ["deepseek-chat", "deepseek-reasoner"],
-				"timeout": "30s"
-			},
-			{
-				"protocol": "anthropic",
-				"base_url": "https://api.deepseek.com/anthropic",
-				"api_key": "sk-test",
-				"roles": {"sonnet": "deepseek-v4-flash", "haiku": "deepseek-v4-flash"},
-				"timeout": "30s"
-			}
-		]
+		"fallback": {"failure_threshold": 4, "degrade_duration": "2m", "min_tokens_per_second": 10, "idle_timeout": "10s"},
+		"instances": {
+			"openai": [
+				{"base_url": "https://api.deepseek.com", "api_key": "sk-test", "provider": "deepseek", "models": ["deepseek-chat", "deepseek-reasoner"], "timeout": "30s"}
+			],
+			"anthropic": [
+				{"base_url": "https://api.deepseek.com/anthropic", "api_key": "sk-test", "roles": {"sonnet": "deepseek-v4-flash", "haiku": "deepseek-v4-flash"}, "timeout": "30s"}
+			]
+		}
 	}`))
 	if err != nil {
 		t.Fatalf("parse config: %v", err)
@@ -237,6 +343,16 @@ func TestSaveRoundTrip(t *testing.T) {
 	if err := config.Save(path, cfg); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read saved config: %v", err)
+	}
+	for _, want := range []string{`"openai":`, `"anthropic":`, `"fallback":`, `"failure_threshold": 4`, `"idle_timeout": "10s"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("saved config = %s, want %s", raw, want)
+		}
+	}
+
 	loaded, err := config.Load(path)
 	if err != nil {
 		t.Fatalf("reload saved config: %v", err)
@@ -244,58 +360,69 @@ func TestSaveRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(cfg, loaded) {
 		t.Errorf("round trip mismatch:\n saved = %+v\n loaded = %+v", cfg, loaded)
 	}
-	if got := loaded.Instances[0].Timeout.Duration(); got != 30*time.Second {
-		t.Errorf("timeout = %s, want 30s", got)
-	}
 }
 
-func TestLoadProvider(t *testing.T) {
-	valid := writeConfig(t, `{
-		"auth_token": "token",
-		"instances": [{"protocol": "anthropic", "base_url": "https://example.com", "api_key": "k", "provider": "deepseek", "roles": {"sonnet": "m"}}]
-	}`)
-	cfg, err := config.Load(valid)
+func TestInstancesMarshalGrouped(t *testing.T) {
+	cfg, err := config.Parse([]byte(`{
+		"auth_token": "t",
+		"instances": {
+			"openai": [{"base_url": "https://openai.example", "api_key": "k", "models": ["m"]}],
+			"anthropic": [{"base_url": "https://anthropic.example", "api_key": "k", "roles": {"sonnet": "cm"}}]
+		}
+	}`))
 	if err != nil {
-		t.Fatalf("load config with known provider: %v", err)
+		t.Fatalf("parse config: %v", err)
 	}
-	if cfg.Instances[0].Provider != "deepseek" {
-		t.Errorf("provider = %q, want deepseek", cfg.Instances[0].Provider)
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
 	}
 
-	custom := writeConfig(t, `{
-		"auth_token": "token",
-		"instances": [{"protocol": "anthropic", "base_url": "https://example.com", "api_key": "k", "roles": {"sonnet": "m"}}]
-	}`)
-	cfg, err = config.Load(custom)
-	if err != nil {
-		t.Fatalf("load config without provider: %v", err)
+	var raw struct {
+		Instances struct {
+			OpenAI    []map[string]any `json:"openai"`
+			Anthropic []map[string]any `json:"anthropic"`
+		} `json:"instances"`
 	}
-	if cfg.Instances[0].Provider != "" {
-		t.Errorf("provider = %q, want empty for custom instance", cfg.Instances[0].Provider)
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal marshaled config: %v", err)
 	}
-
-	unknown := writeConfig(t, `{
-		"auth_token": "token",
-		"instances": [{"protocol": "anthropic", "base_url": "https://example.com", "api_key": "k", "provider": "nope", "roles": {"sonnet": "m"}}]
-	}`)
-	if _, err := config.Load(unknown); err == nil {
-		t.Fatal("load config succeeded with unknown provider, want error")
+	if len(raw.Instances.OpenAI) != 1 || len(raw.Instances.Anthropic) != 1 {
+		t.Fatalf("groups = %d/%d, want 1/1", len(raw.Instances.OpenAI), len(raw.Instances.Anthropic))
+	}
+	for _, group := range [][]map[string]any{raw.Instances.OpenAI, raw.Instances.Anthropic} {
+		for _, inst := range group {
+			if _, ok := inst["protocol"]; ok {
+				t.Errorf("marshaled instance contains protocol: %v", inst)
+			}
+		}
+	}
+	if _, ok := raw.Instances.OpenAI[0]["models"]; !ok {
+		t.Errorf("openai instance lost models: %v", raw.Instances.OpenAI[0])
+	}
+	if _, ok := raw.Instances.Anthropic[0]["roles"]; !ok {
+		t.Errorf("anthropic instance lost roles: %v", raw.Instances.Anthropic[0])
 	}
 }
 
 func TestLoadRejectsEmptyInstances(t *testing.T) {
-	path := writeConfig(t, `{
-		"auth_token": "client-token",
-		"instances": []
-	}`)
-	if _, err := config.Load(path); err == nil {
-		t.Fatal("load config succeeded, want error for empty instances")
+	cases := map[string]string{
+		"empty_groups": `"instances": {"openai": [], "anthropic": []}`,
+		"missing":      `"instances": {}`,
+	}
+	for name, instances := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := writeConfig(t, `{"auth_token": "client-token", `+instances+`}`)
+			if _, err := config.Load(path); err == nil {
+				t.Fatal("load config succeeded, want error for no instances")
+			}
+		})
 	}
 }
 
 func TestLoadRejectsMissingAuthToken(t *testing.T) {
 	path := writeConfig(t, `{
-		"instances": [{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m"]}]
+		"instances": {"openai": [{"base_url": "https://example.com", "api_key": "k", "models": ["m"]}]}
 	}`)
 	if _, err := config.Load(path); err == nil {
 		t.Fatal("load config succeeded, want error for missing auth_token")
@@ -305,7 +432,7 @@ func TestLoadRejectsMissingAuthToken(t *testing.T) {
 func TestLoadRejectsUnknownField(t *testing.T) {
 	path := writeConfig(t, `{
 		"auth_token": "client-token",
-		"instances": [{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m"]}],
+		"instances": {"openai": [{"base_url": "https://example.com", "api_key": "k", "models": ["m"]}]},
 		"listne": "typo"
 	}`)
 	if _, err := config.Load(path); err == nil {
@@ -327,30 +454,87 @@ func TestLoadRejectsLegacyBackends(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsInvalidInstance(t *testing.T) {
-	cases := map[string]string{
-		"missing_protocol":       `{"base_url": "https://example.com", "api_key": "k", "models": ["m"]}`,
-		"invalid_protocol":       `{"protocol": "gemini", "base_url": "https://example.com", "api_key": "k", "models": ["m"]}`,
-		"missing_base_url":       `{"protocol": "openai", "api_key": "k", "models": ["m"]}`,
-		"relative_base_url":      `{"protocol": "openai", "base_url": "api.example.com", "api_key": "k", "models": ["m"]}`,
-		"missing_api_key":        `{"protocol": "openai", "base_url": "https://example.com", "models": ["m"]}`,
-		"openai_missing_models":  `{"protocol": "openai", "base_url": "https://example.com", "api_key": "k"}`,
-		"openai_empty_models":    `{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["", "  "]}`,
-		"openai_with_roles":      `{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m"], "roles": {"sonnet": "x"}}`,
-		"anthropic_missing_roles": `{"protocol": "anthropic", "base_url": "https://example.com", "api_key": "k"}`,
-		"anthropic_with_models":  `{"protocol": "anthropic", "base_url": "https://example.com", "api_key": "k", "roles": {"sonnet": "x"}, "models": ["m"]}`,
-		"anthropic_invalid_role": `{"protocol": "anthropic", "base_url": "https://example.com", "api_key": "k", "roles": {"gemini": "x"}}`,
-		"anthropic_empty_model":  `{"protocol": "anthropic", "base_url": "https://example.com", "api_key": "k", "roles": {"sonnet": "  "}}`,
-		"invalid_timeout":        `{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m"], "timeout": "soon"}`,
-		"unknown_provider":       `{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "provider": "nope", "models": ["m"]}`,
+func TestLoadRejectsLegacyInstancesArray(t *testing.T) {
+	path := writeConfig(t, `{
+		"auth_token": "client-token",
+		"instances": [{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m"]}]
+	}`)
+	_, err := config.Load(path)
+	if err == nil {
+		t.Fatal("load config succeeded, want error for legacy instances array")
 	}
-	for name, instance := range cases {
+	if !strings.Contains(err.Error(), "分组结构") {
+		t.Errorf("error = %q, want a grouped-instances migration hint", err)
+	}
+}
+
+func TestLoadRejectsInstanceProtocolField(t *testing.T) {
+	path := writeConfig(t, `{
+		"auth_token": "client-token",
+		"instances": {"openai": [{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m"]}]}
+	}`)
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("load config succeeded, want error for instance protocol field")
+	}
+}
+
+func TestLoadRejectsInvalidInstance(t *testing.T) {
+	cases := map[string]struct {
+		group    string
+		instance string
+	}{
+		"missing_base_url":       {config.ProtocolOpenAI, `{"api_key": "k", "models": ["m"]}`},
+		"relative_base_url":      {config.ProtocolOpenAI, `{"base_url": "api.example.com", "api_key": "k", "models": ["m"]}`},
+		"missing_api_key":        {config.ProtocolOpenAI, `{"base_url": "https://example.com", "models": ["m"]}`},
+		"openai_missing_models":  {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k"}`},
+		"openai_empty_models":    {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k", "models": ["", "  "]}`},
+		"openai_with_roles":      {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k", "models": ["m"], "roles": {"sonnet": "x"}}`},
+		"anthropic_missing_roles": {config.ProtocolAnthropic, `{"base_url": "https://example.com", "api_key": "k"}`},
+		"anthropic_with_models":  {config.ProtocolAnthropic, `{"base_url": "https://example.com", "api_key": "k", "roles": {"sonnet": "x"}, "models": ["m"]}`},
+		"anthropic_invalid_role": {config.ProtocolAnthropic, `{"base_url": "https://example.com", "api_key": "k", "roles": {"gemini": "x"}}`},
+		"anthropic_empty_model":  {config.ProtocolAnthropic, `{"base_url": "https://example.com", "api_key": "k", "roles": {"sonnet": "  "}}`},
+		"invalid_timeout":        {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k", "models": ["m"], "timeout": "soon"}`},
+		"unknown_provider":       {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k", "provider": "nope", "models": ["m"]}`},
+	}
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			path := writeConfig(t, `{"auth_token": "client-token", "instances": [`+instance+`]}`)
+			var groups string
+			if tc.group == config.ProtocolAnthropic {
+				groups = `"anthropic": [` + tc.instance + `]`
+			} else {
+				groups = `"openai": [` + tc.instance + `]`
+			}
+			path := writeConfig(t, `{"auth_token": "client-token", "instances": {`+groups+`}}`)
 			if _, err := config.Load(path); err == nil {
 				t.Fatalf("load config succeeded, want error for %s", name)
 			}
 		})
+	}
+}
+
+func TestLoadProvider(t *testing.T) {
+	valid := writeConfig(t, `{
+		"auth_token": "token",
+		"instances": {"anthropic": [{"base_url": "https://example.com", "api_key": "k", "provider": "deepseek", "roles": {"sonnet": "m"}}]}
+	}`)
+	cfg, err := config.Load(valid)
+	if err != nil {
+		t.Fatalf("load config with known provider: %v", err)
+	}
+	if cfg.Instances[0].Provider != "deepseek" {
+		t.Errorf("provider = %q, want deepseek", cfg.Instances[0].Provider)
+	}
+
+	custom := writeConfig(t, `{
+		"auth_token": "token",
+		"instances": {"anthropic": [{"base_url": "https://example.com", "api_key": "k", "roles": {"sonnet": "m"}}]}
+	}`)
+	cfg, err = config.Load(custom)
+	if err != nil {
+		t.Fatalf("load config without provider: %v", err)
+	}
+	if cfg.Instances[0].Provider != "" {
+		t.Errorf("provider = %q, want empty for custom instance", cfg.Instances[0].Provider)
 	}
 }
 
@@ -359,8 +543,12 @@ func TestExampleConfigIsValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read example config: %v", err)
 	}
-	if _, err := config.Parse(data); err != nil {
+	cfg, err := config.Parse(data)
+	if err != nil {
 		t.Fatalf("example config is invalid: %v", err)
+	}
+	if len(cfg.Instances) == 0 {
+		t.Fatal("example config has no instances")
 	}
 }
 
@@ -388,7 +576,7 @@ func TestEnvOverridesConfig(t *testing.T) {
 		"auth_token": "file-token",
 		"admin_user": "admin",
 		"admin_password": "file-secret",
-		"instances": [{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["file-model"]}]
+		"instances": {"openai": [{"base_url": "https://example.com", "api_key": "k", "models": ["file-model"]}]}
 	}`)
 	cfg, err := config.Load(path)
 	if err != nil {
@@ -419,7 +607,7 @@ func TestEnvEmptyKeepsFileValues(t *testing.T) {
 		"auth_token": "file-token",
 		"admin_user": "file-admin",
 		"admin_password": "file-secret",
-		"instances": [{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m"]}]
+		"instances": {"openai": [{"base_url": "https://example.com", "api_key": "k", "models": ["m"]}]}
 	}`)
 	cfg, err := config.Load(path)
 	if err != nil {
@@ -437,7 +625,7 @@ func TestEnvAuthTokenSatisfiesRequired(t *testing.T) {
 	clearModelRouterEnv(t)
 
 	path := writeConfig(t, `{
-		"instances": [{"protocol": "openai", "base_url": "https://example.com", "api_key": "k", "models": ["m"]}]
+		"instances": {"openai": [{"base_url": "https://example.com", "api_key": "k", "models": ["m"]}]}
 	}`)
 	if _, err := config.Load(path); err == nil {
 		t.Fatal("load config succeeded without auth_token in file or environment, want fail-closed error")

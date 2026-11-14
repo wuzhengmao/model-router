@@ -531,3 +531,274 @@ OpenAI 入口映射保持 M1 不变（401 `invalid_request_error` + `missing_api
 - 单测：`providers` 清单完整性（11 个 + id 唯一）；`Instance.provider` 校验（合法/非法/空）；`probe/models` 的 override 分支（DeepSeek anthropic 走 openai base_url + bearer）；无 override 时走原逻辑；`GET /api/providers` 返回清单。
 - 端到端（主代理补）：`GET /api/providers` 返回 11 供应商；真实 DeepSeek anthropic 实例「查询模型」从 `https://api.deepseek.com/v1/models` 拉到 `deepseek-flash`/`deepseek-v4-pro`；UI 选择框 + base_url 自动带入 + 自定义手动填。
 - README/CHANGELOG/design/tests 同步；`-version` 仍 `0.0.1-rc`。
+
+## §11 M4 回退降级（实例粒度）
+
+### 11.1 目标与范围
+
+把 FR-3 的回退状态机从「模型粒度」落到**实例粒度**：每个协议下，实例按配置顺序构成候选链；当前实例失败时，按顺序回退到下一个能提供**等价模型**的实例，直到成功或全部失败。
+
+- 回退单位 = 实例（一个实例 = base_url + api_key + timeout + 一组模型映射）。
+- 顺序 = `instances` 数组中该协议实例的声明顺序（配置页可拖动排序）。
+- 沿用 FR-3 的失败判定、失败计数、持续回退、恢复探测与默认参数（§4）。
+- 不做跨协议回退；不做后台健康检查；不做全局轮询/负载均衡。
+
+### 11.2 候选链（candidate chain）
+
+对一次请求，先按 §9.2 的路由规则确定**基础实例**（第一个能处理该请求的实例），然后从基础实例开始、按该协议实例顺序收集候选，每个候选给出「上游模型」：
+
+- **OpenAI 请求 `model=X`**
+  - 实例 `models` 含 `X` → 上游模型 = `X`（**不改写**）。
+  - 实例不含 `X` → 上游模型 = 该实例 `models[0]`（**改写** `model=models[0]`）。
+  - 实例 `models` 为空 → 跳过（校验保证不会发生）。
+- **Anthropic 请求角色 `R`**（`R` 为 `sonnet`/`opus`/`fable`/`haiku`，或以 `claude-<role>-` 前缀识别为对应角色）
+  - 实例 `roles` 含 `R` → 上游模型 = `roles[R]`（**改写** `model=roles[R]`）。
+  - 实例不含 `R` 但含 `*` → 上游模型 = `roles["*"]`（**改写**）。
+  - 实例既无 `R` 也无 `*` → 跳过（不作为候选）。
+- **请求 model 缺失 / null / 非字符串 / 未命中任何实例**
+  - 基础实例 = 该协议第一个实例（R5 语义），候选链 = 该协议全部实例，上游模型 = 各实例 `models[0]`（OpenAI）或 `roles["*"]`（Anthropic，无 `*` 则跳过）；**不改写** body（保持 M3 透传语义，R5 不改写）。
+
+候选链顺序 = 实例声明顺序；同一实例只出现一次。
+
+**每级独立判断（重要）**：候选链中每一级都基于**原始请求的 model / 角色**判断，**不继承上一级改写后的 model**。**普通路由（§9.2 的 R4a/R4c/R4d）同样适用**：精确匹配、角色匹配、托底都基于**原始请求的 model/角色**判断，不因任何中间改写改变匹配依据。
+- 请求 `model=X` 时：即使第 2 级因无 `X` 用了 `Y`（`models[0]`），第 3 级若同时有 `X` 和 `Y`，仍**优先用 `X`**；只有该级没有 `X` 时才用其 `models[0]`。
+- Anthropic 请求角色 `R` 时：即使第 2 级因无 `R` 用了 `*` 托底，第 3 级若同时有 `R` 和 `*`，仍**优先用 `roles[R]`**；只有该级没有 `R` 时才用 `*`。
+
+### 11.3 状态机（每个实例一份，线程安全）
+
+每个实例维护：
+- `consecutiveFailures`：连续失败次数（int）。
+- `degradedUntil`：持续回退截止时间（time.Time，零值 = 未回退/已恢复）。
+
+请求处理：
+
+1. 计算候选链。
+2. 从链头开始，**跳过** `now < degradedUntil` 的候选（持续回退中）。
+3. 依次尝试未被跳过的候选：
+   - 成功 → 该实例 `consecutiveFailures=0`、`degradedUntil=零`；返回响应。
+   - 失败 → `consecutiveFailures++`：
+     - 若该实例 `degradedUntil` 非零且已过期（**恢复探测**：回退期结束后的首次尝试）→ `degradedUntil = now + 回退时长`（重新计时，**不再累计**）。
+     - 否则若 `consecutiveFailures >= 失败阈值`（默认 3）→ `degradedUntil = now + 回退时长`（进入持续回退）。
+     - 继续尝试链上下一个候选（**本次请求临时回退**）。
+4. 若链上所有候选都被跳过（全部处于持续回退中）→ **退化为尝试链头候选一次**（保证至少尝试，符合「回退期结束回主实例」）。
+5. 所有候选尝试都失败 → 返回最后一个错误（502，按协议错误体格式）。
+
+**临时回退** vs **持续回退**：
+- `failures < 3` 且未进入持续回退：每次请求仍从链头（主实例）试起（临时回退只在本次请求内生效）。
+- `failures >= 3`：`degradedUntil` 设置，后续请求跳过该实例，直接用下一个候选（持续回退，默认 5 分钟）。
+- 回退期结束：`degradedUntil` 过期后，实例重新可尝试；若再次失败，立即重新进入持续回退（「失败一次就回退一层」）。
+
+### 11.4 失败判定与回退时机
+
+**失败判定**（任一成立）：
+1. 连接失败（dial 错误）。
+2. 超时：连接 / 响应头超时，默认 15s（沿用实例 `timeout`）。
+3. 吞吐：响应完成时 `tokens / elapsed < 30`（默认阈值 30；`tokens` 取上游 `usage` 的 completion/output tokens，`elapsed` 为本次请求耗时秒数；窗口 = 本次请求）。
+
+**回退时机**：
+- 情况 1、2 发生在响应体转发前 → **本次请求立即回退到下一候选重试**。
+- 情况 3 发生在响应完成后（响应已发出）→ **本次不回退**，只记录失败状态（`consecutiveFailures++` / 更新 `degradedUntil`），影响**后续请求**的回退决策。
+- 流式响应一旦开始转发（已写出响应头/首块），不再中断回退（避免客户端收到不一致数据）；吞吐不达标按「响应完成后记录失败」处理。
+
+> 工程化说明：透传代理无法在「响应已发出」后回退而不破坏客户端数据；因此 FR-3 的「吞吐失败」在 M4 中体现为**失败计数/回退状态更新**，而非本次请求换模型。
+
+### 11.5 默认参数（沿用 §4）
+
+| 参数 | 默认 |
+|---|---|
+| 连接/响应超时 | 15 s（每实例 `timeout`） |
+| token/s 阈值 | 30 |
+| 失败阈值 | 3 次 |
+| 回退时长 | 5 分钟 |
+
+### 11.6 Web 配置页：实例拖动排序
+
+- 可视化模式两个 tab 的实例卡片支持**拖动排序**（HTML5 drag & drop 或等价交互）。
+- 排序结果即保存时 `instances` 数组顺序，决定候选链优先级（越靠前越优先）。
+- JSON 高级模式直接编辑数组顺序，等效。
+
+### 11.7 明确不做
+
+- 不做跨协议回退（OpenAI 失败不转 Anthropic 实例）。
+- 不做后台健康检查/定时探测（回退纯请求驱动）。
+- 不做全局轮询/随机/最少连接等负载均衡（严格按配置顺序）。
+- 不做流式中断回退（已开始转发的响应不中断）。
+- 不做回退状态持久化（进程内存，重启清零）。
+
+### 11.8 验收标准
+
+- `go build`/`go vet`/`go test` 退出码 0。
+- 单测：
+  - 候选链构建：OpenAI 同名命中不改写、无同名用 `models[0]` 改写；Anthropic 同角色改写、无角色用 `*` 改写、两者皆无则跳过；R5 未命中候选链与不改写。
+  - 状态机：首次失败临时回退；失败计数 <3 下次仍先试主实例；≥3 进入持续回退（跳过主实例）；回退期结束恢复探测、失败即重新计时；成功恢复清零。
+  - 并发安全（`go test -race` 或等价）。
+  - 吞吐判定：mock 上游慢响应/低 usage → 记录失败（响应仍透传）。
+- 端到端（主代理补）：两实例 mock，主实例连接失败 → 回退到第二实例（同名/第一个模型）；主实例连续失败 3 次 → 后续直接走第二实例；回退期（可缩短用于测试）结束后回主实例。
+- UI：拖动排序改变 `instances` 顺序，保存后生效（`/api/config` 顺序与拖动一致）。
+- README/CHANGELOG/design/tests 同步；`-version` 仍 `0.0.1-rc`。
+
+## 12. M4 配置结构修正（fallback 分组 + instances 分组）
+
+### 12.1 目标
+
+M4 验收后，用户要求两点配置结构修正：
+1. 回退相关参数不再硬编码，改为可配置，放在 `Config` 顶层 `fallback` 对象下。
+2. `instances` 不再用混合数组（含 `protocol` 字段），改为按协议分成 `openai` / `anthropic` 两个数组。
+
+### 12.2 配置结构
+
+```json
+{
+  "listen": "127.0.0.1:18080",
+  "auth_token": "...",
+  "admin_user": "admin",
+  "admin_password": "...",
+  "fallback": {
+    "failure_threshold": 3,
+    "degrade_duration": "5m",
+    "min_tokens_per_second": 30
+  },
+  "instances": {
+    "openai": [
+      {"base_url": "...", "api_key": "...", "provider": "...", "timeout": "15s", "models": ["..."]}
+    ],
+    "anthropic": [
+      {"base_url": "...", "api_key": "...", "provider": "...", "timeout": "15s", "roles": {"sonnet": "...", "*": "..."}}
+    ]
+  }
+}
+```
+
+#### fallback 对象（可选）
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `failure_threshold` | int | 3 | 连续失败 ≥ 该值进入持续回退；≥1 |
+| `degrade_duration` | Duration 字符串 | `"5m"` | 持续回退时长；>0 |
+| `min_tokens_per_second` | float | 30 | 吞吐阈值；0 = 禁用吞吐判定 |
+
+- `fallback` 整体可省略；省略或某项缺失 → 该项用默认值。
+- 校验失败（如 `failure_threshold` ≤0、`degrade_duration` ≤0、`min_tokens_per_second` <0）→ 启动/校验失败。
+
+#### instances 分组（必填，至少一个实例）
+
+- 废弃 `instances []Instance`（含 `protocol` 字段），改为 `instances` 对象含两个数组 `openai` / `anthropic`。
+
+**OpenAI 实例字段**：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `base_url` | 是 | 去尾斜杠，绝对 http(s) URL |
+| `api_key` | 是 | 非空 |
+| `models` | 是 | 字符串数组，至少 1 项，去空去重保序 |
+| `provider` | 否 | 内置供应商 id，空 = 自定义（沿用 §10） |
+| `timeout` | 否 | 默认 15s |
+
+**Anthropic 实例字段**：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `base_url` | 是 | 去尾斜杠，绝对 http(s) URL |
+| `api_key` | 是 | 非空 |
+| `roles` | 是 | 对象，键 ∈ {`sonnet`,`opus`,`fable`,`haiku`,`*`}，值非空，至少 1 项 |
+| `provider` | 否 | 同上 |
+| `timeout` | 否 | 默认 15s |
+
+校验规则：
+- 去掉 `protocol` 字段（由所在分组决定）；实例内若出现 `protocol` → 视为未知字段，解析失败（DisallowUnknownFields）。
+- 每类数组可为空，但 `openai` + `anthropic` 总实例数 ≥ 1，否则启动/校验失败（fail-closed）。
+- openai 实例不得有 `roles`，anthropic 实例不得有 `models`（沿用 §9.1 互斥）。
+- 旧 `instances` 数组形态（顶层为数组）→ 解析失败，报错提示「instances 已改为分组结构 {openai, anthropic}」。
+
+### 12.3 运行时语义（不变）
+
+- 候选链、状态机、每级独立判断、失败判定、回退时机全部沿用 §11，仅参数改从 `fallback` 读。
+- 路由（§9.2）简化：`openai` 组 / `anthropic` 组各自独立展开，不再跨协议过滤；R4a/R4c/R4d/R5 匹配顺序与改写规则不变。
+- `provider` / `models_override` / `probe` / `/v1/models` / 环境变量逻辑不变（实例协议由所在分组确定）。
+- 环境变量仍只覆盖 `listen/auth_token/admin_user/admin_password`（§8.9）；`fallback` 与 `instances` 不支持环境变量。
+
+### 12.4 Web 配置页
+
+- 可视化模式：两个 tab（openai/anthropic）实例列表改从 `instances.openai` / `instances.anthropic` 读取；拖动排序在**各组内**生效，保存按组内顺序序列化。
+- JSON 模式：展示新结构（含 `fallback` 对象与分组 `instances`）。
+- `fallback` 参数在 JSON 模式可见可编辑；可视化模式在页面顶部（实例列表上方）加「回退参数」区块，提供三个输入框：
+  - `failure_threshold`（失败阈值）：整数 ≥1，默认 3；
+  - `degrade_duration`（回退时长）：时长字符串（如 `5m`/`30s`/`1h`）>0，默认 `5m`；
+  - `min_tokens_per_second`（最低吞吐 token/s）：浮点数 ≥0，默认 30，填 `0` 表示禁用吞吐判定（留空 = 缺省默认 30）。
+  - 加载时从 `fallback` 读回填入；保存时读取并序列化进 `config.fallback`；非法值（阈值<1、时长非法、吞吐<0）阻止保存并就地提示（复用 `/api/config/validate`）。
+
+### 12.5 明确不做
+
+- 不做旧 `instances` 数组的自动迁移（直接报错要求迁移）。
+- 不做 `fallback` / `instances` 的环境变量覆盖。
+- 其余 §11.7「明确不做」继续有效。
+
+### 12.6 验收标准
+
+- `go build`/`go vet`/`go test`（含 `-race`）退出码 0。
+- `fallback` 三项缺省/显式配置生效：改 `failure_threshold` 后主实例连续失败 N 次即持续回退；`degrade_duration` 缩短后恢复探测更快；`min_tokens_per_second=0` 禁用吞吐判定。
+- `instances` 分组：openai 组 / anthropic 组各自展开；总实例 0 个启动失败；实例含 `protocol` 字段报错；旧数组形态报错提示迁移。
+- 可视化「回退参数」区块：加载读回、保存序列化进 `fallback`、非法值阻止保存并提示。
+- 端到端（主代理补）：新结构 2 实例 mock 回退 + fallback 参数生效 + 拖动排序保存分组顺序。
+- `config.example.json` 迁移到新结构；README/CHANGELOG/design/tests 同步；`-version` 仍 `0.0.1-rc`。
+
+## §13 M4.1 流式中途切换（空闲超时 + pause_turn + OpenAI 打断）
+
+### 13.1 目标
+
+在 M4（§11）回退降级基础上，为「已 committed（首块已转发给客户端）的流式响应」新增**空闲超时**判定，并按协议提供「中途切换」处理：
+
+- Anthropic 入口：空闲超时 → 以 `pause_turn` 优雅收尾，客户端 SDK 自动续接。
+- OpenAI 入口：空闲超时 → 直接中断连接；低速（token/s 低）→ 不打断、只记失败。
+
+### 13.2 配置新增：`fallback.idle_timeout`
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `idle_timeout` | Duration 字符串 | `"30s"` | 流式空闲超时；0 = 禁用空闲超时判定 |
+
+- `fallback.idle_timeout` 可省略（用默认 30s）；校验非法 Duration 或 <0 → 启动/校验失败（fail-closed）。
+- 其余 `fallback` 字段沿用 §12.2。
+
+### 13.3 空闲超时判定
+
+- 仅在**流式响应 committed 之后**生效：自最后一个数据块到达起，连续 `idle_timeout` 秒内无任何新数据块 → 触发空闲超时。
+- 首字节等待（响应头未返回）仍走实例 `timeout`（§11.4 情况 2），不占用 `idle_timeout`。
+- 非流式响应不受空闲超时影响。
+
+### 13.4 触发后的按协议处理
+
+**Anthropic 入口**：
+- 终止读取上游流，向客户端补发收尾事件：若当前内容块未结束先补 `content_block_stop`，随后补 `message_delta`（`delta.stop_reason="pause_turn"`、`delta.stop_sequence=null`）与 `message_stop`。
+- 客户端 SDK 识别 `pause_turn` 后，把已生成的 assistant message（含 content）加回 messages 并自动重发续接；重发请求按 §11 候选链正常路由（该实例已记失败，视失败计数决定是否切备用实例）。
+
+**OpenAI 入口**：
+- 终止读取上游流，直接中断客户端连接（流截断，不补 `[DONE]`）。是否重试由客户端 SDK 决定，代理不负责。
+
+**共同**：两种协议触发空闲超时均记该实例失败（`recordFailure`，计入 `consecutiveFailures`，走 §11.3 状态机）。
+
+### 13.5 低速（token/s）处理维持现状
+
+- 吞吐 `tokens / elapsed < min_tokens_per_second`（§11.4 情况 3）时：committed 后**不打断流**、只记失败，影响后续请求回退决策；OpenAI 与 Anthropic 通用。
+- 空闲超时与低速是**互补判定**：空闲超时捕获「完全卡死」，低速捕获「慢但在动」。
+
+### 13.6 明确不做
+
+- OpenAI 空闲超时不尝试 `pause_turn` 等价（OpenAI Chat Completions 无该机制，`finish_reason` 无 pause 语义）。
+- 空闲超时不触发「响应前无感切换」（那是首字节超时职责，§11.4 情况 2）。
+- 不新增客户端重试协调逻辑（pause_turn 由客户端 SDK 自动续接；OpenAI 由客户端 SDK 决定是否重试）。
+- 低速不升级为「中断流」。
+
+### 13.7 Web 配置页
+
+- 「回退参数」区块新增「空闲超时（idle_timeout）」输入框（Duration，默认 30s，填 0 禁用）。
+- 加载读回、保存序列化进 `config.fallback.idle_timeout`、非法值阻止保存并提示（复用 §12.4 机制）。
+
+### 13.8 验收标准
+
+- `go build`/`go vet`/`go test`（含 `-race`）退出码 0。
+- 配置：`fallback.idle_timeout` 缺省 30s / 显式生效 / 0 禁用 / 非法报错。
+- Anthropic：mock 上游发出首块后静默超过 `idle_timeout` → 客户端收到 `message_delta(stop_reason="pause_turn")` + `message_stop` 收尾事件（不收到上游的残留数据）。
+- OpenAI：mock 上游发出首块后静默超过 `idle_timeout` → 客户端连接被中断（流截断）。
+- OpenAI 低速：mock 上游持续慢速输出（< `min_tokens_per_second`）→ 流不被中断、完整结束，仅记失败。
+- README/CHANGELOG/design/tests 同步；`-version` 仍 `0.0.1-rc`。

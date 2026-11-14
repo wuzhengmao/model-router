@@ -26,9 +26,15 @@ const (
 	ProtocolOpenAI = "openai"
 	// ProtocolAnthropic marks an instance that speaks the Anthropic protocol.
 	ProtocolAnthropic = "anthropic"
+
+	// Fallback defaults (§12.2 / §13.2).
+	DefaultFailureThreshold   = 3
+	DefaultDegradeDuration    = 5 * time.Minute
+	DefaultMinTokensPerSecond = 30.0
+	DefaultIdleTimeout        = 30 * time.Second
 )
 
-// Model roles an anthropic instance can map via instances[].roles.
+// Model roles an anthropic instance can map via instances.anthropic[].roles.
 const (
 	RoleSonnet   = "sonnet"
 	RoleOpus     = "opus"
@@ -89,7 +95,176 @@ func (d Duration) Duration() time.Duration {
 
 // MarshalJSON writes the effective duration back as a string such as "15s".
 func (d Duration) MarshalJSON() ([]byte, error) {
-	return json.Marshal(d.Duration().String())
+	return json.Marshal(formatDuration(d.Duration()))
+}
+
+// formatDuration renders compact durations: "5m" instead of Go's "5m0s".
+func formatDuration(d time.Duration) string {
+	s := d.String()
+	if strings.HasSuffix(s, "m0s") {
+		s = strings.TrimSuffix(s, "0s")
+	}
+	if strings.HasSuffix(s, "h0m") {
+		s = strings.TrimSuffix(s, "0m")
+	}
+	return s
+}
+
+// OptionalDuration is an idle-timeout duration that accepts zero (disabled)
+// while rejecting negative or malformed values.
+type OptionalDuration time.Duration
+
+// UnmarshalJSON parses a Go duration string; "0s" is valid.
+func (d *OptionalDuration) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+	var raw string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return fmt.Errorf("idle_timeout must be a duration string such as \"30s\": %w", err)
+	}
+	parsed, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("invalid idle_timeout %q: %w", raw, err)
+	}
+	if parsed < 0 {
+		return fmt.Errorf("idle_timeout must be >= 0, got %q", raw)
+	}
+	*d = OptionalDuration(parsed)
+	return nil
+}
+
+// Duration returns the configured value (0 = disabled).
+func (d OptionalDuration) Duration() time.Duration {
+	return time.Duration(d)
+}
+
+// MarshalJSON writes the value back as a string; zero is written as "0s".
+func (d OptionalDuration) MarshalJSON() ([]byte, error) {
+	duration := time.Duration(d)
+	if duration == 0 {
+		return json.Marshal("0s")
+	}
+	return json.Marshal(formatDuration(duration))
+}
+
+// Fallback holds the optional fallback state-machine parameters.
+type Fallback struct {
+	FailureThreshold   int      `json:"failure_threshold"`
+	DegradeDuration    Duration `json:"degrade_duration"`
+	MinTokensPerSecond float64  `json:"min_tokens_per_second"`
+	IdleTimeout        OptionalDuration `json:"idle_timeout"`
+
+	configured bool
+}
+
+// UnmarshalJSON applies per-field defaults and validates explicit values.
+func (f *Fallback) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		FailureThreshold   *int              `json:"failure_threshold"`
+		DegradeDuration    *Duration         `json:"degrade_duration"`
+		MinTokensPerSecond *float64          `json:"min_tokens_per_second"`
+		IdleTimeout        *OptionalDuration `json:"idle_timeout"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
+		return fmt.Errorf("fallback: %w", err)
+	}
+	if err := dec.Decode(new(struct{})); err != io.EOF {
+		return errors.New("fallback: unexpected trailing data")
+	}
+
+	*f = Fallback{
+		FailureThreshold:   DefaultFailureThreshold,
+		DegradeDuration:    Duration(DefaultDegradeDuration),
+		MinTokensPerSecond: DefaultMinTokensPerSecond,
+		IdleTimeout:        OptionalDuration(DefaultIdleTimeout),
+		configured:         true,
+	}
+	if raw.FailureThreshold != nil {
+		if *raw.FailureThreshold < 1 {
+			return fmt.Errorf("fallback.failure_threshold must be >= 1, got %d", *raw.FailureThreshold)
+		}
+		f.FailureThreshold = *raw.FailureThreshold
+	}
+	if raw.DegradeDuration != nil {
+		f.DegradeDuration = *raw.DegradeDuration
+	}
+	if raw.MinTokensPerSecond != nil {
+		if *raw.MinTokensPerSecond < 0 {
+			return fmt.Errorf("fallback.min_tokens_per_second must be >= 0, got %v", *raw.MinTokensPerSecond)
+		}
+		f.MinTokensPerSecond = *raw.MinTokensPerSecond
+	}
+	if raw.IdleTimeout != nil {
+		f.IdleTimeout = *raw.IdleTimeout
+	}
+	return nil
+}
+
+func (f *Fallback) applyDefaults() {
+	if !f.configured {
+		f.FailureThreshold = DefaultFailureThreshold
+		f.DegradeDuration = Duration(DefaultDegradeDuration)
+		f.MinTokensPerSecond = DefaultMinTokensPerSecond
+		f.IdleTimeout = OptionalDuration(DefaultIdleTimeout)
+		return
+	}
+	if f.FailureThreshold < 1 {
+		f.FailureThreshold = DefaultFailureThreshold
+	}
+	if f.DegradeDuration <= 0 {
+		f.DegradeDuration = Duration(DefaultDegradeDuration)
+	}
+	if f.MinTokensPerSecond < 0 {
+		f.MinTokensPerSecond = DefaultMinTokensPerSecond
+	}
+	if f.IdleTimeout < 0 {
+		f.IdleTimeout = OptionalDuration(DefaultIdleTimeout)
+	}
+}
+
+// FallbackValues is the effective, concrete fallback configuration.
+type FallbackValues struct {
+	FailureThreshold   int
+	DegradeDuration    time.Duration
+	MinTokensPerSecond float64
+	IdleTimeout        time.Duration
+}
+
+// Values returns the effective fallback parameters. An explicit
+// min_tokens_per_second=0 means "disable throughput judgement"; an explicit
+// idle_timeout=0 means "disable idle-timeout detection". When fallback was not
+// configured at all (e.g. a direct Config literal), zeros mean defaults.
+func (f Fallback) Values() FallbackValues {
+	values := FallbackValues{
+		FailureThreshold:   f.FailureThreshold,
+		DegradeDuration:    time.Duration(f.DegradeDuration),
+		MinTokensPerSecond: f.MinTokensPerSecond,
+		IdleTimeout:        time.Duration(f.IdleTimeout),
+	}
+	if values.FailureThreshold <= 0 {
+		values.FailureThreshold = DefaultFailureThreshold
+	}
+	if values.DegradeDuration <= 0 {
+		values.DegradeDuration = DefaultDegradeDuration
+	}
+	if values.MinTokensPerSecond < 0 {
+		values.MinTokensPerSecond = DefaultMinTokensPerSecond
+	}
+	if values.IdleTimeout < 0 {
+		values.IdleTimeout = DefaultIdleTimeout
+	}
+	if !f.configured {
+		if values.MinTokensPerSecond == 0 {
+			values.MinTokensPerSecond = DefaultMinTokensPerSecond
+		}
+		if values.IdleTimeout == 0 {
+			values.IdleTimeout = DefaultIdleTimeout
+		}
+	}
+	return values
 }
 
 // Config is the top-level configuration file structure.
@@ -102,14 +277,19 @@ type Config struct {
 	AdminUser string `json:"admin_user"`
 	// AdminPassword enables the admin surface when non-empty.
 	AdminPassword string `json:"admin_password"`
-	// Instances is ordered; order is the routing priority.
-	Instances []Instance `json:"instances"`
+	// Fallback holds optional fallback state-machine parameters.
+	Fallback Fallback `json:"fallback"`
+	// Instances is a flat, protocol-tagged view of the grouped JSON. The JSON
+	// form is {"openai":[...],"anthropic":[...]} (see Instances).
+	Instances Instances `json:"instances"`
 }
 
 // Instance is one provider instance carrying a set of model mappings.
 // OpenAI instances declare Models; Anthropic instances declare Roles.
 type Instance struct {
-	Protocol string   `json:"protocol"`
+	// Protocol is derived from the JSON group and is not accepted as an
+	// instance field.
+	Protocol string   `json:"-"`
 	BaseURL  string   `json:"base_url"`
 	APIKey   string   `json:"api_key"`
 	// Provider is an optional built-in provider id; empty means custom.
@@ -117,6 +297,62 @@ type Instance struct {
 	Timeout  Duration          `json:"timeout"`
 	Models   []string          `json:"models,omitempty"`
 	Roles    map[string]string `json:"roles,omitempty"`
+}
+
+// Instances is the flat runtime representation of the grouped JSON
+// {"openai": [...], "anthropic": [...]}. Within-group order is preserved.
+type Instances []Instance
+
+// UnmarshalJSON decodes the grouped object into a flat protocol-tagged slice.
+func (g *Instances) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		OpenAI    []Instance `json:"openai"`
+		Anthropic []Instance `json:"anthropic"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
+		return fmt.Errorf("instances: %w", err)
+	}
+	if err := dec.Decode(new(struct{})); err != io.EOF {
+		return errors.New("instances: unexpected trailing data")
+	}
+
+	out := make(Instances, 0, len(raw.OpenAI)+len(raw.Anthropic))
+	for i := range raw.OpenAI {
+		inst := raw.OpenAI[i]
+		inst.Protocol = ProtocolOpenAI
+		out = append(out, inst)
+	}
+	for i := range raw.Anthropic {
+		inst := raw.Anthropic[i]
+		inst.Protocol = ProtocolAnthropic
+		out = append(out, inst)
+	}
+	*g = out
+	return nil
+}
+
+// MarshalJSON groups the flat instances by protocol.
+func (g Instances) MarshalJSON() ([]byte, error) {
+	grouped := struct {
+		OpenAI    []Instance `json:"openai"`
+		Anthropic []Instance `json:"anthropic"`
+	}{
+		OpenAI:    []Instance{},
+		Anthropic: []Instance{},
+	}
+	for _, inst := range g {
+		switch inst.Protocol {
+		case ProtocolOpenAI:
+			grouped.OpenAI = append(grouped.OpenAI, inst)
+		case ProtocolAnthropic:
+			grouped.Anthropic = append(grouped.Anthropic, inst)
+		default:
+			return nil, fmt.Errorf("instances: unknown protocol %q", inst.Protocol)
+		}
+	}
+	return json.Marshal(grouped)
 }
 
 // Load reads, parses and validates the configuration file at path.
@@ -135,6 +371,9 @@ func Load(path string) (*Config, error) {
 // Parse parses and validates configuration bytes.
 func Parse(data []byte) (*Config, error) {
 	if err := rejectLegacyBackends(data); err != nil {
+		return nil, err
+	}
+	if err := rejectLegacyInstancesArray(data); err != nil {
 		return nil, err
 	}
 
@@ -168,9 +407,26 @@ func rejectLegacyBackends(data []byte) error {
 	return nil
 }
 
+// rejectLegacyInstancesArray turns the old array form into a migration hint.
+func rejectLegacyInstancesArray(data []byte) error {
+	var legacy struct {
+		Instances json.RawMessage `json:"instances"`
+	}
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return nil
+	}
+	trimmed := bytes.TrimSpace(legacy.Instances)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		return errors.New(`instances 已改为分组结构 {openai, anthropic}，请迁移配置`)
+	}
+	return nil
+}
+
 // Save writes cfg to path atomically (temp file + rename).
 func Save(path string, cfg *Config) error {
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	normalized := *cfg
+	normalized.Fallback.applyDefaults()
+	data, err := json.MarshalIndent(&normalized, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
@@ -218,25 +474,36 @@ func (c *Config) applyDefaults() error {
 	}
 	c.AdminPassword = strings.TrimSpace(c.AdminPassword)
 
+	c.Fallback.applyDefaults()
+
 	if len(c.Instances) == 0 {
 		return errors.New("instances must contain at least one instance")
 	}
+	openaiIndex, anthropicIndex := 0, 0
 	for i := range c.Instances {
-		if err := c.Instances[i].applyDefaults(); err != nil {
-			return fmt.Errorf("instances[%d]: %w", i, err)
+		inst := &c.Instances[i]
+		proto := strings.ToLower(strings.TrimSpace(inst.Protocol))
+		switch proto {
+		case ProtocolOpenAI:
+			inst.Protocol = proto
+			if err := inst.applyDefaults(); err != nil {
+				return fmt.Errorf("instances.openai[%d]: %w", openaiIndex, err)
+			}
+			openaiIndex++
+		case ProtocolAnthropic:
+			inst.Protocol = proto
+			if err := inst.applyDefaults(); err != nil {
+				return fmt.Errorf("instances.anthropic[%d]: %w", anthropicIndex, err)
+			}
+			anthropicIndex++
+		default:
+			return fmt.Errorf("instances: instance has no valid protocol (derived from group), got %q", inst.Protocol)
 		}
 	}
 	return nil
 }
 
 func (in *Instance) applyDefaults() error {
-	in.Protocol = strings.ToLower(strings.TrimSpace(in.Protocol))
-	switch in.Protocol {
-	case ProtocolOpenAI, ProtocolAnthropic:
-	default:
-		return fmt.Errorf("protocol must be %q or %q, got %q", ProtocolOpenAI, ProtocolAnthropic, in.Protocol)
-	}
-
 	in.APIKey = strings.TrimSpace(in.APIKey)
 	if in.APIKey == "" {
 		return errors.New("api_key is required")
