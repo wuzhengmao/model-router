@@ -70,6 +70,13 @@
 
 - M4.1 流式响应会先移除上游 `Content-Length`（补发收尾事件时需要 chunked 帧）；SSE 响应头其余字段仍原样透传。
 - M4.1 流式吞吐判定由“跳过”改为“按 SSE usage 判定但从不打断流”。
+- M5 GitHub Actions 跨平台构建：`.github/workflows/build.yml` 在 push / PR / tag `v*` 上以 6 组合（windows/linux/darwin × amd64/arm64）构建并上传产物；tag 时创建 Release，并在 ubuntu runner 上用 buildx 构建 `linux/amd64,linux/arm64` 镜像推送 GHCR（`:<version>` 与 `:latest`）。
+- M5 Docker 镜像：multi-stage `golang:1.27-alpine` → `gcr.io/distroless/static-debian12:nonroot`；`CGO_ENABLED=0`、`TARGETOS/TARGETARCH` 多架构构建、非 root、`EXPOSE 18080`，入口 `-config /home/nonroot/config/config.json`，默认 `MODEL_ROUTER_LISTEN=0.0.0.0:18080`。
+- M5 `docker-compose.yml` 部署示例：端口 18080、挂载 `./.docker` 目录（`.docker/config.json`）、环境变量覆盖、`restart: unless-stopped`。
+- M5 `build-all.sh` 本地全平台构建脚本与 `.dockerignore`（排除 dist/.git/.claude-runs/本地配置等）。
+- M5 文档：README 增加构建/CI/Docker 部署说明与目录结构；design/tests 增加构建与部署设计与验证用例。
+- M5 版本来源保持 `internal/version/version.txt`（`0.0.1-rc`）；CI tag 构建时版本改用 tag 去掉 `v` 前缀（如 `v0.0.1` → `0.0.1`）。
+- M3-models-roles 修复：Anthropic 入口 `/v1/models` 改为返回预定义角色名 `sonnet`/`opus`/`fable`/`haiku`（固定顺序、去重、仅已声明角色、不含 `*`），不再返回 `roles` 映射的实际模型值；OpenAI 入口行为不变。测试更新为断言角色名。
 - M4-fallback-ui 可视化「保存到文件」流程改为先 `POST /api/config/validate` 再 `PUT /api/config`；`fallback` 不再原样透传已加载对象，而是由三个输入框序列化。
 - M4-config 配置不兼容变更：`instances` 由混合数组改为分组对象，实例移除 `protocol` 字段；旧配置需迁移（出现旧数组会得到「分组结构」错误提示）。
 - M4-config `proxy.New` 现在从 `Config.Fallback` 读取 3 个回退参数；`NewWithOptions` 仍可注入测试用参数（0 表示沿用配置）。

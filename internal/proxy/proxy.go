@@ -340,15 +340,21 @@ func (h *Handler) modelList(proto protocol) []string {
 		seen[name] = true
 		models = append(models, name)
 	}
-	for _, inst := range h.byProtocol[proto] {
-		if proto == protocolAnthropic {
-			for _, role := range concreteRoles {
-				if model, ok := inst.roles[role]; ok {
-					add(model)
+	if proto == protocolAnthropic {
+		// Anthropic clients select roles (sonnet/opus/...), which the proxy then
+		// maps to configured upstream models. Publish only roles that at least
+		// one anthropic instance declares, in the fixed canonical order.
+		for _, role := range concreteRoles {
+			for _, inst := range h.byProtocol[proto] {
+				if _, ok := inst.roles[role]; ok {
+					add(role)
+					break
 				}
 			}
-			continue
 		}
+		return models
+	}
+	for _, inst := range h.byProtocol[proto] {
 		for _, model := range inst.models {
 			add(model)
 		}

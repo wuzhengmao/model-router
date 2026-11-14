@@ -181,7 +181,9 @@ JSON 对象不保留键顺序，因此 anthropic 条目按固定顺序展开：`
 
 - 协议判定：同时带 `x-api-key` 且无 `Authorization` → Anthropic；其余 → OpenAI。
 - 仅 GET；其他 405（`Allow: GET`）。
-- 聚合：按协议取展开条目，依次取 `model`，按出现顺序去重；anthropic 跳过 `role="*"` 条目。
+- 聚合：
+  - OpenAI：按实例顺序收集各实例 `models`，按出现顺序去重。
+  - Anthropic：返回已声明的**角色名**（`sonnet → opus → fable → haiku` 固定顺序，去重，不含 `*`），只要任一 anthropic 实例声明了该角色；不返回 `roles` 映射值（客户端用角色名请求，再由路由映射到实际模型）。
 - OpenAI 格式：`{"object":"list","data":[{"id","object":"model","created":<unix>,"owned_by":"model-router"}]}`。
 - Anthropic 格式：`{"data":[{"id","type":"model","display_name","created_at":"<RFC3339>"}],"has_more":false,"first_id","last_id"}`；空列表时 first/last 为 `""`。
 - 不调用上游。
@@ -448,3 +450,41 @@ OpenAI：`{"error":{"message","type","code"}}`；Anthropic：`{"type":"error","e
 - **D-M4.1-6 空闲时吞吐**：空闲触发分支直接记失败并返回，不再做吞吐判定，避免重复计数。
 - **D-M4.1-7 非流式不受影响**：空闲超时仅用于 SSE；非流式仍使用原有整体读取与 usage 判定。
 - **D-M4.1-8 上游正常结束**：收到 EOF 即视为完成，计时器停止；不会因流结束后等待而触发空闲。
+
+## 21. 跨平台构建与容器部署（M5，§14）
+
+### 21.1 GitHub Actions（`.github/workflows/build.yml`）
+
+- 触发：`push`（所有分支与 `v*` tag）、`pull_request`。
+- `build` job：matrix 6 个组合（windows-latest/windows、ubuntu-latest/linux、macos-latest/darwin 各配 amd64/arm64）；`actions/setup-go@v5` 使用 `1.27.x` 与模块缓存；`CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X ...Version=${version}"` 产出 `dist/model-router-<version>-<goos>-<goarch>[.exe]`，逐组合上传 artifact（同名规则）。
+- 版本解析：读取 `internal/version/version.txt`；`refs/tags/v*` 时取 tag 去掉 `v` 前缀。每一步用 bash（windows-latest 亦使用 Git Bash），`fail-fast: true`。
+- `release` job：仅 tag，`needs: build`；下载全部 artifact 合并后由 `softprops/action-gh-release@v2` 发布。
+- `docker` job：ubuntu-latest；checkout → 解析版本与镜像名（`ghcr.io/<owner>/model-router`，仓库名小写化）→ `docker/setup-buildx-action` → tag 时登录 GHCR → `docker/build-push-action` 构建 `linux/amd64,linux/arm64`；tag 时推送 `:<version>` 与 `:latest`，非 tag 只构建不推送。`GITHUB_TOKEN` 仅需 `packages: write`/`contents: read`。
+
+### 21.2 Dockerfile
+
+- 两阶段：`golang:1.27-alpine AS build` → `gcr.io/distroless/static-debian12:nonroot`。
+- build 阶段接收 `TARGETOS`/`TARGETARCH`（buildx 自动注入）与可选 `VERSION`；未传 `VERSION` 时读取 `internal/version/version.txt`，保证版本单一来源。
+- `CGO_ENABLED=0` 静态编译；运行阶段只拷二进制，`USER nonroot:nonroot`、`EXPOSE 18080`、`ENV MODEL_ROUTER_LISTEN=0.0.0.0:18080`；入口固定 `-config /home/nonroot/config/config.json`。
+- 镜像不内置配置；运行时挂载或通过 `MODEL_ROUTER_*` 覆盖。
+
+### 21.3 docker-compose.yml
+
+- 单服务 `model-router`：`build: .`、端口 `18080:18080`、`./.docker` 目录读写挂载到 `/home/nonroot/config`（容器内 `/home/nonroot/config/config.json`）、`MODEL_ROUTER_LISTEN=0.0.0.0:18080`、`restart: unless-stopped`。
+- 作为部署示例，真实密钥由本地 `.docker/config.json` 提供（gitignore）；目录挂载（而非单文件）使 Web 页保存配置时的原子 rename 在同设备完成。
+
+### 21.4 build-all.sh
+
+- 读取 `internal/version/version.txt`，循环 `GOOS × GOARCH`，以环境变量调用现有 `build.sh`（不修改 `build.sh`）；产物落 `dist/`。
+- 任一构建失败因 `set -e` 立即非零退出；结束后校验 6 个文件存在并打印清单。
+
+### 21.5 决策与未覆盖
+
+- **D-M5-1 版本来源**：本地构建统一用 `version.txt`；CI tag 构建以 tag 版本为准（可能不同于文件值）。`-version` 仍由 ldflags 注入值决定。
+- **D-M5-2 runner 与目标**：每个 runner 只构建自身 GOOS 的两个架构（windows runner 构建 windows/arm64 等交叉编译），共 6 个产物，不额外增加 runner 数。
+- **D-M5-3 CI Go 版本**：`1.27.x` 由 setup-go 解析最新补丁；`go.mod` 仍声明 `go 1.27.1`。
+- **D-M5-4 PR 的 Docker 构建**：非 tag 时 buildx 仍构建双架构（arm64 走 QEMU 模拟）但不登录/不推送；fork PR 无写权限也不受影响。
+- **D-M5-5 镜像不含配置/健康检查**：配置通过挂载提供；未添加 HEALTHCHECK（需求标注非必需）。
+- **D-M5-6 distroless 调试能力**：运行镜像无 shell，只能通过日志/端口排查；这是非 root 最小镜像的取舍。
+- **D-M5-7 本地端口冲突**：compose 示例固定 18080；若宿主机已有进程监听该端口，需要改端口映射；不属于镜像行为。
+- **D-M5-8 不做**：代码签名、macOS 公证、系统包、K8s/Helm、CI 真实 E2E（§14.6）。

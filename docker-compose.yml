@@ -1,0 +1,15 @@
+services:
+  model-router:
+    build: .
+    image: model-router:0.0.1-rc
+    ports:
+      - "18080:18080"
+    environment:
+      MODEL_ROUTER_LISTEN: "0.0.0.0:18080"
+      # 可按需覆盖其他顶层配置（§8.9）：
+      # MODEL_ROUTER_AUTH_TOKEN: "replace-with-your-client-token"
+      # MODEL_ROUTER_ADMIN_USER: "admin"
+      # MODEL_ROUTER_ADMIN_PASSWORD: "replace-with-your-admin-password"
+    volumes:
+      - ./.docker:/home/nonroot/config:rw
+    restart: unless-stopped

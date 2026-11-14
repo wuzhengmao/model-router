@@ -57,7 +57,7 @@
 | 编号 | 用例 | 入口 | 覆盖点 | 预期 |
 |---|---|---|---|---|
 | UT-121 | OpenAI 格式 | `TestModelsOpenAI` | 跨 openai 实例 models 顺序/去重；排除 anthropic；`object/owned_by/created` | 列表正确，上游 0 调用 |
-| UT-122 | Anthropic 格式 | `TestModelsAnthropic` | 具体 roles 值（不含 `*`）去重；`data/type/display_name/created_at/has_more/first_id/last_id` | 格式正确，`*` 值不出现 |
+| UT-122 | Anthropic 格式 | `TestModelsAnthropic` | 返回角色名（sonnet/opus/fable/haiku 固定顺序、去重、不含 `*`），不是 roles 映射值；`data/type/display_name/created_at/has_more/first_id/last_id` | id 为角色名，`*` 不出现 |
 | UT-123 | 认证与方法 | `TestModelsAuthAndMethod` | 无/错 Bearer、错 x-api-key、POST | 401 按协议；405 + `Allow: GET` |
 
 ## 5. 管理面（`internal/proxy`）
@@ -234,3 +234,30 @@ go test -race ./internal/proxy
 | 首字节等待仍由实例 timeout 控制 | 代码审查（`client.Do` + transport 响应头超时）；非流式超时测试 UT-114/115 保持通过 |
 | 页面「空闲超时」输入框（回填/保存/0 禁用/非法阻止） | UT-1401～1406 扩展 + 手工 |
 | 文档同步 / `-version` 0.0.1-rc | README/CHANGELOG/design/tests；`bash build.sh` + `-version` |
+
+## 16. 跨平台构建与 Docker（M5，§14）
+
+### 16.1 验证项
+
+| 编号 | 验证项 | 命令 / 方法 | 预期 |
+|---|---|---|---|
+| ET-1601 | Workflow YAML 语法 | `python -c "import yaml; yaml.safe_load(open('.github/workflows/build.yml'))"` | 解析成功，jobs = build/release/docker |
+| ET-1602 | Workflow 内容 | 人工检查 matrix/trigger/permissions | 6 组合（windows/linux/darwin × amd64/arm64）；push+PR+tag；tag release；docker 双架构推 GHCR |
+| ET-1603 | 本地全平台构建 | `bash build-all.sh` | `dist/` 下 6 个 `model-router-0.0.1-rc-<os>-<arch>[.exe]`，退出码 0 |
+| ET-1604 | Compose 语法 | `docker compose config --quiet` | 退出码 0 |
+| ET-1605 | Docker 镜像构建 | `docker build -t model-router:m5-test .` | 成功（golang:1.27-alpine → distroless nonroot） |
+| ET-1606 | 容器运行与 /v1/models | 挂载测试配置运行容器，`curl /v1/models -H "Authorization: Bearer <token>"` | 200 + 本地生成的模型列表；无 token → 401；容器 `User=nonroot:nonroot` |
+| ET-1607 | 版本 | 构建产物 `-version` | `0.0.1-rc` |
+| ET-1608 | actionlint（可选） | `actionlint` | 若本机存在则通过；本次环境未安装，以 PyYAML 解析为准 |
+
+### 16.2 验收对照（§14.7）
+
+| 验收项 | 对应 |
+|---|---|
+| Workflow YAML 可解析（actionlint 如有） | ET-1601、ET-1608 |
+| matrix 6 组合 + tag release + 多架构 Docker | ET-1602 |
+| Dockerfile 本地 build 成功 | ET-1605 |
+| 容器 /v1/models 带 token 返回 200 | ET-1606 |
+| docker compose config 通过 | ET-1604 |
+| build-all.sh 生成 6 个产物 | ET-1603 |
+| 文档同步 / `-version` 0.0.1-rc | ET-1607；README/CHANGELOG/design/tests 已更新 |

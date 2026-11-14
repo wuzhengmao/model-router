@@ -1050,11 +1050,15 @@ func TestModelsOpenAI(t *testing.T) {
 
 func TestModelsAnthropic(t *testing.T) {
 	proxyServer := newProxy(t, serviceToken,
-		anthropicInstance("https://anthropic.example", "anthropic-key", map[string]string{
+		anthropicInstance("https://anthropic-a.example", "anthropic-key", map[string]string{
 			"sonnet": "claude-sonnet-real",
 			"opus":   "claude-opus-real",
 			"haiku":  "claude-sonnet-real",
 			"*":      "fallback-model",
+		}),
+		anthropicInstance("https://anthropic-b.example", "anthropic-key", map[string]string{
+			"fable":  "claude-fable-real",
+			"sonnet": "other-model",
 		}),
 		openAIInstance("https://openai.example", "openai-key", "gpt-only"),
 	)
@@ -1089,15 +1093,20 @@ func TestModelsAnthropic(t *testing.T) {
 			t.Errorf("model %q created_at = %q, want RFC3339: %v", item.ID, item.CreatedAt, err)
 		}
 	}
-	want := []string{"claude-sonnet-real", "claude-opus-real"}
+	want := []string{"sonnet", "opus", "fable", "haiku"}
 	if !reflect.DeepEqual(ids, want) {
-		t.Errorf("model ids = %v, want %v (concrete roles only, dedupe)", ids, want)
+		t.Errorf("model ids = %v, want role names %v (fixed order, dedupe, no *)", ids, want)
+	}
+	for _, id := range ids {
+		if id == "claude-sonnet-real" || id == "claude-opus-real" || id == "claude-fable-real" || id == "fallback-model" {
+			t.Errorf("model ids must be role names, got upstream model %q", id)
+		}
 	}
 	if list.HasMore {
 		t.Error("has_more = true, want false")
 	}
-	if list.FirstID != "claude-sonnet-real" || list.LastID != "claude-opus-real" {
-		t.Errorf("first_id/last_id = %q/%q, want first/last ids", list.FirstID, list.LastID)
+	if list.FirstID != "sonnet" || list.LastID != "haiku" {
+		t.Errorf("first_id/last_id = %q/%q, want sonnet/haiku", list.FirstID, list.LastID)
 	}
 }
 

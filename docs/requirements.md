@@ -275,7 +275,10 @@ OpenAI 入口映射保持 M1 不变（401 `invalid_request_error` + `missing_api
 - 路径 `GET /v1/models`，按入口协议返回对应标准格式（**本地生成，不转发上游**）：
   - OpenAI 入口（认证 `Authorization: Bearer <auth_token>`）→ `{"object":"list","data":[{"id":<model>,"object":"model","created":<unix秒>,"owned_by":"model-router"}]}`
   - Anthropic 入口（认证 `x-api-key: <auth_token>`）→ `{"data":[{"id":<model>,"type":"model","display_name":<model>,"created_at":"<RFC3339>"}],"has_more":false,"first_id":<首项id>,"last_id":<末项id>}`
-- 模型清单（按入口协议过滤 backend 后聚合）：对每个匹配协议的 backend 依次收集 ① `backend.model` ② `matches` 每项 ③ `roles` 中具体角色（`sonnet`/`opus`/`fable`/`haiku`，**不含 `*`**）；按出现顺序去重。
+- 模型清单：
+  - **OpenAI 入口**：收集所有 openai 实例的 `models` 值，按实例顺序、出现顺序去重。
+  - **Anthropic 入口**：返回**预定义角色名** `sonnet`/`opus`/`fable`/`haiku`（不是 `roles` 映射的值），只返回至少有一个 anthropic 实例配置了该角色的角色名，按固定顺序 `sonnet → opus → fable → haiku` 去重；不返回 `*`。
+  - 理由：Anthropic 客户端（Claude Code）从 `/v1/models` 选模型后用该 id 发请求；只有返回角色名，客户端才能发 `sonnet`/`opus` 等，代理再经 `roles` 映射到实际模型（§9.2）。
 - 认证失败：返回对应协议格式的 401（复用现有错误体逻辑，格式由入口路径决定）。
 - 方法限定 `GET`；其他方法（POST 等）→ 405。
 - 不调用上游 `/v1/models`（用户拍板）。
@@ -461,7 +464,7 @@ OpenAI 入口映射保持 M1 不变（401 `invalid_request_error` + `missing_api
 - probe 不持久化、不缓存结果；不做自动连接健康检查（M4）。
 - 不做 session/cookie 登录（仍 Basic Auth）。
 - 不做协议转换；不做跨平台 CI/Docker（M5）。
-- `/v1/models` 对外入口仍只列配置声明模型、不调上游（§8.2 不变；probe 是管理面独立能力）。
+- `/v1/models` 对外入口仍不调上游（§8.2；OpenAI 返回实例 `models` 值、Anthropic 返回角色名；probe 是管理面独立能力）。
 
 ### 9.6 验收标准
 
@@ -801,4 +804,60 @@ M4 验收后，用户要求两点配置结构修正：
 - Anthropic：mock 上游发出首块后静默超过 `idle_timeout` → 客户端收到 `message_delta(stop_reason="pause_turn")` + `message_stop` 收尾事件（不收到上游的残留数据）。
 - OpenAI：mock 上游发出首块后静默超过 `idle_timeout` → 客户端连接被中断（流截断）。
 - OpenAI 低速：mock 上游持续慢速输出（< `min_tokens_per_second`）→ 流不被中断、完整结束，仅记失败。
+- README/CHANGELOG/design/tests 同步；`-version` 仍 `0.0.1-rc`。
+
+## 14. M5 增量规格：跨平台构建 + Docker
+
+> 本节由产品经理（主代理）在 M5 启动前规格化，是 M5 派发与验收的需求依据。对应 NFR：一键构建脚本 + GitHub Actions 跨平台构建；Docker 容器部署（amd64/arm64）。
+
+### 14.1 目标
+
+1. **GitHub Actions 跨平台构建** 6 个组合：`windows-linux-darwin` × `amd64-arm64`，产物上传/发布。
+2. **Docker 多架构镜像**（amd64/arm64），纯静态二进制、非 root 运行。
+3. **本地一键全平台构建**（`build-all.sh`），方便无 CI 时出包。
+4. `docker-compose.yml` 部署示例。
+
+### 14.2 GitHub Actions
+
+文件 `.github/workflows/build.yml`：
+
+- **触发**：`push`（所有分支）、`pull_request`、`push tag 'v*'`。
+- **build job（matrix 6 组合）**：`os=[windows-latest, ubuntu-latest, macos-latest]` × `arch=[amd64, arm64]`；步骤：checkout → `actions/setup-go`（go-version 从 `go.mod` 或固定 `1.27.x`）→ `go build -trimpath -ldflags "-s -w -X model-router/internal/version.Version=$VERSION" -o dist/model-router-$VERSION-$GOOS-$GOARCH[.exe]` → `actions/upload-artifact`（6 个产物，命名一致）。
+- **版本号**：从 `internal/version/version.txt` 读取；tag 触发时以 tag 去 `v` 前缀作为版本（如 `v0.0.1` → `0.0.1`），非 tag 用文件值。
+- **release job（仅 tag）**：`softprops/action-gh-release` 或 `gh release create` 上传 6 个产物。
+- **docker job（仅 ubuntu-latest）**：`docker/setup-buildx-action` → `docker buildx build --platform linux/amd64,linux/arm64`，tag 时推 `ghcr.io/<owner>/model-router:<version>` 与 `:latest`；非 tag 只构建不推送。
+- Go 模块缓存（`actions/setup-go` 自带），失败即终止。
+
+### 14.3 Dockerfile
+
+- **multi-stage**：`golang:1.27-alpine AS build` → `gcr.io/distroless/static-debian12:nonroot`（纯静态二进制，无 shell，非 root uid 65532）。
+- build 阶段 `CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build -trimpath -ldflags "-s -w -X ...Version=$VERSION" -o /model-router .`（用 `--build-arg TARGETARCH` 支持多架构）。
+- 运行阶段：`COPY --from=build /model-router /model-router`；`USER nonroot:nonroot`；`EXPOSE 18080`；`ENTRYPOINT ["/model-router", "-config", "/home/nonroot/config/config.json"]`。
+- 支持环境变量 `MODEL_ROUTER_*`（§8.9）覆盖配置文件；默认 `MODEL_ROUTER_LISTEN=0.0.0.0:18080`（容器内需监听 0.0.0.0）。
+- 不做健康检查（可选加 `HEALTHCHECK`，非必需）。
+
+### 14.4 docker-compose.yml
+
+- 服务 `model-router`：`build: .` 或 `image: ghcr.io/.../model-router:0.0.1-rc`；`ports: ["18080:18080"]`；`volumes: ["./.docker:/home/nonroot/config:rw"]`；`environment` 可放 `MODEL_ROUTER_LISTEN=0.0.0.0:18080` 等。
+- `restart: unless-stopped`。
+- 作为部署示例，不强制要求生产配置。
+
+### 14.5 build-all.sh
+
+- 循环 `GOOS in windows linux darwin` × `GOARCH in amd64 arm64`，调用 `build.sh`（已支持环境变量）或直接 `go build`，产物统一落 `dist/`。
+- 输出汇总清单；任一失败即非零退出。
+
+### 14.6 明确不做
+
+- 不做代码签名 / macOS 公证 / Windows 安装包。
+- 不做 Homebrew / apt / rpm 包。
+- 不做 K8s manifest / Helm chart。
+- 不做 CI 中的真实 E2E（保持 `go test` + 构建）。
+
+### 14.7 验收标准
+
+- `.github/workflows/build.yml` YAML 语法正确（至少能被 `python -c "import yaml"` 解析；如本机有 `actionlint` 则必须通过）。
+- `Dockerfile` 在本地可 `docker build`（或 `docker buildx build --platform linux/amd64`）成功；镜像可 `docker run` 启动并响应 `/v1/models`（带 token）。
+- `docker-compose.yml` 语法正确（`docker compose config` 通过）。
+- `build-all.sh` 可生成 6 个产物到 `dist/`（本机跨平台交叉编译可行）。
 - README/CHANGELOG/design/tests 同步；`-version` 仍 `0.0.1-rc`。

@@ -15,6 +15,7 @@ go.work.sum
 
 # 本地配置与密钥（不要把真实 key 提交进仓库）
 config.local.*
+/.docker/
 *.local.yaml
 *.local.yml
 *.local.json

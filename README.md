@@ -20,7 +20,7 @@ OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理
 - **实例粒度回退降级（M4）**：每个协议下实例按配置顺序构成候选链；连接失败/超时自动在本次请求内回退到下一候选；连续失败 3 次进入 5 分钟持续回退（跳过该实例）；回退期结束后首次探测失败立即重新计时；成功清零。吞吐低于 30 token/s 会在响应完成后记录失败（已发出的响应不回退）。
 - **透传**：方法、路径、查询串、请求体（别名/角色命中时仅改顶层 `model`）与非认证请求头原样转发；响应原样回传，SSE 逐块 flush。
 - **上游认证分离**：OpenAI 实例使用 `Authorization: Bearer <api_key>`，Anthropic 实例使用 `x-api-key: <api_key>`；客户端 token 永不外传。
-- **模型列表 `/v1/models`**：本地聚合配置声明的模型（Anthropic 不含 `*` 托底值），按认证头判定协议并返回对应格式；不调上游。
+- **模型列表 `/v1/models`**：本地聚合配置声明（OpenAI 返回 `models` 值；Anthropic 返回已声明的角色名 `sonnet`/`opus`/`fable`/`haiku`，固定顺序、不含 `*`），按认证头判定协议并返回对应格式；不调上游。
 - **Web 配置页 `/admin`**：可视化模式（回退参数输入框、OpenAI/Anthropic 双 tab、添加实例时先选供应商或自定义、实例卡片可拖动排序、测试连接、查询上游模型、勾选/手动填写）+ JSON 高级模式（含 `fallback` 与分组 `instances`；校验通过才可保存）。
 - **管理 API**：`GET/PUT /api/config`、`POST /api/reload`、`POST /api/config/validate`、`POST /api/probe/test`、`POST /api/probe/models`、`GET /api/providers`；HTTP Basic Auth。
 - **手动重载**：重读 `-config` 文件并原子切换，进程不重启；失败保留旧配置。
@@ -212,7 +212,8 @@ curl -sS http://127.0.0.1:18080/v1/models -H "Authorization: Bearer <auth_token>
 curl -sS http://127.0.0.1:18080/v1/models -H "x-api-key: <auth_token>"
 ```
 
-- 只列配置声明：OpenAI 实例的 `models`、Anthropic 实例 `roles` 的具体角色值（不含 `*`），按实例/条目顺序去重。
+- OpenAI：收集 openai 实例的 `models` 值，按实例顺序、出现顺序去重。
+- Anthropic：返回**预定义角色名** `sonnet`/`opus`/`fable`/`haiku`（不是 `roles` 映射的实际模型名），只返回至少有一个 anthropic 实例声明的角色，固定顺序、去重，不返回 `*`。客户端据此发角色名，代理再经 `roles` 映射到真实模型。
 - 仅 GET；其他方法 405。
 - 同时带两种认证头时按 OpenAI 处理。
 
@@ -267,14 +268,51 @@ Anthropic 入口：`{"type":"error","error":{"type":"...","message":"..."}}`。
 
 ## 构建
 
+当前平台一键构建（产物输出到 `dist/`）：
+
 ```bash
 bash build.sh
 ./dist/model-router-0.0.1-rc-windows-amd64.exe -version
 # 输出：0.0.1-rc
 ```
 
+本地全平台构建（windows/linux/darwin × amd64/arm64，共 6 个产物）：
+
+```bash
+bash build-all.sh
+# 输出汇总：dist/model-router-0.0.1-rc-<os>-<arch>[.exe]
+```
+
 - 纯 Go，`CGO_ENABLED=0`。版本号唯一来源 `internal/version/version.txt`，构建脚本通过 `-ldflags -X` 注入。
-- 产物输出到 `dist/`，命名 `model-router-<version>-<os>-<arch>[.exe]`；可用 `GOOS`/`GOARCH` 覆盖平台。
+- 产物命名 `model-router-<version>-<os>-<arch>[.exe]`；`build.sh` 可用 `GOOS`/`GOARCH` 覆盖平台。
+- GitHub Actions（`.github/workflows/build.yml`）在 push / PR / tag `v*` 上运行 6 组合构建并上传产物；tag 时创建 GitHub Release，并在 ubuntu runner 上用 buildx 构建 `linux/amd64,linux/arm64` 镜像推送 `ghcr.io/<owner>/model-router:<version>` 与 `:latest`。
+
+## Docker 部署
+
+多阶段构建：`golang:1.27-alpine` 编译静态二进制，运行阶段使用 `gcr.io/distroless/static-debian12:nonroot`（非 root，无 shell）。
+
+```bash
+# 本地构建并运行（需要挂载配置文件）
+docker build -t model-router:0.0.1-rc .
+docker run -d --name model-router -p 18080:18080 \
+  -e MODEL_ROUTER_LISTEN=0.0.0.0:18080 \
+  -v "$PWD/.docker:/home/nonroot/config:rw" \
+  model-router:0.0.1-rc
+
+curl -sS http://127.0.0.1:18080/v1/models -H "Authorization: Bearer <auth_token>"
+```
+
+或使用 docker compose：
+
+```bash
+docker compose up -d --build
+docker compose logs -f model-router
+```
+
+- 镜像内入口固定为 `/model-router -config /home/nonroot/config/config.json`，配置文件由挂载目录 `./.docker` 提供（主机 `.docker/config.json`）；配置含真实密钥，请勿提交。
+- 容器默认 `MODEL_ROUTER_LISTEN=0.0.0.0:18080`；也可用 `MODEL_ROUTER_AUTH_TOKEN` 等环境变量覆盖顶层配置（§8.9）。
+- 多架构构建：`docker buildx build --platform linux/amd64,linux/arm64 -t <tag> .`（Dockerfile 使用 `TARGETARCH`/`TARGETOS` build args）。
+- 镜像不包含健康检查；生产环境请置于 TLS 反向代理之后。
 
 ## 目录结构
 
@@ -288,7 +326,12 @@ bash build.sh
 │   ├── version/               # 版本号唯一来源 + ldflags 注入
 │   └── web/                   # 内嵌管理页（go:embed，无外部 CDN）
 ├── config.example.json        # instances 配置样例
-├── build.sh                   # 一键构建脚本
+├── build.sh                   # 当前平台一键构建（dist/）
+├── build-all.sh               # 本地全平台构建（6 个 dist/ 产物）
+├── Dockerfile                 # multi-stage、distroless nonroot 镜像
+├── docker-compose.yml         # 部署示例（端口/配置挂载/环境变量）
+├── .dockerignore
+├── .github/workflows/build.yml # CI：6 组合构建 + tag release + 多架构镜像
 ├── README.md
 ├── CHANGELOG.md
 └── docs/
