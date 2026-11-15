@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,11 +26,18 @@ import (
 	"model-router/internal/web"
 )
 
-// API paths served by this proxy.
+// API paths served by this proxy. PathAnthropic and PathModels are also the
+// upstream paths used by probe requests.
 const (
 	PathOpenAI    = "/v1/chat/completions"
 	PathAnthropic = "/v1/messages"
 	PathModels    = "/v1/models"
+
+	// Protocol-separated Anthropic entrypoints (§22.3). /anthropic/v1/messages
+	// behaves exactly like /v1/messages; /anthropic/v1/models always answers in
+	// the Anthropic schema.
+	PathAnthropicMessages = "/anthropic/v1/messages"
+	PathAnthropicModels   = "/anthropic/v1/models"
 )
 
 // Admin API paths added in M3.1.
@@ -76,12 +84,14 @@ const (
 
 // instanceRuntime is one configured instance plus its in-memory fallback state.
 type instanceRuntime struct {
-	name    string
-	baseURL *url.URL
-	apiKey  string
-	models  []string
-	roles   map[string]string
-	client  *http.Client
+	name         string
+	baseURL      *url.URL
+	apiKey       string
+	models       []string
+	roles        map[string]string
+	roleNames    map[string]string
+	capabilities map[string]config.ModelCapability
+	client       *http.Client
 
 	mu                  sync.Mutex
 	consecutiveFailures int
@@ -211,6 +221,23 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Handler, error) {
 					ir.roles[role] = model
 				}
 			}
+			ir.roleNames = make(map[string]string, len(inst.RoleNames))
+			for rawRole, rawName := range inst.RoleNames {
+				role := strings.ToLower(strings.TrimSpace(rawRole))
+				if !config.IsConcreteRole(role) {
+					continue
+				}
+				if name := strings.TrimSpace(rawName); name != "" {
+					ir.roleNames[role] = name
+				}
+			}
+		}
+		// Capabilities feed the models listings of both protocols (§21.5, §22.4).
+		ir.capabilities = make(map[string]config.ModelCapability, len(inst.ModelCapabilities))
+		for rawModel, capability := range inst.ModelCapabilities {
+			if model := strings.TrimSpace(rawModel); model != "" {
+				ir.capabilities[model] = capability
+			}
 		}
 		h.byProtocol[proto] = append(h.byProtocol[proto], ir)
 	}
@@ -275,11 +302,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !known {
 		writeOpenAIError(w, http.StatusNotFound, "invalid_request_error", "not_found",
-			"only "+PathOpenAI+", "+PathAnthropic+" and "+PathModels+" are served")
+			"only "+PathOpenAI+", "+PathAnthropic+", "+PathAnthropicMessages+", "+
+				PathModels+" and "+PathAnthropicModels+" are served")
 		return
 	}
 
-	if r.URL.Path == PathModels {
+	if isModelsPath(r.URL.Path) {
 		h.serveModels(w, r, proto)
 		return
 	}
@@ -304,32 +332,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.serveChain(w, r, proto, insts, body)
 }
 
-// protocolForPath returns the protocol of the entrypoint. /v1/models has no
-// inherent protocol, so its credential header decides; unknown paths are
-// reported as OpenAI so their 404 keeps the M1 OpenAI error format.
+// protocolForPath returns the protocol of the entrypoint. The path alone
+// decides the protocol (§22.3); unknown paths are reported as OpenAI so their
+// 404 keeps the M1 OpenAI error format.
 func protocolForPath(r *http.Request) (protocol, bool) {
 	switch r.URL.Path {
-	case PathOpenAI:
+	case PathOpenAI, PathModels:
 		return protocolOpenAI, true
-	case PathAnthropic:
+	case PathAnthropic, PathAnthropicMessages, PathAnthropicModels:
 		return protocolAnthropic, true
-	case PathModels:
-		return modelsProtocol(r), true
 	default:
 		return protocolOpenAI, false
 	}
 }
 
-// modelsProtocol treats /v1/models as Anthropic only when the caller presents
-// x-api-key without Authorization; otherwise it is served as OpenAI.
-func modelsProtocol(r *http.Request) protocol {
-	if r.Header.Get("x-api-key") != "" && r.Header.Get("Authorization") == "" {
-		return protocolAnthropic
-	}
-	return protocolOpenAI
+func isModelsPath(path string) bool {
+	return path == PathModels || path == PathAnthropicModels
 }
 
-// serveModels answers /v1/models locally from the configured instances.
+// upstreamPath maps a public entry path to the upstream path. The /anthropic
+// prefix exists only locally; upstreams still receive /v1/messages (§22.3).
+func upstreamPath(entry string) string {
+	if entry == PathAnthropicMessages {
+		return PathAnthropic
+	}
+	return entry
+}
+
+// serveModels answers the two models entrypoints locally from the configured
+// instances. The path, not the credential header, selects the response schema.
 func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, proto protocol) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
@@ -337,54 +368,96 @@ func (h *Handler) serveModels(w http.ResponseWriter, r *http.Request, proto prot
 		return
 	}
 
-	models := h.modelList(proto)
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if proto == protocolAnthropic {
-		_ = json.NewEncoder(w).Encode(newAnthropicModelList(models))
-		return
-	}
-	_ = json.NewEncoder(w).Encode(newOpenAIModelList(models))
-}
-
-// modelList aggregates declared upstream models per protocol in instance order,
-// de-duplicated by first appearance. "*" role values are excluded.
-func (h *Handler) modelList(proto protocol) []string {
-	seen := make(map[string]bool)
-	models := make([]string, 0)
-	add := func(name string) {
-		if name == "" || seen[name] {
+	if r.URL.Path == PathAnthropicModels {
+		list, err := h.anthropicModelList(r)
+		if err != nil {
+			writeProtocolError(w, proto, http.StatusBadRequest, err.Error())
 			return
 		}
-		seen[name] = true
-		models = append(models, name)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_ = json.NewEncoder(w).Encode(list)
+		return
 	}
-	if proto == protocolAnthropic {
-		// Anthropic clients select roles (sonnet/opus/...), which the proxy then
-		// maps to configured upstream models. Publish only roles that at least
-		// one anthropic instance declares, in the fixed canonical order.
-		for _, role := range concreteRoles {
-			for _, inst := range h.byProtocol[proto] {
-				if _, ok := inst.roles[role]; ok {
-					add(role)
-					break
-				}
-			}
-		}
-		return models
-	}
-	for _, inst := range h.byProtocol[proto] {
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(h.openAIModelList())
+}
+
+// openAIModelList aggregates declared upstream models in instance order,
+// de-duplicated by first appearance, with the first declared capability of
+// each model (§22.4).
+func (h *Handler) openAIModelList() openAIModelList {
+	instances := h.byProtocol[protocolOpenAI]
+	seen := make(map[string]bool)
+	now := time.Now().Unix()
+	data := make([]openAIModelEntry, 0)
+	for _, inst := range instances {
 		for _, model := range inst.models {
-			add(model)
+			if model == "" || seen[model] {
+				continue
+			}
+			seen[model] = true
+			entry := openAIModelEntry{
+				ID:      model,
+				Object:  "model",
+				Created: now,
+				OwnedBy: "model-router",
+			}
+			if capability, ok := openAIModelCapability(instances, model); ok {
+				applyOpenAIModelCapability(&entry, capability)
+			}
+			data = append(data, entry)
 		}
 	}
-	return models
+	return openAIModelList{Object: "list", Data: data}
+}
+
+// openAIModelCapability returns the first declaration of the upstream model in
+// instance order; a later instance supplies it when the first one is silent
+// (§22.4, mirroring §21.5).
+func openAIModelCapability(instances []*instanceRuntime, model string) (config.ModelCapability, bool) {
+	for _, inst := range instances {
+		if capability, ok := inst.capabilities[model]; ok {
+			return capability, true
+		}
+	}
+	return config.ModelCapability{}, false
+}
+
+func applyOpenAIModelCapability(entry *openAIModelEntry, capability config.ModelCapability) {
+	if capability.MaxInputTokens > 0 {
+		value := capability.MaxInputTokens
+		entry.ContextWindow = &value
+		entry.MaxInputTokens = &value
+	}
+	if capability.MaxTokens > 0 {
+		value := capability.MaxTokens
+		entry.MaxOutputTokens = &value
+		entry.MaxTokens = &value
+	}
+
+	modalities := []string{"text"}
+	if capability.ImageInput != nil && *capability.ImageInput {
+		modalities = append(modalities, "image")
+	}
+	if capability.PDFInput != nil && *capability.PDFInput {
+		modalities = append(modalities, "pdf")
+	}
+	if len(modalities) > 1 {
+		entry.InputModalities = modalities
+	}
 }
 
 type openAIModelEntry struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID              string   `json:"id"`
+	Object          string   `json:"object"`
+	Created         int64    `json:"created"`
+	OwnedBy         string   `json:"owned_by"`
+	ContextWindow   *int     `json:"context_window,omitempty"`
+	MaxInputTokens  *int     `json:"max_input_tokens,omitempty"`
+	MaxOutputTokens *int     `json:"max_output_tokens,omitempty"`
+	MaxTokens       *int     `json:"max_tokens,omitempty"`
+	InputModalities []string `json:"input_modalities,omitempty"`
 }
 
 type openAIModelList struct {
@@ -392,49 +465,303 @@ type openAIModelList struct {
 	Data   []openAIModelEntry `json:"data"`
 }
 
-func newOpenAIModelList(models []string) openAIModelList {
-	now := time.Now().Unix()
-	data := make([]openAIModelEntry, 0, len(models))
-	for _, id := range models {
-		data = append(data, openAIModelEntry{
-			ID:      id,
-			Object:  "model",
-			Created: now,
-			OwnedBy: "model-router",
-		})
+// Lifecycle values accepted by ?lifecycle (§21.3). This proxy only publishes
+// active models.
+const (
+	lifecycleActive     = "active"
+	lifecycleDeprecated = "deprecated"
+	lifecycleRetired    = "retired"
+
+	defaultModelsLimit = 20
+	maxModelsLimit     = 1000
+)
+
+// roleNameDefault is the built-in public identity of a concrete role (§21.4).
+type roleNameDefault struct {
+	ID          string
+	DisplayName string
+	CreatedAt   string
+}
+
+var builtinRoleNames = map[string]roleNameDefault{
+	config.RoleSonnet: {ID: "claude-sonnet-5", DisplayName: "Claude Sonnet 5", CreatedAt: "2026-01-01T00:00:00Z"},
+	config.RoleOpus:   {ID: "claude-opus-5", DisplayName: "Claude Opus 5", CreatedAt: "2026-01-01T00:00:00Z"},
+	config.RoleFable:  {ID: "claude-fable-5", DisplayName: "Claude Fable 5", CreatedAt: "2026-01-01T00:00:00Z"},
+	config.RoleHaiku:  {ID: "claude-haiku-4-5", DisplayName: "Claude Haiku 4.5", CreatedAt: "2025-10-01T00:00:00Z"},
+}
+
+var builtinRoleNamesByID = func() map[string]roleNameDefault {
+	byID := make(map[string]roleNameDefault, len(builtinRoleNames))
+	for _, name := range builtinRoleNames {
+		byID[name.ID] = name
 	}
-	return openAIModelList{Object: "list", Data: data}
+	return byID
+}()
+
+type anthropicCapabilitySupport struct {
+	Supported bool `json:"supported"`
+}
+
+type anthropicCapabilities struct {
+	ImageInput        *anthropicCapabilitySupport `json:"image_input,omitempty"`
+	PDFInput          *anthropicCapabilitySupport `json:"pdf_input,omitempty"`
+	Thinking          *anthropicCapabilitySupport `json:"thinking,omitempty"`
+	StructuredOutputs *anthropicCapabilitySupport `json:"structured_outputs,omitempty"`
 }
 
 type anthropicModelEntry struct {
-	ID          string `json:"id"`
-	Type        string `json:"type"`
-	DisplayName string `json:"display_name"`
-	CreatedAt   string `json:"created_at"`
+	Type           string                 `json:"type"`
+	ID             string                 `json:"id"`
+	DisplayName    string                 `json:"display_name"`
+	CreatedAt      string                 `json:"created_at"`
+	MaxInputTokens *int                   `json:"max_input_tokens"`
+	MaxTokens      *int                   `json:"max_tokens"`
+	Lifecycle      string                 `json:"lifecycle"`
+	DeprecatedAt   *string                `json:"deprecated_at"`
+	RetiresAt      *string                `json:"retires_at"`
+	Line           string                 `json:"line"`
+	Capabilities   *anthropicCapabilities `json:"capabilities"`
 }
 
 type anthropicModelList struct {
 	Data    []anthropicModelEntry `json:"data"`
 	HasMore bool                  `json:"has_more"`
-	FirstID string                `json:"first_id"`
-	LastID  string                `json:"last_id"`
+	FirstID *string               `json:"first_id"`
+	LastID  *string               `json:"last_id"`
 }
 
-func newAnthropicModelList(models []string) anthropicModelList {
-	createdAt := time.Now().UTC().Format(time.RFC3339)
-	data := make([]anthropicModelEntry, 0, len(models))
-	for _, id := range models {
-		data = append(data, anthropicModelEntry{
-			ID:          id,
-			Type:        "model",
-			DisplayName: id,
-			CreatedAt:   createdAt,
-		})
+type anthropicModelsQuery struct {
+	limit      int
+	afterID    string
+	beforeID   string
+	lifecycles map[string]bool
+}
+
+func (h *Handler) anthropicModelList(r *http.Request) (anthropicModelList, error) {
+	query, err := parseAnthropicModelsQuery(r)
+	if err != nil {
+		return anthropicModelList{}, err
 	}
-	list := anthropicModelList{Data: data, HasMore: false}
-	if len(models) > 0 {
-		list.FirstID = models[0]
-		list.LastID = models[len(models)-1]
+	entries := filterAnthropicModels(h.anthropicModelEntries(), query.lifecycles)
+	return paginateAnthropicModels(entries, query), nil
+}
+
+// anthropicModelEntries lists one entry per concrete role declared by at least
+// one anthropic instance, in canonical role order.
+func (h *Handler) anthropicModelEntries() []anthropicModelEntry {
+	instances := h.byProtocol[protocolAnthropic]
+	now := h.now().UTC().Format(time.RFC3339)
+	entries := make([]anthropicModelEntry, 0, len(concreteRoles))
+	for _, role := range concreteRoles {
+		upstreamModel, ok := roleUpstreamModel(instances, role)
+		if !ok {
+			continue
+		}
+		id := publicRoleModelID(instances, role)
+		displayName, createdAt := roleModelIdentity(id, now)
+		entry := anthropicModelEntry{
+			Type:        "model",
+			ID:          id,
+			DisplayName: displayName,
+			CreatedAt:   createdAt,
+			Lifecycle:   lifecycleActive,
+			Line:        role,
+		}
+		if capability, ok := roleModelCapability(instances, upstreamModel); ok {
+			applyModelCapability(&entry, capability)
+		}
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
+// roleUpstreamModel returns the upstream model of the first anthropic instance
+// that maps role, matching the routing order.
+func roleUpstreamModel(instances []*instanceRuntime, role string) (string, bool) {
+	for _, inst := range instances {
+		if model, ok := inst.roles[role]; ok {
+			return model, true
+		}
+	}
+	return "", false
+}
+
+// publicRoleModelID is the first role_names override in instance order, or the
+// built-in official model name (§21.4).
+func publicRoleModelID(instances []*instanceRuntime, role string) string {
+	for _, inst := range instances {
+		if id := inst.roleNames[role]; id != "" {
+			return id
+		}
+	}
+	if builtin, ok := builtinRoleNames[role]; ok {
+		return builtin.ID
+	}
+	return role
+}
+
+// roleModelIdentity follows the built-in table by public id; ids outside the
+// table fall back to id/current time (§21.4).
+func roleModelIdentity(id, now string) (displayName, createdAt string) {
+	if builtin, ok := builtinRoleNamesByID[id]; ok {
+		return builtin.DisplayName, builtin.CreatedAt
+	}
+	return id, now
+}
+
+// roleModelCapability returns the first declaration of the upstream model in
+// anthropic instance order; absence means unknown (§21.5).
+func roleModelCapability(instances []*instanceRuntime, upstreamModel string) (config.ModelCapability, bool) {
+	for _, inst := range instances {
+		if capability, ok := inst.capabilities[upstreamModel]; ok {
+			return capability, true
+		}
+	}
+	return config.ModelCapability{}, false
+}
+
+func applyModelCapability(entry *anthropicModelEntry, capability config.ModelCapability) {
+	if capability.MaxInputTokens > 0 {
+		value := capability.MaxInputTokens
+		entry.MaxInputTokens = &value
+	}
+	if capability.MaxTokens > 0 {
+		value := capability.MaxTokens
+		entry.MaxTokens = &value
+	}
+
+	declared := false
+	capabilities := &anthropicCapabilities{}
+	if capability.ImageInput != nil {
+		capabilities.ImageInput = &anthropicCapabilitySupport{Supported: *capability.ImageInput}
+		declared = true
+	}
+	if capability.PDFInput != nil {
+		capabilities.PDFInput = &anthropicCapabilitySupport{Supported: *capability.PDFInput}
+		declared = true
+	}
+	if capability.Thinking != nil {
+		capabilities.Thinking = &anthropicCapabilitySupport{Supported: *capability.Thinking}
+		declared = true
+	}
+	if capability.StructuredOutputs != nil {
+		capabilities.StructuredOutputs = &anthropicCapabilitySupport{Supported: *capability.StructuredOutputs}
+		declared = true
+	}
+	if declared {
+		entry.Capabilities = capabilities
+	}
+}
+
+func parseAnthropicModelsQuery(r *http.Request) (anthropicModelsQuery, error) {
+	values := r.URL.Query()
+	query := anthropicModelsQuery{
+		limit:      defaultModelsLimit,
+		lifecycles: map[string]bool{lifecycleActive: true, lifecycleDeprecated: true},
+	}
+
+	if limits, ok := values["limit"]; ok {
+		raw := ""
+		if len(limits) > 0 {
+			raw = limits[0]
+		}
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit < 1 || limit > maxModelsLimit {
+			return anthropicModelsQuery{}, fmt.Errorf("limit must be an integer between 1 and %d", maxModelsLimit)
+		}
+		query.limit = limit
+	}
+
+	before, hasBefore := values["before_id"]
+	after, hasAfter := values["after_id"]
+	if hasBefore && hasAfter {
+		return anthropicModelsQuery{}, errors.New("before_id and after_id are mutually exclusive")
+	}
+	if hasBefore && len(before) > 0 {
+		query.beforeID = before[0]
+	}
+	if hasAfter && len(after) > 0 {
+		query.afterID = after[0]
+	}
+
+	if raw, ok := values["lifecycle"]; ok {
+		lifecycles := make([]string, 0, len(raw))
+		for _, item := range raw {
+			for _, value := range strings.Split(item, ",") {
+				lifecycles = append(lifecycles, strings.TrimSpace(value))
+			}
+		}
+		if len(lifecycles) > 3 {
+			return anthropicModelsQuery{}, errors.New("lifecycle accepts at most 3 values")
+		}
+		query.lifecycles = make(map[string]bool, len(lifecycles))
+		for _, value := range lifecycles {
+			switch value {
+			case lifecycleActive, lifecycleDeprecated, lifecycleRetired:
+				query.lifecycles[value] = true
+			default:
+				return anthropicModelsQuery{}, fmt.Errorf("invalid lifecycle %q: must be one of active, deprecated, retired", value)
+			}
+		}
+	}
+
+	return query, nil
+}
+
+func filterAnthropicModels(entries []anthropicModelEntry, lifecycles map[string]bool) []anthropicModelEntry {
+	filtered := make([]anthropicModelEntry, 0, len(entries))
+	for _, entry := range entries {
+		if lifecycles[entry.Lifecycle] {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+func paginateAnthropicModels(entries []anthropicModelEntry, query anthropicModelsQuery) anthropicModelList {
+	start, end := 0, len(entries)
+	hasMore := false
+	switch {
+	case query.afterID != "":
+		index := anthropicModelIndex(entries, query.afterID)
+		if index < 0 {
+			return newAnthropicModelPage(nil, false)
+		}
+		start = index + 1
+		end = min(start+query.limit, len(entries))
+		hasMore = end < len(entries)
+	case query.beforeID != "":
+		index := anthropicModelIndex(entries, query.beforeID)
+		if index < 0 {
+			return newAnthropicModelPage(nil, false)
+		}
+		end = index
+		start = max(0, end-query.limit)
+		hasMore = start > 0
+	default:
+		end = min(query.limit, len(entries))
+		hasMore = end < len(entries)
+	}
+	return newAnthropicModelPage(entries[start:end], hasMore)
+}
+
+func anthropicModelIndex(entries []anthropicModelEntry, id string) int {
+	for i, entry := range entries {
+		if entry.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func newAnthropicModelPage(entries []anthropicModelEntry, hasMore bool) anthropicModelList {
+	data := make([]anthropicModelEntry, len(entries))
+	copy(data, entries)
+	list := anthropicModelList{Data: data, HasMore: hasMore}
+	if len(data) > 0 {
+		firstID, lastID := data[0].ID, data[len(data)-1].ID
+		list.FirstID = &firstID
+		list.LastID = &lastID
 	}
 	return list
 }
@@ -460,11 +787,11 @@ func (h *Handler) tokenMatches(token string) bool {
 }
 
 // authorized reports whether the request carries the configured service token:
-// OpenAI entrypoints use Authorization: Bearer only; Anthropic entrypoints accept
-// x-api-key first and fall back to Authorization: Bearer (§17.2). Comparisons are
-// constant-time to avoid timing side channels.
+// Anthropic entrypoints and both models entrypoints accept x-api-key first and
+// fall back to Authorization: Bearer (§17.2, §22.3); other OpenAI entrypoints
+// use Bearer only. Comparisons are constant-time to avoid timing side channels.
 func (h *Handler) authorized(proto protocol, r *http.Request) bool {
-	if proto == protocolAnthropic && h.tokenMatches(r.Header.Get("x-api-key")) {
+	if (proto == protocolAnthropic || isModelsPath(r.URL.Path)) && h.tokenMatches(r.Header.Get("x-api-key")) {
 		return true
 	}
 	token, ok := bearerToken(r.Header.Get("Authorization"))
@@ -517,6 +844,11 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 	now := h.now()
 
 	attempted := false
+	// last is the candidate that failed before any response was written. Its
+	// model information goes into the final log line so that a failed routed
+	// call still shows which instance/model was tried (§23 only drops the
+	// segment for traffic that never reached a route).
+	var last *candidate
 	for _, cand := range chain {
 		if cand.inst.isDegraded(now) {
 			continue
@@ -532,6 +864,7 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 			return
 		}
 		log.Printf("%s %s candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.name, err)
+		last = cand
 	}
 
 	if !attempted && len(chain) > 0 {
@@ -547,8 +880,17 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 			return
 		}
 		log.Printf("%s %s forced candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.name, err)
+		last = cand
 	}
 
+	if last != nil {
+		logRequest(r, attemptMetrics{
+			instName: last.inst.name,
+			model:    last.model,
+			reqModel: reqModel,
+			hasModel: true,
+		}, time.Since(start))
+	}
 	log.Printf("%s %s -> (%s) total=%ss status=502 all candidates failed",
 		r.Method, r.URL.Path, proto, formatSeconds(time.Since(start)))
 	writeProtocolError(w, proto, http.StatusBadGateway, "upstream request failed")
@@ -779,9 +1121,12 @@ func rewriteModel(body []byte, model string) []byte {
 // attemptMetrics carries per-attempt measurements for logging (§17.6) and the
 // generation-speed judgement (§17.4).
 type attemptMetrics struct {
-	instName    string
-	reqModel    string
-	model       string
+	instName string
+	reqModel string
+	model    string
+	// hasModel records that some candidate supplied a model name, i.e. the
+	// request actually reached a route. It stays false for non-AI calls.
+	hasModel    bool
 	inTokens    int
 	hasIn       bool
 	outTokens   int
@@ -899,9 +1244,20 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
-// logRequest emits the §18.3 one-line request log. The gen segment is omitted
-// entirely unless the throughput sample passed the §17.4 threshold.
+// logRequest emits the §18.3 one-line request log in one of §23's three shapes:
+// non-AI traffic carries neither segment, a routed call without usage keeps the
+// model segment only, and a call with usage gets the full line. The gen segment
+// appears only in the full shape, and only when the §17.4 sample passed.
 func logRequest(r *http.Request, m attemptMetrics, total time.Duration) {
+	// D1: a call that never reached a route (favicon, rejected credentials,
+	// unknown path) prints neither "-> name/model (req_model)" nor "↑in ↓out".
+	if !m.hasModel {
+		log.Printf("%s %s in %ss from %s %s",
+			r.Method, r.URL.Path,
+			formatSeconds(total),
+			clientIP(r), clientID(r))
+		return
+	}
 	name, model, reqModel := m.instName, m.model, m.reqModel
 	if name == "" {
 		name = "n/a"
@@ -912,6 +1268,17 @@ func logRequest(r *http.Request, m attemptMetrics, total time.Duration) {
 	if reqModel == "" {
 		reqModel = "n/a"
 	}
+	// D2: a routed call that produced no usage omits the "↑<in> ↓<out>" segment
+	// instead of printing "↑n/a ↓n/a".
+	if !m.hasIn && !m.hasOut {
+		log.Printf("%s %s -> %s/%s (%s) in %ss from %s %s",
+			r.Method, r.URL.Path, name, model, reqModel,
+			formatSeconds(total),
+			clientIP(r), clientID(r))
+		return
+	}
+	// D3: full format. A response with only one side of the usage pair still
+	// prints the segment, with "n/a" for the missing side (R1).
 	gen := ""
 	if m.hasTPS {
 		gen = formatTPS(m.genTPS) + "t/s "
@@ -932,12 +1299,13 @@ func logRequest(r *http.Request, m attemptMetrics, total time.Duration) {
 func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto protocol, cand *candidate, body []byte) (committed bool, m attemptMetrics, err error) {
 	m.instName = cand.inst.name
 	m.model = cand.model
+	m.hasModel = true
 	attemptBody := body
 	if cand.rewrite {
 		attemptBody = rewriteModel(body, cand.model)
 	}
 
-	target, err := url.JoinPath(cand.inst.baseURL.String(), r.URL.Path)
+	target, err := url.JoinPath(cand.inst.baseURL.String(), upstreamPath(r.URL.Path))
 	if err != nil {
 		h.recordFailure(cand.inst)
 		return false, m, fmt.Errorf("join upstream URL: %w", err)
@@ -1854,6 +2222,10 @@ type probeTestResponse struct {
 
 type probeModelsResponse struct {
 	Models []string `json:"models"`
+	// Capabilities carries optional metadata declared by the upstream model
+	// list (Anthropic official schema). Models without declared metadata are
+	// omitted; the field itself is omitted when nothing was declared.
+	Capabilities map[string]config.ModelCapability `json:"capabilities,omitempty"`
 }
 
 // anthropicProbeBody is the minimal messages request used to probe Anthropic
@@ -1919,7 +2291,10 @@ func (s *Server) serveProbe(w http.ResponseWriter, r *http.Request, wantModels b
 		writeAdminError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	writeJSONError(w, http.StatusOK, probeModelsResponse{Models: models})
+	writeJSONError(w, http.StatusOK, probeModelsResponse{
+		Models:       models,
+		Capabilities: parseModelCapabilities(body),
+	})
 }
 
 func decodeProbeRequest(r *http.Request) (*probeRequest, error) {
@@ -2053,6 +2428,197 @@ func parseModelIDs(body []byte) ([]string, error) {
 		}
 	}
 	return models, nil
+}
+
+// upstreamModelEntry is one entry of a /v1/models response, kept as raw JSON so
+// every metadata field can be decoded independently: one malformed value must
+// not discard the rest of the entry.
+type upstreamModelEntry map[string]json.RawMessage
+
+// parseModelCapabilities extracts optional capability metadata from a
+// /v1/models response. It understands the Anthropic official schema as well as
+// OpenAI/DeepSeek-style aliases (context_window, max_output_tokens,
+// input_modalities, effort, ...); Anthropic official fields win when both
+// spellings are present. It is best-effort: absent or malformed metadata yields
+// a nil map and never fails the model-name probe.
+func parseModelCapabilities(body []byte) map[string]config.ModelCapability {
+	var payload struct {
+		Data []upstreamModelEntry `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+	capabilities := make(map[string]config.ModelCapability)
+	for _, item := range payload.Data {
+		id := strings.TrimSpace(rawString(item["id"]))
+		if id == "" {
+			continue
+		}
+		capability := modelCapabilityFromEntry(item)
+		if capability == (config.ModelCapability{}) {
+			continue
+		}
+		capabilities[id] = capability
+	}
+	if len(capabilities) == 0 {
+		return nil
+	}
+	return capabilities
+}
+
+func modelCapabilityFromEntry(item upstreamModelEntry) config.ModelCapability {
+	limit := rawObject(item["limit"])
+	topProvider := rawObject(item["top_provider"])
+	return config.ModelCapability{
+		MaxInputTokens: firstPositiveInt(
+			item["max_input_tokens"],
+			item["context_window"],
+			item["context_length"],
+			item["contextWindow"],
+			limit["context"],
+		),
+		MaxTokens: firstPositiveInt(
+			item["max_tokens"],
+			item["max_output_tokens"],
+			item["maxTokens"],
+			item["maxOutputTokens"],
+			item["max_completion_tokens"],
+			topProvider["max_completion_tokens"],
+			limit["output"],
+		),
+		ImageInput: officialOrInferredBool(
+			upstreamCapabilitySupported(item, "image_input"),
+			inputModalitySupported(item, "image"),
+		),
+		PDFInput: officialOrInferredBool(
+			upstreamCapabilitySupported(item, "pdf_input"),
+			inputModalitySupported(item, "pdf"),
+		),
+		Thinking: officialOrInferredBool(
+			upstreamCapabilitySupported(item, "thinking"),
+			thinkingIndicator(item),
+		),
+		StructuredOutputs: upstreamCapabilitySupported(item, "structured_outputs"),
+	}
+}
+
+// upstreamCapabilitySupported reads the Anthropic official
+// capabilities.<name>.supported flag.
+func upstreamCapabilitySupported(item upstreamModelEntry, name string) *bool {
+	capabilities := rawObject(item["capabilities"])
+	flag := rawObject(capabilities[name])
+	return rawBool(flag["supported"])
+}
+
+// officialOrInferredBool gives the Anthropic official flag priority over the
+// OpenAI-style inference when both spellings are declared.
+func officialOrInferredBool(official, inferred *bool) *bool {
+	if official != nil {
+		return official
+	}
+	return inferred
+}
+
+// inputModalitySupported reports whether input_modalities declares modality.
+// A present array is an explicit declaration: a missing modality yields false
+// rather than "undeclared".
+func inputModalitySupported(item upstreamModelEntry, modality string) *bool {
+	raw, ok := item["input_modalities"]
+	if !ok || isJSONNull(raw) {
+		return nil
+	}
+	var modalities []string
+	if err := json.Unmarshal(raw, &modalities); err != nil {
+		return nil
+	}
+	supported := slices.Contains(modalities, modality)
+	return &supported
+}
+
+// thinkingIndicator treats a declared effort (object or non-empty string) or a
+// present reasoning field as evidence that the model supports thinking.
+func thinkingIndicator(item upstreamModelEntry) *bool {
+	if raw, ok := item["effort"]; ok && effortDeclared(raw) {
+		return declaredTrue()
+	}
+	if _, ok := item["reasoning"]; ok {
+		return declaredTrue()
+	}
+	return nil
+}
+
+func effortDeclared(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || isJSONNull(trimmed) {
+		return false
+	}
+	switch trimmed[0] {
+	case '{':
+		return true
+	case '"':
+		var level string
+		return json.Unmarshal(trimmed, &level) == nil && level != ""
+	default:
+		return false
+	}
+}
+
+func declaredTrue() *bool {
+	value := true
+	return &value
+}
+
+func firstPositiveInt(values ...json.RawMessage) int {
+	for _, raw := range values {
+		if value := positiveInt(raw); value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+// positiveInt accepts only a JSON integer literal above zero; 0, negatives,
+// floats, exponents, strings and other types count as undeclared.
+func positiveInt(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
+}
+
+func rawString(raw json.RawMessage) string {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	return value
+}
+
+func rawObject(raw json.RawMessage) map[string]json.RawMessage {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return nil
+	}
+	return object
+}
+
+func rawBool(raw json.RawMessage) *bool {
+	if isJSONNull(raw) {
+		return nil
+	}
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil
+	}
+	return &value
+}
+
+func isJSONNull(raw json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
 type adminMessage struct {

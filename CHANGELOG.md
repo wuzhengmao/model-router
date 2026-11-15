@@ -2,6 +2,29 @@
 
 本文件记录项目的重要变更，遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的结构与语义化版本号规则。
 
+## [Unreleased]
+
+## [0.1.1] - 2026-11-15
+
+### Added
+
+- M6 Anthropic 入口 `/v1/models` 对齐官方 schema：`id` 改为官方模型名（`claude-sonnet-5` / `claude-opus-5` / `claude-fable-5` / `claude-haiku-4-5`），新增 `line` / `lifecycle` / `max_input_tokens` / `max_tokens` / `capabilities` / `deprecated_at` / `retires_at` 字段。
+- M6 查询参数与分页：`limit`（1–1000，默认 20）、`before_id` / `after_id` 游标、`lifecycle` 过滤（可重复/逗号分隔）；空页 `first_id` / `last_id` 为 `null`，非法参数返回 400 `invalid_request_error`。
+- 新增实例配置 `role_names`（角色 → 对外模型 id）与 `model_capabilities`（上游模型名 → 窗口/输出上限/`image_input`/`pdf_input`/`thinking`/`structured_outputs`），多个实例声明时取配置顺序首个；`model_capabilities` 不影响路由与转发。
+- Web 配置页支持编辑 `role_names`（每个角色行旁填写对外模型名，留空使用内置官方名）与 `model_capabilities`（按上游模型名的横向紧凑能力网格）；新增/删除/切换实例与保存回读均保留两项配置。
+- `/api/probe/models` 在保留 `models` 数组的同时新增可选 `capabilities` 映射（形状同 `model_capabilities`）；配置页「查询模型」自动把上游声明的能力填入缺失字段，不覆盖用户已填值。
+- `/api/probe/models` 能力解析兼容 OpenAI/DeepSeek 风格字段名：支持 `context_window` / `context_length` / `contextWindow` / `limit.context`、`max_output_tokens` / `maxTokens` / `maxOutputTokens` / `max_completion_tokens` / `top_provider.max_completion_tokens` / `limit.output`、`input_modalities` 与 `effort` / `reasoning`；Anthropic 官方字段与别名并存时官方字段优先，`input_modalities` 不含某模态时输出显式 `false`。
+- M7 协议路径分离：新增 `POST /anthropic/v1/messages`（与 `/v1/messages` 同一 handler，认证/路由/回退/日志一致）与 `GET /anthropic/v1/models`（固定 Anthropic 格式）；`GET /v1/models` 固定 OpenAI 格式，不再按认证头猜测协议。两个模型列表入口均接受 `x-api-key` 或 Bearer。
+- M7 OpenAI 入口能力字段：`/v1/models` 在基础四字段上按 `model_capabilities` 追加 `context_window` / `max_input_tokens`、`max_output_tokens` / `max_tokens`、`input_modalities`（恒含 `text`，按 `image_input`/`pdf_input` 追加）。同名模型去重后取第一个声明能力的实例；未声明能力的模型保持基础四字段。
+- M7 配置页 OpenAI 实例新增「模型能力」紧凑表格（复用 Anthropic 侧组件），可编辑窗口/输出上限/四项能力；「查询模型」自动回填缺失字段。
+
+### Changed
+
+- 请求日志三档格式（§23）：从未路由到模型的请求（`GET /favicon.ico`、401 拒绝、未知路径）既不打印模型段也不打印 token 段；已路由但未拿到任何 usage 的请求保留 `-> <实例>/<上游模型> (<请求模型>)` 段、省略整段 `↑<in> ↓<out>`；有 usage 的请求维持完整格式（缺失项仍为 `n/a`，生成速率段规则不变）。上游候选全部失败时，`status=502 all candidates failed` 汇总行之前额外输出一行带最后候选实例名/上游模型名的无 token 段日志。
+- 对外契约变更：Anthropic `/v1/models` 不再返回角色名；请求侧 `sonnet` / `claude-sonnet-5` 等仍按既有 R4c 角色规则路由到同一上游模型。OpenAI `/v1/models` 的基础四字段形状不变（M7 起可追加能力字段，并忽略 Anthropic 专用查询参数）。
+- **破坏性变更（M7）**：`/v1/models` 不再按认证头返回 Anthropic 格式；依赖 Anthropic 模型列表的客户端需把 baseURL 指向 `.../anthropic`（即请求 `/anthropic/v1/models`）。`/v1/messages` 保留。
+- `config.example.json` 补充 `role_names` / `model_capabilities` 示例；`docs/design.md`、`docs/tests.md`、`README.md` 同步 M6/M7 路径矩阵与字段表。
+
 ## [0.1.0] - 2026-11-15
 
 ### Added

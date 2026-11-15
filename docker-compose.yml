@@ -1,7 +1,7 @@
 services:
   model-router:
     build: .
-    image: wuzm219/model-router:0.1.0
+    image: wuzm219/model-router:0.1.1
     ports:
       - "18080:18080"
     environment:

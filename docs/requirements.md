@@ -848,7 +848,7 @@ M4 验收后，用户要求两点配置结构修正：
 
 ### 14.4 docker-compose.yml
 
-- 服务 `model-router`：`build: .` 或 `image: wuzm219/model-router:0.1.0`；`ports: ["18080:18080"]`；`volumes: ["./.docker:/home/nonroot/config:rw"]`；`environment` 可放 `MODEL_ROUTER_LISTEN=0.0.0.0:18080` 等。
+- 服务 `model-router`：`build: .` 或 `image: wuzm219/model-router:0.1.1`；`ports: ["18080:18080"]`；`volumes: ["./.docker:/home/nonroot/config:rw"]`；`environment` 可放 `MODEL_ROUTER_LISTEN=0.0.0.0:18080` 等。
 - `restart: unless-stopped`。
 - 作为部署示例，不强制要求生产配置。
 
@@ -1307,3 +1307,236 @@ POST /v1/messages -> req_model="opus[1m]" model="mti-flash" (anthropic) client=c
 - 真实 DeepSeek Anthropic 入口（会压缩）实测 in/out 正确。
 - 客户端仍能收到完整、可解析的响应体。
 - `go build`/`go vet`/`go test`（含 `-race`）退出码 0。
+
+## 21. M6：`/v1/models` 对齐 Anthropic 官方 schema（模型名 + 能力元数据）
+
+### 21.1 背景
+
+上游 DSH（DeepSeek Harness）判断"某模型能否收图片"只读它自己的模型定义：`entry.input ?? 内置 catalog（按 provider 键 + 模型 id 命中）?.input ?? route.defaultInput（默认 ["text"]）`，**不会**调用任何接口，也不会读取 `/v1/models` 返回的能力字段（实测：其 `readListing` 只解析 `id`/`name`/`contextWindow`/`maxTokens`，`input_modalities` 被丢弃）。
+
+要让 DSH 免手工配置即可获得图片能力，唯一可行的路径是：**代理对外暴露的模型 id 命中 DSH 内置 catalog 的官方名**（如 `claude-sonnet-5`）。此时 DSH 按 provider 键 `anthropic` + 官方 id 命中内置目录，能力/窗口/输出上限全部继承，配置里一行 `input` 都不用写。
+
+当前代理 Anthropic 入口 `/v1/models` 返回的是角色名 `sonnet/opus/fable/haiku`，与官方名不一致，导致 DSH 侧必须手写模型名与能力声明——脆弱（用户点「获取可用模型」会把角色名采纳回来，能力随即丢失）。
+
+### 21.2 目标
+
+1. Anthropic 入口 `/v1/models` 的模型 id 改为**官方模型名**，与 DSH 内置 catalog 对齐；角色名 `sonnet` 等**继续可用**于请求路由。
+2. 按 Anthropic 官方 schema 补齐返回字段与查询参数。
+3. 能力/容量元数据（`capabilities`、`max_input_tokens`、`max_tokens`）做成**配置项**：来自上游声明（配置时采纳）或手动填写；多个实例声明同一角色时取**首个**声明。
+
+### 21.3 官方 schema（依据 platform.claude.com/docs/en/api/models/list）
+
+查询参数：
+
+| 参数 | 语义 | 约束 |
+|---|---|---|
+| `limit` | 每页条数 | 1–1000，默认 20 |
+| `before_id` | 游标：返回该 id 之前的一页 | 未知 id → 返回空页（不报错） |
+| `after_id` | 游标：返回该 id 之后的一页 | 同上 |
+| `lifecycle` | 过滤生命周期，可重复/逗号分隔 | 仅 `active`/`deprecated`/`retired`，最多 3 个；缺省 = active+deprecated |
+
+返回字段（每个模型）：
+
+| 字段 | 类型 | 要求 |
+|---|---|---|
+| `type` | `"model"` | 恒定 |
+| `id` | string | 官方模型名 |
+| `display_name` | string | 人类可读名 |
+| `created_at` | RFC3339 | 模型发布时间；缺失时回退当前时间 |
+| `max_input_tokens` | number \| null | 输入窗口；未声明输出 `null` |
+| `max_tokens` | number \| null | 输出上限；未声明输出 `null` |
+| `lifecycle` | enum | 恒为 `active`（本代理不维护退役模型） |
+| `deprecated_at` | string \| null | 恒为 `null` |
+| `retires_at` | string \| null | 恒为 `null` |
+| `line` | enum \| null | 角色名：`sonnet`/`opus`/`fable`/`haiku` |
+| `capabilities` | object \| null | 见 21.5；全部未声明时输出 `null` |
+
+列表级：`data`、`first_id`、`last_id`、`has_more`。`first_id`/`last_id` 为本页首/末模型的 id，空页时为 `null`。
+
+### 21.4 模型名映射（`role_names`）
+
+内置默认表（角色 → id / display_name / created_at）：
+
+| 角色 | id | display_name | created_at |
+|---|---|---|---|
+| sonnet | `claude-sonnet-5` | Claude Sonnet 5 | `2026-01-01T00:00:00Z` |
+| opus | `claude-opus-5` | Claude Opus 5 | `2026-01-01T00:00:00Z` |
+| fable | `claude-fable-5` | Claude Fable 5 | `2026-01-01T00:00:00Z` |
+| haiku | `claude-haiku-4-5` | Claude Haiku 4.5 | `2025-10-01T00:00:00Z` |
+
+- 实例可选配置 `role_names: { "<角色>": "<对外 id>" }` 覆盖内置默认值（例如以后 `claude-sonnet-6` 发布，只改配置）。
+- `role_names` 的键必须是合法角色（`sonnet`/`opus`/`fable`/`haiku`），值为非空字符串；非法键或空值 → 配置校验失败。
+- `display_name` 与 `created_at` 跟随内置表；自定义 `role_names` 未在内置表中的，`display_name` 回退为 id，`created_at` 回退当前时间。
+- 请求路由**不变**：`sonnet` 精确角色名、`claude-sonnet-5` 前缀名都映射到 `roles["sonnet"]`（既有 R4c 规则已覆盖）。
+
+### 21.5 能力元数据（`model_capabilities`）
+
+实例可选配置，键为**上游模型名**（`roles` 的值，或 OpenAI 的 `models` 项）：
+
+```json
+"model_capabilities": {
+  "mti-pro":   { "max_input_tokens": 1000000, "max_tokens": 128000,
+                 "image_input": true, "pdf_input": false, "thinking": true,
+                 "structured_outputs": true },
+  "mti-flash": { "image_input": true }
+}
+```
+
+字段（全部可选，未声明即不输出）：
+
+| 配置字段 | 输出位置 | 说明 |
+|---|---|---|
+| `max_input_tokens` | `max_input_tokens` | 正整数；`0`/缺省 → `null` |
+| `max_tokens` | `max_tokens` | 正整数；`0`/缺省 → `null` |
+| `image_input` | `capabilities.image_input.supported` | 布尔 |
+| `pdf_input` | `capabilities.pdf_input.supported` | 布尔 |
+| `thinking` | `capabilities.thinking.supported` | 布尔；不输出 `types` 子对象 |
+| `structured_outputs` | `capabilities.structured_outputs.supported` | 布尔 |
+
+取值规则（用户拍板）：
+
+1. 按 Anthropic 实例的**配置顺序**遍历；某角色映射到的上游模型（`roles[<角色>]`）在**首个**声明了该模型的 `model_capabilities` 里取值。
+2. 若首个实例未声明该模型，继续看下一个实例；全部未声明 → 视为"未知"，输出 `null`（不谎报能力）。
+3. OpenAI 入口的 `/v1/models` 不受影响（仍返回 `models` 值，不新增字段）。
+
+### 21.6 配置页（Web UI）
+
+1. Anthropic 实例卡片内，角色映射行旁显示 **对外模型名**（默认官方名），可编辑（写 `role_names`）。
+2. 每实例新增 **模型能力** 区块：按上游模型名列出行，字段为窗口、输出上限、四个能力勾选；空值表示未声明。
+3. 「查询上游模型」结果若含 `max_input_tokens`/`max_tokens`/`capabilities`（Anthropic 官方格式），**自动填入**对应行，用户可改；上游未提供或手动输入的模型，行内留空供手填。
+4. UI 风格保持紧凑，不新增过高卡片。
+
+### 21.7 兼容性
+
+- 请求侧完全向后兼容：`sonnet`/`opus`/`fable`/`haiku` 仍直接可用（Claude Code 的 `ANTHROPIC_DEFAULT_*_MODEL=sonnet` 不受影响）。
+- `/v1/models` 的 `id` 变更属于对外契约变更：`docs/design.md`、`docs/tests.md`、`README.md` 与 Web 配置页说明需同步；旧行为（返回角色名）不再保留。
+- OpenAI 入口 `/v1/models` 行为不变。
+
+### 21.8 边界
+
+- `limit` 非数字、`0`、负数、`>1000` → 400 `invalid_request_error`。
+- `lifecycle` 含非法值（如 `foo`）→ 400 `invalid_request_error`；`deprecated`/`retired` 合法但无数据 → 空 `data`。
+- `before_id` 与 `after_id` 同时出现 → 400 `invalid_request_error`。
+- 未知 `before_id`/`after_id` → 空 `data`、`has_more=false`、`first_id`/`last_id` 为 `null`。
+- `/v1/models` 仍是本地应答，**不访问上游**（保持 FR-2 已取消的约定）。
+- 能力配置不影响路由、回退、日志。
+
+### 21.9 验收标准
+
+- `curl -H "x-api-key: <token>" -H "anthropic-version: 2023-06-01" /v1/models` 返回 4 个模型，`id` 为官方名，含 `line`/`lifecycle`/`max_input_tokens`/`max_tokens`/`capabilities`/`deprecated_at`/`retires_at`。
+- 配置了 `model_capabilities` 后，对应字段出现在响应里；未配置时 `max_input_tokens`/`max_tokens` 为 `null`、`capabilities` 为 `null`。
+- `?limit=2` 返回 2 条且 `has_more=true`；`?after_id=<首条>` 返回剩余；`?lifecycle=retired` 返回空。
+- 发 `model=claude-sonnet-5` 与 `model=sonnet` 的 `/v1/messages` 请求，日志中 `req_model` 不同但转发目标一致（映射到同一 `roles` 值）。
+- 非法 `limit`/`lifecycle`/双游标 → 400，错误体为 Anthropic 格式。
+- DSH 选 `claude-sonnet-5` 发图：不再提示"当前模型不知道图片"，代理日志 `↑` 输入 token 明显增大。
+- `go build`/`go vet`/`go test`（含 `-race`）退出码 0。
+
+## 22. M7：协议路径分离 + OpenAI 入口模型能力
+
+### 22.1 背景
+
+当前 `/v1/models` 靠认证头猜协议（带 `x-api-key` 且无 `Authorization` → Anthropic 格式，否则 OpenAI 格式），两种协议的模型列表挤在同一路径上，语义混乱；且 OpenAI 入口的模型条目只有 `id`/`object`/`created`/`owned_by`，不携带任何能力元数据，即使实例配了 `model_capabilities` 也体现不出来。
+
+### 22.2 目标
+
+1. 协议路径分离：Anthropic 的模型列表走 `/anthropic/v1/models`，`/v1/models` 固定为 OpenAI 格式，不再按认证头猜测。
+2. Anthropic 的 messages 入口同时支持 `/anthropic/v1/messages` 与既有的 `/v1/messages`（向前兼容）。
+3. OpenAI 实例支持 `model_capabilities` 配置与编辑，OpenAI 入口 `/v1/models` 返回能力字段；模型 id 重叠时取**第一个实例**的能力。
+
+### 22.3 路径矩阵
+
+| 路径 | 协议 | 说明 |
+|---|---|---|
+| `/v1/chat/completions` | OpenAI | 不变 |
+| `/v1/models` | OpenAI | **改为固定 OpenAI 格式**（不再按认证头判断） |
+| `/v1/messages` | Anthropic | 保留（向前兼容） |
+| `/anthropic/v1/messages` | Anthropic | 新增，与 `/v1/messages` 行为完全一致 |
+| `/anthropic/v1/models` | Anthropic | 新增，固定 Anthropic 格式 |
+| 其他 | — | 404，错误体格式沿用该路径所属协议（未知路径仍按 OpenAI 格式） |
+
+- 两条 messages 路径的认证、路由、回退、日志行为必须完全一致（同一套 handler）。
+- `/anthropic/v1/models` 的查询参数语义（`limit`/`before_id`/`after_id`/`lifecycle`）与 §21.3 相同。
+- 认证：两条路径都先取 `x-api-key` 匹配 `auth_token`，否则回退 `Authorization: Bearer`（沿用 §17.2 双认证）。
+
+### 22.4 OpenAI 入口 `/v1/models` 的能力字段
+
+在既有 `id`/`object`/`created`/`owned_by` 基础上，为每个模型追加（同时输出两套，值相同）：
+
+| 字段 | 来源 | 未声明时 |
+|---|---|---|
+| `context_window` | `model_capabilities[<模型>].max_input_tokens` | 省略该字段 |
+| `max_input_tokens` | 同上 | 省略 |
+| `max_output_tokens` | `model_capabilities[<模型>].max_tokens` | 省略 |
+| `max_tokens` | 同上 | 省略 |
+| `input_modalities` | 由 `image_input`/`pdf_input` 推导：`image_input=true` → 含 `"image"`；`pdf_input=true` → 含 `"pdf"`；`text` 恒含 | 三个布尔都未声明时省略；部分声明时按实际输出 |
+
+- `input_modalities` 的构造规则：始终含 `"text"`；`image_input=true` 时追加 `"image"`；`pdf_input=true` 时追加 `"pdf"`。布尔为 `false` 或未声明时不追加。
+- 模型 id 重叠（多个 openai 实例声明同名模型）：去重后每个 id 只出现一次，能力取自**第一个声明该模型的实例**（按配置顺序）；该实例未声明能力而后续实例声明时，继续向后找（与 §21.5 的"首个声明"规则一致）。
+- 未声明任何能力的模型：只输出基础四字段，不输出上表五个字段（保持与标准 OpenAI 响应兼容）。
+
+### 22.5 OpenAI 实例的能力配置与 UI
+
+- OpenAI 实例的 `model_capabilities` 键为 `models` 数组中的模型名；配置校验、字段、取值规则与 §21.5 相同。
+- 配置页 OpenAI 实例的「模型列表」区块下方新增**模型能力**表格（与 Anthropic 实例同一套组件与紧凑样式）：按已选模型逐行列出窗口、输出上限、四个能力勾选。
+- 勾选/输入留空即不写该字段；整行空不留 `model_capabilities` 条目。
+- 「查询上游模型」解析出的能力（DeepSeek 风格 `context_window`/`max_output_tokens`/`input_modalities` 与 Anthropic 官方风格均支持）自动填入对应行，用户可改。
+
+### 22.6 兼容性
+
+- **破坏性变更**：`/v1/models` 不再按认证头返回 Anthropic 格式。使用 Anthropic 协议且依赖模型列表的客户端，必须把 baseURL 指向 `.../anthropic`（其 `/v1/models` 请求会变成 `/anthropic/v1/models`）。
+- `/v1/messages` 保留，旧的 baseURL（无 `/anthropic` 后缀）仍可正常发消息，只是模型列表需改用新路径。
+- OpenAI 入口 `/v1/models` 的基础四字段形状不变，新增字段为可选扩展（标准 OpenAI 客户端应忽略未知字段）。
+- `docs/design.md`、`docs/tests.md`、`README.md`、`CHANGELOG.md` 需同步路径矩阵与字段表。
+
+### 22.7 边界
+
+- `/anthropic/v1/models` 与 `/v1/models` 的 `Allow` 头：非 GET → 405，错误体按各自协议格式。
+- 新增路径不得改变 `/v1/chat/completions` 的行为。
+- 路径匹配为精确匹配，不上溯、不重定向；`/anthropic/v1/chat/completions` 不提供服务（404）。
+- 能力配置不参与路由与回退。
+
+### 22.8 验收标准
+
+- [ ] `GET /v1/models`（带 Bearer，或不带任何认证只靠 `?`）返回 OpenAI 格式，模型条目含 `context_window`/`max_output_tokens`/`max_input_tokens`/`max_tokens`/`input_modalities`（配置了能力时）。
+- [ ] 同一请求带 `x-api-key` 而非 Bearer 时，`/v1/models` **仍返回 OpenAI 格式**（不再按头切换）。
+- [ ] `GET /anthropic/v1/models` 返回 Anthropic 格式（`data`/`first_id`/`last_id`/`has_more`，条目含 `type`/`display_name`/`line`/`capabilities` 等），即使请求方带的是 Bearer。
+- [ ] `POST /anthropic/v1/messages` 与 `POST /v1/messages` 对同一请求体返回一致结果，日志行格式一致。
+- [ ] OpenAI 实例配置了 `model_capabilities` 后，`/v1/models` 对应条目出现能力字段；未配置的模型不出现这些字段。
+- [ ] 两个 openai 实例声明同名模型且能力不同：`/v1/models` 中该 id 只出现一次，能力取第一个实例。
+- [ ] `input_modalities` 构造正确：`image_input=true,pdf_input=false` → `["text","image"]`；`image_input=false,pdf_input=true` → `["text","pdf"]`；两者都 false 或未声明 → 省略该字段。
+- [ ] 配置页 OpenAI 实例可编辑模型能力，保存后 `GET /api/config` 与落盘文件均含 `model_capabilities`。
+- [ ] `go build`/`go vet`/`go test`（含 `-race`）退出码 0。
+
+## 23. M8：非 AI 请求不输出 token 统计
+
+### 23.1 背景
+
+浏览器或健康检查发来的非 AI 请求（如 `GET /favicon.ico`）经过代理时，日志会打印 `-> n/a/n/a (n/a) in 0.000s ↑n/a ↓n/a from 172.18.0.1 Mozilla/5.0`——既噪声大又误导（看起来像一次失败的上游调用）。用户要求："非 ai的请求，不要显示 in/out token的统计"。
+
+只区分"有没有 usage"并不够：请求可能从未路由到任何模型（favicon、401 拒绝、未知路径），也可能已路由到上游但没拿到任何 usage（上游返回空响应或错误体）。三种状态对应三种日志形态，因此请求日志统一定义为三档。
+
+### 23.2 要求
+
+判定依据是"本次请求是否曾路由到某个模型"，即 `attemptMetrics.hasModel` 是否为 true。
+
+| 编号 | 条件 | 日志形态 |
+|---|---|---|
+| D1 | `!hasModel`（从未路由到任何模型：favicon、401 拒绝、未知路径） | `GET /favicon.ico in 0.000s from 172.18.0.1 Mozilla/5.0`——既无 `-> name/model (req_model)` 段，也无 `↑in ↓out` 段 |
+| D2 | `hasModel` 但本次没有拿到任何 usage（`!hasIn && !hasOut`） | `POST /v1/messages -> MTI/mti-pro (sonnet) in 0.002s from 127.0.0.1 Go-http-client/1.1`——保留模型段，省略 `↑↓` 段 |
+| D3 | `hasModel` 且有 usage | `POST /anthropic/v1/messages -> MTI/mti-flash (claude-sonnet-5) in 6.325s ↑870 ↓1185 229t/s from 172.18.0.1 deepseek-harness/0.2.2-rc.1`——完整格式，含可选的 `<n>t/s ` 段 |
+
+补充规则：
+
+- R1：D3 中只有 in 或只有 out 拿到时，仍打印 `↑<in> ↓<out>` 段，缺的那项照旧显示 `n/a`。
+- R2：`<n>t/s ` 生成速率段的现有触发条件（`hasTPS`）与位置不变，仅 D3 出现。
+- R3：上游候选全部失败（走 `status=502 all candidates failed` 汇总行）时，若至少尝试过一个候选，必须在该汇总行**之前**额外输出一行符合 D2 的请求日志，带上最后尝试那个候选的实例名与上游模型名（`reqModel` 用客户端请求里的模型名）。失败路径上这些值由 `serveChain` 按候选补记，不依赖 `tryCandidate` 的具名返回值 `m` 带回（它常以 `return false, m, err` 整体覆盖已有赋值而不保留 `m.instName` / `m.model`）。
+
+### 23.3 验收标准
+
+- [ ] `GET /favicon.ico` 走 D1：日志行含 `GET /favicon.ico in ` 与 ` from 127.0.0.1 Mozilla/5.0`，且不含 ` -> `、`↑`、`↓`、`n/a`。
+- [ ] 401 拒绝请求走 D1：日志行含 `POST /v1/chat/completions in ` 与 ` from 203.0.113.9 claude-code/2.1.323`，且不含 ` -> `、`↑`、`↓`、`n/a`，仍不得泄漏凭据。
+- [ ] 已路由但无 usage 的请求走 D2：`/v1/messages` 与 `/anthropic/v1/messages` 的日志行含 ` -> MTI/mti-pro (sonnet) in ` 与 ` from `，且不含 `↑`、`↓`。
+- [ ] 正常 AI 请求走 D3：格式与顺序不变（`-> ` → `/model (req_model)` → ` in ` → `↑31` → `↓300` → `from `）。
+- [ ] 只有输入或只有输出的场景仍打印该段，缺失项为 `n/a`（R1）。
+- [ ] 上游候选全部失败时，`status=502 all candidates failed` 汇总行之前存在一行带最后候选实例名/上游模型名的 D2 日志（R3）。
+- [ ] `go build`/`go vet`/`go test`（含 `-race`）退出码 0。

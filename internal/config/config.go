@@ -44,14 +44,20 @@ const (
 	RoleWildcard = "*"
 )
 
-// IsValidRole reports whether role is one of the supported role values.
+// IsConcreteRole reports whether role is one of the concrete model roles.
 // Callers must pass a normalized (trimmed, lowercased) value.
-func IsValidRole(role string) bool {
+func IsConcreteRole(role string) bool {
 	switch role {
-	case RoleSonnet, RoleOpus, RoleFable, RoleHaiku, RoleWildcard:
+	case RoleSonnet, RoleOpus, RoleFable, RoleHaiku:
 		return true
 	}
 	return false
+}
+
+// IsValidRole reports whether role is one of the supported role values.
+// Callers must pass a normalized (trimmed, lowercased) value.
+func IsValidRole(role string) bool {
+	return IsConcreteRole(role) || role == RoleWildcard
 }
 
 // Environment variables that override top-level scalar settings. They are
@@ -303,6 +309,17 @@ type Config struct {
 	Instances Instances `json:"instances"`
 }
 
+// ModelCapability declares optional metadata for an upstream model (§21.5).
+// Unset fields are not exposed by /v1/models.
+type ModelCapability struct {
+	MaxInputTokens    int   `json:"max_input_tokens,omitempty"`
+	MaxTokens         int   `json:"max_tokens,omitempty"`
+	ImageInput        *bool `json:"image_input,omitempty"`
+	PDFInput          *bool `json:"pdf_input,omitempty"`
+	Thinking          *bool `json:"thinking,omitempty"`
+	StructuredOutputs *bool `json:"structured_outputs,omitempty"`
+}
+
 // Instance is one provider instance carrying a set of model mappings.
 // OpenAI instances declare Models; Anthropic instances declare Roles.
 type Instance struct {
@@ -317,8 +334,12 @@ type Instance struct {
 	// in routing, matching or fallback.
 	Name    string            `json:"name,omitempty"`
 	Timeout Duration          `json:"timeout"`
-	Models   []string          `json:"models,omitempty"`
-	Roles    map[string]string `json:"roles,omitempty"`
+	Models  []string          `json:"models,omitempty"`
+	Roles   map[string]string `json:"roles,omitempty"`
+	// RoleNames optionally overrides the public /v1/models id per role (§21.4).
+	RoleNames map[string]string `json:"role_names,omitempty"`
+	// ModelCapabilities declares metadata keyed by upstream model name (§21.5).
+	ModelCapabilities map[string]ModelCapability `json:"model_capabilities,omitempty"`
 }
 
 // Instances is the flat runtime representation of the grouped JSON
@@ -579,6 +600,44 @@ func (in *Instance) applyDefaults() error {
 		in.Roles = nil
 	} else {
 		in.Roles = roles
+	}
+
+	roleNames := make(map[string]string, len(in.RoleNames))
+	for rawRole, rawName := range in.RoleNames {
+		role := strings.ToLower(strings.TrimSpace(rawRole))
+		if !IsConcreteRole(role) {
+			return fmt.Errorf("role_names: invalid role %q: must be one of sonnet, opus, fable, haiku", rawRole)
+		}
+		name := strings.TrimSpace(rawName)
+		if name == "" {
+			return fmt.Errorf("role_names[%q] must be a non-empty model id", role)
+		}
+		roleNames[role] = name
+	}
+	if len(roleNames) == 0 {
+		in.RoleNames = nil
+	} else {
+		in.RoleNames = roleNames
+	}
+
+	capabilities := make(map[string]ModelCapability, len(in.ModelCapabilities))
+	for rawModel, capability := range in.ModelCapabilities {
+		model := strings.TrimSpace(rawModel)
+		if model == "" {
+			return errors.New("model_capabilities: model name must be non-empty")
+		}
+		if capability.MaxInputTokens < 0 {
+			return fmt.Errorf("model_capabilities[%q].max_input_tokens must be >= 0, got %d", model, capability.MaxInputTokens)
+		}
+		if capability.MaxTokens < 0 {
+			return fmt.Errorf("model_capabilities[%q].max_tokens must be >= 0, got %d", model, capability.MaxTokens)
+		}
+		capabilities[model] = capability
+	}
+	if len(capabilities) == 0 {
+		in.ModelCapabilities = nil
+	} else {
+		in.ModelCapabilities = capabilities
 	}
 
 	switch in.Protocol {

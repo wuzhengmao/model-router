@@ -1,4 +1,4 @@
-# model-router 测试用例（M1 ～ M4.4）
+# model-router 测试用例（M1 ～ M6）
 
 > 对应需求：[requirements.md](requirements.md)（FR-4、§7、§8、§9）；设计：[design.md](design.md)。
 
@@ -27,6 +27,8 @@
 | UT-016 | `provider` 校验 | `TestLoadProvider` | 已知 provider、空 provider | 已知/空通过（已知归一化） |
 | UT-017 | fallback 默认/显式/非法 | `TestLoadAppliesDefaults`、`TestFallbackExplicit`、`TestFallbackIdleZero`、`TestFallbackInvalid` | 缺省 3/5m/30/30s；显式值生效；显式 `min_tokens_per_second=0` / `idle_timeout=0s` 保留；阈值/时长/负吞吐/负载空闲超时/未知字段非法 | 默认与显式正确，非法值报错 |
 | UT-018 | 分组实例解析/迁移 | `TestInstancesMarshalGrouped`、`TestLoadRejectsLegacyInstancesArray`、`TestLoadRejectsInstanceProtocolField` | 分组 flat 展开、Marshal 分组且无 protocol；旧数组提示「分组结构」；实例含 `protocol` 报错 | 分组结构正确，迁移报错 |
+| UT-019 | `role_names` 校验与往返 | `TestRoleNamesConfig`、`TestRoleNamesConfigRejectsInvalid` | 键小写/trim、值 trim；marshal 往返；非法角色键、`*`、空值 | 合法归一化并通过；非法报错 |
+| UT-020 | `model_capabilities` 校验与往返 | `TestModelCapabilitiesConfig`、`TestModelCapabilitiesConfigRejectsInvalid`、`TestModelCapabilitiesAllowedOnOpenAIInstance` | 键为上游模型名并 trim；窗口与四布尔解析（含 false）；0 合法；负数/空键报错；openai 实例允许 | 合法通过且往返一致；非法报错 |
 | UT-012 | 示例配置可解析 | `TestExampleConfigIsValid` | `config.example.json`（fallback + 分组） | Parse 成功且实例非空 |
 | UT-013 | 环境变量覆盖 | `TestEnvOverridesConfig` | 四个 `MODEL_ROUTER_*`（含空格）覆盖文件值 | 生效值为 env（trim 后），instances/fallback 不变 |
 | UT-014 | 空 env 沿用文件 | `TestEnvEmptyKeepsFileValues` | 变量显式置空 | 使用文件值 |
@@ -52,13 +54,20 @@
 | UT-114 | 请求体超限 | `TestRequestTooLarge` | 10 MiB + 1 | 413 按协议，不转发 |
 | UT-115 | 上游失败 | `TestUpstreamFailureErrorFormat` | 上游已关闭 | 502 按协议 |
 
-## 4. `/v1/models`（`internal/proxy`）
+## 4. 模型列表入口（`internal/proxy`）
 
 | 编号 | 用例 | 入口 | 覆盖点 | 预期 |
 |---|---|---|---|---|
-| UT-121 | OpenAI 格式 | `TestModelsOpenAI` | 跨 openai 实例 models 顺序/去重；排除 anthropic；`object/owned_by/created` | 列表正确，上游 0 调用 |
-| UT-122 | Anthropic 格式 | `TestModelsAnthropic` | 返回角色名（sonnet/opus/fable/haiku 固定顺序、去重、不含 `*`），不是 roles 映射值；`data/type/display_name/created_at/has_more/first_id/last_id` | id 为角色名，`*` 不出现 |
-| UT-123 | 认证与方法 | `TestModelsAuthAndMethod` | 无/错 Bearer、错 x-api-key、POST | 401 按协议；405 + `Allow: GET` |
+| UT-121 | OpenAI 格式 | `TestModelsOpenAI` | 跨 openai 实例 models 顺序/去重；排除 anthropic；`object/owned_by/created`；Anthropic 专用查询参数被忽略 | 列表正确，上游 0 调用；带非法查询参数仍 200 |
+| UT-122 | Anthropic 官方 schema | `TestModelsAnthropic` | `/anthropic/v1/models`：4 条官方 id（sonnet/opus/fable/haiku 固定顺序、不含 `*`）；`display_name`/`created_at` 内置表；`line`/`lifecycle`；`max_input_tokens`/`max_tokens`/`capabilities`/`deprecated_at`/`retires_at` 未声明为 `null`；`first_id`/`last_id`/`has_more` | id 为官方名，角色名与上游名不出现 |
+| UT-123 | 认证与方法 | `TestModelsAuthAndMethod` | 两入口：无/错 Bearer、错 x-api-key、POST | 401 按路径协议；405 + `Allow: GET`，错误体按路径协议 |
+| UT-124 | 能力元数据 | `TestModelsAnthropicCapabilities` | 首个声明生效、首个实例未声明时继续向后、未声明 `null`、`0`→`null`、布尔 `false` 输出、未声明子项省略 | 字段与取值符合 §21.5 |
+| UT-125 | 模型名映射 | `TestModelsAnthropicRoleNamesFromConfig` | `role_names` 覆盖官方名；自定义 id 的 `display_name`/`created_at` 回退；内置 id 跟随内置表；配置键归一化 | 官方 schema 下 id/display/created 正确 |
+| UT-126 | 分页与 lifecycle | `TestModelsAnthropicPagination` | `limit`、`after_id`、`before_id`、未知/边界游标、`lifecycle` 重复/逗号/过滤、空页 `first_id`/`last_id` | 分页与 `has_more` 正确，空页为 null |
+| UT-127 | 非法查询 | `TestModelsAnthropicInvalidQuery` | `limit` 非数字/0/负数/>1000、非法/空 `lifecycle`、双游标 | 400 `invalid_request_error`（Anthropic 格式） |
+| UT-128 | 路径决定格式（M7） | `TestModelsSchemaIsDecidedByPath` | `/v1/models` 带 Bearer / 带 x-api-key 均为 OpenAI；`/anthropic/v1/models` 带 x-api-key / Bearer 均为 Anthropic；两入口无凭据 401 按路径协议；`/anthropic/v1/chat/completions` → 404 | 认证头不切换格式；仅路径决定 schema |
+| UT-129 | OpenAI 能力字段（M7） | `TestModelsOpenAICapabilities` | 首个声明实例取值；首个实例未声明时向后找；两实例同名去重且取首个；`context_window`/`max_input_tokens` 与 `max_output_tokens`/`max_tokens` 别名相等；`input_modalities` 的 image/pdf/两者/显式 false 组合；未声明模型只有基础四字段 | 字段与省略规则符合 §22.4 |
+| UT-130 | messages 路径别名（M7） | `TestAnthropicMessagesPathAlias` | 同一 body 发 `/v1/messages` 与 `/anthropic/v1/messages`；x-api-key/Bearer 两种认证；上游路径与查询串、模型改写、上游认证头；两条日志行字段格式一致；无凭据 401 | 返回体一致、转发目标一致、日志字段一致 |
 
 ## 5. 管理面（`internal/proxy`）
 
@@ -78,7 +87,7 @@
 - JSON 流程：修改 JSON → 校验（失败时保存禁用）→ 保存 → 重载生效。
 - 配置迁移：`config.local.json` / `config.example.json` 迁移为 `instances` 后路由行为与迁移前一致。
 - 无 `admin_password` 时 `/admin`、`/api/*` 404；Basic Auth 失败 401。
-- `-version` 输出 `0.1.0`，产物位于 `dist/`。
+- `-version` 输出 `0.1.1`，产物位于 `dist/`。
 
 ## 7. 执行方式
 
@@ -100,7 +109,7 @@ bash build.sh
 | `/api/probe/test`（httptest mock 上游） | UT-136 |
 | `/api/probe/models`（httptest mock 上游） | UT-137 |
 | `/api/config/validate`（通过/失败） | UT-135 |
-| `/v1/models` 双协议与过滤去重 | UT-121、UT-122、UT-123 |
+| 模型列表双路径、双协议与过滤去重 | UT-121～UT-130 |
 | 管理鉴权、PUT 写回不生效、reload 成功/失败 | UT-131～UT-134 |
 | `config.example.json` 为 fallback + 分组 instances 且可解析 | UT-012 |
 | 文档同步（README/CHANGELOG/design/tests） | 本文件与 design.md、README.md、CHANGELOG.md |
@@ -118,6 +127,7 @@ bash build.sh
 | UT-138 | `GET /api/providers` | `TestProvidersAPI` | 鉴权、清单、非 GET | 401；200 返回 11 项（含 deepseek override）；POST 405 |
 | UT-139 | probe/models provider | `TestProbeModelsWithProvider` | openai+provider=deepseek（无该协议 override）走请求 base_url；未知 provider | 走 mock base_url 并返回模型；未知 provider 400 |
 | UT-140 | 配置 provider 透传 | `TestSaveRoundTrip` / `TestLoadAppliesDefaults` | provider 的归一化、保存往返 | provider 保留为小写 id |
+| UT-141 | probe/models 能力字段兼容 | `TestProbeModelsCapabilities` | DeepSeek 真实响应夹具（`context_window`/`max_output_tokens`/`input_modalities`/`effort`）；其余别名（`context_length`/`contextWindow`/`maxTokens`/`maxOutputTokens`/`max_completion_tokens`/`top_provider`/`limit`/`reasoning`）；Anthropic 官方字段与别名并存；MTI 无元数据条目 | flash：窗口 1048576、输出 393216、`image_input:true`、`thinking:true`；pro：`input_modalities` 仅 text → `image_input:false`；官方字段优先；无元数据时省略 `capabilities` 且 `models` 正常 |
 
 ## 10. 验收对照（§10.7）
 
@@ -319,3 +329,101 @@ go vet ./...
 go test ./...
 go test -race ./internal/proxy
 ```
+
+## 20. M6 `/v1/models` 官方 schema（§21）
+
+### 20.1 自动化用例
+
+- 配置：UT-019（`role_names`）、UT-020（`model_capabilities`）。
+- 端点：UT-122（官方 schema 与未声明 `null`）、UT-124（能力元数据取值规则）、UT-125（`role_names` 映射）、UT-126（分页/lifecycle）、UT-127（400 错误体）。
+- 路由不变：`TestRouteByRoles` 覆盖 `claude-sonnet-5`；`TestOfficialModelNameRoutesLikeRoleAndLogsRequestModel` 断言 `req_model` 分别为 `sonnet`/`claude-sonnet-5`，转发目标与改写值一致。
+- OpenAI 兼容：UT-121 断言 Anthropic 查询参数不影响 OpenAI 响应。
+
+### 20.2 验收对照（§21.9）
+
+| 验收项 | 对应用例 |
+|---|---|
+| 4 个官方 id + `line`/`lifecycle`/窗口/能力/`deprecated_at`/`retires_at` | UT-122 |
+| 配置能力后字段出现；未配置为 `null` | UT-122、UT-124、UT-125 |
+| `?limit=2`、`?after_id=`、`?lifecycle=retired` | UT-126 |
+| `claude-sonnet-5` 与 `sonnet` 路由一致、日志 `req_model` 不同 | `TestRouteByRoles`、`TestOfficialModelNameRoutesLikeRoleAndLogsRequestModel` |
+| 非法 `limit`/`lifecycle`/双游标 → 400 | UT-127 |
+| `go build`/`go vet`/`go test`（含 `-race`）退出码 0 | §7 执行命令 |
+| DSH 发图链路（真实环境） | 手工：DSH 选 `claude-sonnet-5` 发图，不再提示未知图片能力，代理日志 `↑` 输入 token 增大 |
+
+## 21. M6 配置页：`role_names` / `model_capabilities`（§21.6）
+
+### 21.1 自动化用例
+
+- `TestProbeModelsCapabilities`（`internal/proxy`）：
+  - 上游返回 `max_input_tokens` / `max_tokens` / `capabilities.*.supported` → 响应保留原样 `models`，并新增 `capabilities` 映射（显式 `false` 保留；`0`/负数与无元数据模型不输出）。
+  - 上游没有任何能力元数据 → 响应省略 `capabilities` 字段，`models` 形状不变（向后兼容）。
+  - 能力元数据类型异常 → 仅忽略能力映射，`models` 仍正常返回（best-effort）。
+  - OpenAI/DeepSeek 风格字段：`context_window` / `max_output_tokens` / `input_modalities` / `effort` 等自动带出窗口与模态；`input_modalities` 不含某模态时为显式 `false` 而非未声明；Anthropic 官方字段与别名并存时官方字段优先；仅 `id`/`object` 的无元数据模型（MTI）不产生能力条目，`capabilities` 省略、`models` 正常返回。
+- 配置往返：UT-019（`role_names`）、UT-020（`model_capabilities`）覆盖 `config.Parse` / `Marshal` 与 `PUT /api/config` 写回。
+- 执行：`go test -race ./internal/proxy -run TestProbeModelsCapabilities`。
+
+### 21.2 手工端到端用例（主代理执行）
+
+准备：管理员开启配置页；一个 Anthropic 实例至少配置 `sonnet`/`opus` 角色；上游 `/v1/models` 至少返回一个带能力元数据的模型。
+
+1. 打开 `/admin` 并切到 Anthropic tab：每个具体角色一行，左侧上游模型、右侧「对外模型名」；对外名输入框 placeholder 为内置官方名（`claude-sonnet-5` 等），`*` 托底行没有对外名。
+2. 给 sonnet 填对外名 `my-sonnet`，其余角色留空；保存到文件 →「重载生效」→「重新读取」：sonnet 回显 `my-sonnet`，未填写对外名的角色不出现在 `role_names`。
+3. 「模型能力」区块只列出角色映射使用到的上游模型（另加已有 `model_capabilities` 键），行内为横向紧凑布局（模型名 + 两个窗口 + 四个勾选），不出现纵向大块堆叠。
+4. 填写 `max_input_tokens` / `max_tokens` 并勾选部分能力，保存/重载/重新读取后回显一致；数值留空或填 `0` 视为未声明，不写入。
+5. 点击「查询模型」：
+   - 上游返回能力元数据时，已被角色使用的模型自动填入缺失的窗口与勾选（`supported:true` 勾选，`supported:false` 不勾选但保留显式 `false`）；
+   - 用户已填字段不被覆盖；上游未声明的模型或手填模型保持空行。
+6. 能力行全部留空（无已声明字段）→ 保存后 `model_capabilities` 不含该模型；若行内存在显式 `false` 则保留（D-M6-6）。
+7. 新增实例、删除实例、切换 OpenAI/Anthropic tab、可视化 ↔ JSON 往返后保存：`role_names` 与 `model_capabilities` 不丢失。
+8. 窗口填负数 → 保存被前端阻止并显示错误；`0` 合法（视为未声明）。
+9. 视觉检查：1 个实例（4 个具体角色 + 3 条能力行）卡片高度约 600px，与新增前同一量级；能力行为一行多列的紧凑网格。
+
+### 21.3 验收对照（§21.6）
+
+| 验收项 | 对应验证 |
+|---|---|
+| 角色行可编辑对外模型名；留空用内置默认；保存写 `role_names` | 手工用例 1–2；UT-019 |
+| 每实例可编辑模型能力（窗口/输出上限/四勾选）；空值不写 | 手工用例 3–4、6；UT-020；`TestProbeModelsCapabilities` |
+| 查询上游把能力自动填入对应行；未提供/手填留空 | 手工用例 5；`TestProbeModelsCapabilities` |
+| 新增/删除/切换/保存后回读不丢失（含 `PUT /api/config` 往返） | 手工用例 7；UT-019、UT-020 |
+| `probeModelsResponse` 保留 `models` 并新增能力映射 | `TestProbeModelsCapabilities`（八个子用例） |
+| 布局紧凑、不产生过高卡片 | 手工用例 3、9 |
+| `go build` / `go vet` / `go test`（含 `-race`）退出码 0 | §7 执行命令 |
+
+## 22. M7 协议路径分离 + OpenAI 入口能力（§22）
+
+### 22.1 自动化用例
+
+- UT-128（`TestModelsSchemaIsDecidedByPath`）：`/v1/models` 无论 Bearer 还是 `x-api-key` 都返回 OpenAI 格式；`/anthropic/v1/models` 无论 `x-api-key` 还是 Bearer 都返回 Anthropic 格式；两入口无凭据 401 的错误体按路径协议；`/anthropic/v1/chat/completions` 精确匹配失败 → 404。
+- UT-129（`TestModelsOpenAICapabilities`）：OpenAI 实例能力字段的构造、别名、去重与“首个声明”回退；`input_modalities` 四种组合（image-only / pdf-only / both / 显式 false）。
+- UT-130（`TestAnthropicMessagesPathAlias`）：两条 messages 路径 × 两种认证头，响应体、上游路径/查询串/认证头、模型改写与日志字段一致；无凭据 401。
+- 既有用例按新契约迁移：UT-123 的 Anthropic 分支改走 `/anthropic/v1/models`；UT-122/124～127 全部改走 `/anthropic/v1/models`。
+- 配置：UT-020 已覆盖 OpenAI 实例的 `model_capabilities` 解析与校验，无需新增。
+
+### 22.2 手工端到端用例
+
+准备：管理员开启配置页；一个 OpenAI 实例勾选至少两个模型，其中一个配置能力；同时存在 Anthropic 实例。
+
+1. OpenAI tab 的实例卡片在「模型列表」下方出现「模型能力」网格（模型名 + 输入窗口 + 输出上限 + 图片/PDF/思考/结构化勾选），与 Anthropic 侧同一紧凑样式；卡片不出现整块纵向堆叠。
+2. 勾选/取消模型、手动修改 `models` 输入框：能力网格行随之增删；已配置能力的模型回显窗口与勾选。
+3. 填写窗口/勾选能力 → 保存 → 「重载生效」→「重新读取」：OpenAI 实例的 `model_capabilities` 回显一致；`GET /api/config` 与落盘文件均含该字段。
+4. 点击「查询模型」：上游返回能力元数据时，已选模型自动填入缺失字段，用户已填值不被覆盖；勾选新模型时其远程能力立即出现。
+5. 能力行全部留空 → 保存后该模型不出现在 `model_capabilities`。
+6. 用 `curl` 验证：`/v1/models` 带 Bearer 或 `x-api-key` 均返回 OpenAI 格式且带能力字段；`/anthropic/v1/models` 无论带哪种头均返回 Anthropic 格式；`/anthropic/v1/messages` 与 `/v1/messages` 对同一请求体结果一致。
+
+### 22.3 验收对照（§22.8）
+
+| 验收项 | 对应验证 |
+|---|---|
+| `/v1/models` 带 Bearer 返回 OpenAI 格式且含能力字段 | UT-121、UT-129 |
+| `/v1/models` 带 `x-api-key` 仍返回 OpenAI 格式 | UT-128 |
+| `/anthropic/v1/models` 返回 Anthropic 格式（即使带 Bearer） | UT-122、UT-128 |
+| `/anthropic/v1/messages` 与 `/v1/messages` 结果与日志一致 | UT-130 |
+| 配置能力后出现字段；未配置模型不出现 | UT-129 |
+| 两实例同名模型只出现一次且取第一个实例能力 | UT-129 |
+| `input_modalities` 构造（image/pdf/两者 false 或未声明） | UT-129 |
+| 配置页 OpenAI 能力编辑与保存 | 手工用例 1–5；UT-020 |
+| `go build` / `go vet` / `go test`（含 `-race`）退出码 0 | §7 执行命令 |
+
+| UT-131 | 非 AI 请求与三档请求日志（M8，§23） | `TestNonAICallOmitsTokenSegment`、`TestAuthFailureIsLoggedWithoutSecrets`、`TestAnthropicMessagesPathAlias`、`TestAllCandidatesFailedLogsAttempt`、`TestRequestLogFormat` | favicon 与 401 走代理；已路由但无 usage 的 messages 请求；上游候选全部失败；有 usage 的正常请求 | D1：无模型段与 token 段；D2：保留模型段、无 `↑`/`↓`；D3：完整格式与顺序不变；候选全失败时 502 汇总行之前有一行带最后候选实例名/上游模型名的 D2 日志（R3） |

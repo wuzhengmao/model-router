@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -682,6 +683,7 @@ func TestRouteByRoles(t *testing.T) {
 		}{
 			{"sonnet", "deepseek-v4-flash", true},
 			{"haiku", "deepseek-v4-flash", true},
+			{"claude-sonnet-5", "deepseek-v4-flash", true},
 			{"claude-sonnet-4-5-20250929", "deepseek-v4-flash", true},
 			{"opus", "deepseek-v4-pro", false},
 			{"fable", "deepseek-v4-pro", false},
@@ -783,6 +785,30 @@ func TestRouteByRoles(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestOfficialModelNameRoutesLikeRoleAndLogsRequestModel(t *testing.T) {
+	backend, captured, calls := newBackend(t, http.StatusOK, nil, `{"backend":"flash"}`)
+	instance := anthropicInstance(backend.URL, "key", map[string]string{"sonnet": "deepseek-v4-flash"})
+	instance.Name = "MTI"
+	proxyServer := newProxy(t, serviceToken, instance)
+	logs := captureLogs(t)
+
+	for _, model := range []string{"sonnet", "claude-sonnet-5"} {
+		body := `{"model":"` + model + `","messages":[]}`
+		resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages", body, withAuth(config.ProtocolAnthropic, nil))
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("model %q status = %d, want 200", model, resp.StatusCode)
+		}
+		_ = readBody(t, resp)
+	}
+	if calls() != 2 {
+		t.Errorf("backend calls = %d, want 2", calls())
+	}
+	assertModelRewritten(t, `{"model":"claude-sonnet-5","messages":[]}`, captured().body, "deepseek-v4-flash")
+
+	waitForLog(t, logs, "MTI/deepseek-v4-flash (sonnet)")
+	waitForLog(t, logs, "MTI/deepseek-v4-flash (claude-sonnet-5)")
 }
 
 func TestRouteWildcardFallback(t *testing.T) {
@@ -1119,7 +1145,285 @@ func TestModelsOpenAI(t *testing.T) {
 	if firstCalls() != 0 || secondCalls() != 0 {
 		t.Errorf("upstream calls = %d/%d, want 0 (models are generated locally)", firstCalls(), secondCalls())
 	}
+
+	// The Anthropic query parameters must not change the OpenAI entrypoint.
+	queryResp := send(t, http.MethodGet,
+		proxyServer.URL+"/v1/models?limit=0&lifecycle=foo&before_id=a&after_id=b", "",
+		withAuth(config.ProtocolOpenAI, nil))
+	if queryResp.StatusCode != http.StatusOK {
+		t.Fatalf("openai models with query status = %d, want 200", queryResp.StatusCode)
+	}
+	queryBody := readBody(t, queryResp)
+	var queryList struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(queryBody), &queryList); err != nil {
+		t.Fatalf("openai models with query is not JSON: %v (body %q)", err, queryBody)
+	}
+	queryIDs := make([]string, 0, len(queryList.Data))
+	for _, item := range queryList.Data {
+		queryIDs = append(queryIDs, item.ID)
+	}
+	if queryList.Object != "list" || !reflect.DeepEqual(queryIDs, want) {
+		t.Errorf("openai models with query = %q/%v, want list/%v (query must be ignored)", queryList.Object, queryIDs, want)
+	}
 }
+
+type openAIModelEntryJSON struct {
+	ID              string          `json:"id"`
+	Object          string          `json:"object"`
+	Created         int64           `json:"created"`
+	OwnedBy         string          `json:"owned_by"`
+	ContextWindow   json.RawMessage `json:"context_window"`
+	MaxInputTokens  json.RawMessage `json:"max_input_tokens"`
+	MaxOutputTokens json.RawMessage `json:"max_output_tokens"`
+	MaxTokens       json.RawMessage `json:"max_tokens"`
+	InputModalities json.RawMessage `json:"input_modalities"`
+}
+
+func decodeOpenAIModelEntries(t *testing.T, resp *http.Response) []openAIModelEntryJSON {
+	t.Helper()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxy status = %d, want %d (body %q)", resp.StatusCode, http.StatusOK, readBody(t, resp))
+	}
+	body := readBody(t, resp)
+	var list struct {
+		Object string                 `json:"object"`
+		Data   []openAIModelEntryJSON `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &list); err != nil {
+		t.Fatalf("models response is not JSON: %v (body %q)", err, body)
+	}
+	if list.Object != "list" {
+		t.Errorf("object = %q, want list", list.Object)
+	}
+	return list.Data
+}
+
+// TestModelsOpenAICapabilities covers §22.4: optional capability fields, the
+// first-declaration rule and the input_modalities construction.
+func TestModelsOpenAICapabilities(t *testing.T) {
+	first := openAIInstance("https://openai-a.example", "key-a", "m-pro", "m-fallthrough", "m-none", "m-both")
+	first.ModelCapabilities = map[string]config.ModelCapability{
+		"m-pro": {
+			MaxInputTokens: 1000000,
+			MaxTokens:      128000,
+			ImageInput:     boolPtr(true),
+			PDFInput:       boolPtr(false),
+		},
+	}
+	second := openAIInstance("https://openai-b.example", "key-b", "m-pro", "m-fallthrough", "m-pdf", "m-both")
+	second.ModelCapabilities = map[string]config.ModelCapability{
+		"m-pro":         {MaxInputTokens: 1},
+		"m-fallthrough": {ImageInput: boolPtr(false), PDFInput: boolPtr(true)},
+		"m-pdf":         {ImageInput: boolPtr(false), PDFInput: boolPtr(false)},
+		"m-both":        {ImageInput: boolPtr(true), PDFInput: boolPtr(true)},
+	}
+	proxyServer := newProxy(t, serviceToken, first, second)
+
+	resp := send(t, http.MethodGet, proxyServer.URL+"/v1/models", "", withAuth(config.ProtocolOpenAI, nil))
+	entries := decodeOpenAIModelEntries(t, resp)
+
+	wantIDs := []string{"m-pro", "m-fallthrough", "m-none", "m-both", "m-pdf"}
+	ids := make([]string, 0, len(entries))
+	byID := make(map[string]openAIModelEntryJSON, len(entries))
+	for _, entry := range entries {
+		ids = append(ids, entry.ID)
+		if _, dup := byID[entry.ID]; dup {
+			t.Errorf("model %q appears more than once (ids %v)", entry.ID, ids)
+		}
+		byID[entry.ID] = entry
+		if entry.Object != "model" || entry.OwnedBy != "model-router" || entry.Created <= 0 {
+			t.Errorf("model %q has wrong base shape: %+v", entry.ID, entry)
+		}
+	}
+	if !reflect.DeepEqual(ids, wantIDs) {
+		t.Fatalf("model ids = %v, want %v (instance order, dedupe)", ids, wantIDs)
+	}
+
+	assertIntField := func(entry openAIModelEntryJSON, field string, raw json.RawMessage, want int) {
+		t.Helper()
+		if got := string(raw); got != strconv.Itoa(want) {
+			t.Errorf("%s %s = %q, want %d", entry.ID, field, got, want)
+		}
+	}
+	assertOmitted := func(entry openAIModelEntryJSON, field string, raw json.RawMessage) {
+		t.Helper()
+		if len(raw) != 0 {
+			t.Errorf("%s %s = %s, want omitted", entry.ID, field, raw)
+		}
+	}
+
+	pro := byID["m-pro"]
+	assertIntField(pro, "context_window", pro.ContextWindow, 1000000)
+	assertIntField(pro, "max_input_tokens", pro.MaxInputTokens, 1000000)
+	assertIntField(pro, "max_output_tokens", pro.MaxOutputTokens, 128000)
+	assertIntField(pro, "max_tokens", pro.MaxTokens, 128000)
+	if got := string(pro.InputModalities); got != `["text","image"]` {
+		t.Errorf("m-pro input_modalities = %s, want [\"text\",\"image\"]", got)
+	}
+
+	fallbackCap := byID["m-fallthrough"]
+	assertOmitted(fallbackCap, "context_window", fallbackCap.ContextWindow)
+	assertOmitted(fallbackCap, "max_input_tokens", fallbackCap.MaxInputTokens)
+	assertOmitted(fallbackCap, "max_output_tokens", fallbackCap.MaxOutputTokens)
+	assertOmitted(fallbackCap, "max_tokens", fallbackCap.MaxTokens)
+	if got := string(fallbackCap.InputModalities); got != `["text","pdf"]` {
+		t.Errorf("m-fallthrough input_modalities = %s, want [\"text\",\"pdf\"] (second instance supplies it)", got)
+	}
+
+	none := byID["m-none"]
+	assertOmitted(none, "context_window", none.ContextWindow)
+	assertOmitted(none, "max_input_tokens", none.MaxInputTokens)
+	assertOmitted(none, "max_output_tokens", none.MaxOutputTokens)
+	assertOmitted(none, "max_tokens", none.MaxTokens)
+	assertOmitted(none, "input_modalities", none.InputModalities)
+
+	both := byID["m-both"]
+	if got := string(both.InputModalities); got != `["text","image","pdf"]` {
+		t.Errorf("m-both input_modalities = %s, want [\"text\",\"image\",\"pdf\"]", got)
+	}
+
+	explicitFalse := byID["m-pdf"]
+	assertOmitted(explicitFalse, "input_modalities", explicitFalse.InputModalities)
+	assertOmitted(explicitFalse, "context_window", explicitFalse.ContextWindow)
+}
+
+// TestAnthropicMessagesPathAlias covers §22.8: /anthropic/v1/messages and
+// /v1/messages share auth, routing, upstream target and log format.
+func TestAnthropicMessagesPathAlias(t *testing.T) {
+	backend, captured, calls := newBackend(t, http.StatusOK, nil, `{"id":"msg_1","type":"message"}`)
+	instance := anthropicInstance(backend.URL, "upstream-key", map[string]string{"sonnet": "mti-pro"})
+	instance.Name = "MTI"
+	proxyServer := newProxy(t, serviceToken, instance)
+	logs := captureLogs(t)
+
+	body := `{"model":"sonnet","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	cases := []struct {
+		name    string
+		path    string
+		headers map[string]string
+	}{
+		{"v1 x-api-key", "/v1/messages", withAuth(config.ProtocolAnthropic, nil)},
+		{"v1 bearer", "/v1/messages", map[string]string{"Authorization": "Bearer " + serviceToken}},
+		{"anthropic x-api-key", "/anthropic/v1/messages", withAuth(config.ProtocolAnthropic, nil)},
+		{"anthropic bearer", "/anthropic/v1/messages", map[string]string{"Authorization": "Bearer " + serviceToken}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := send(t, http.MethodPost, proxyServer.URL+tc.path+"?beta=1", body, tc.headers)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body %q)", resp.StatusCode, readBody(t, resp))
+			}
+			if got := readBody(t, resp); got != `{"id":"msg_1","type":"message"}` {
+				t.Errorf("body = %q, want upstream body verbatim", got)
+			}
+			got := captured()
+			if got.method != http.MethodPost || got.path != "/v1/messages" || got.rawQuery != "beta=1" {
+				t.Errorf("forwarded %s %s?%s, want POST /v1/messages?beta=1", got.method, got.path, got.rawQuery)
+			}
+			if key := got.header.Get("x-api-key"); key != "upstream-key" {
+				t.Errorf("upstream x-api-key = %q, want upstream-key", key)
+			}
+			if auth := got.header.Get("Authorization"); auth != "" {
+				t.Errorf("upstream Authorization = %q, want removed", auth)
+			}
+			assertModelRewritten(t, body, got.body, "mti-pro")
+		})
+	}
+	if calls() != int32(len(cases)) {
+		t.Errorf("backend calls = %d, want %d", calls(), len(cases))
+	}
+
+	for _, path := range []string{"/v1/messages", "/anthropic/v1/messages"} {
+		line := logLineContaining(t, logs(), "POST "+path+" -> MTI/mti-pro (sonnet)")
+		if line == "" {
+			t.Errorf("no request log line for %s in %q", path, logs())
+			continue
+		}
+		// §23: this request did reach a route, so the model segment stays,
+		// but a response without usage omits the token segment entirely.
+		for _, field := range []string{" -> MTI/mti-pro (sonnet) in ", " from "} {
+			if !strings.Contains(line, field) {
+				t.Errorf("log line for %s is missing %q: %s", path, field, line)
+			}
+		}
+		if strings.Contains(line, "↑") || strings.Contains(line, "↓") {
+			t.Errorf("log line for %s must omit token counts when usage is absent: %s", path, line)
+		}
+	}
+
+	for _, path := range []string{"/v1/messages", "/anthropic/v1/messages"} {
+		t.Run("no credentials "+path, func(t *testing.T) {
+			resp := send(t, http.MethodPost, proxyServer.URL+path, body, nil)
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", resp.StatusCode)
+			}
+			if apiErr := decodeAnthropicError(t, resp); apiErr.Error.Type != "authentication_error" {
+				t.Errorf("error.type = %q, want authentication_error", apiErr.Error.Type)
+			}
+		})
+	}
+}
+
+// logLineContaining returns the first log line containing marker, or "".
+func logLineContaining(t *testing.T, logs, marker string) string {
+	t.Helper()
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, marker) {
+			return line
+		}
+	}
+	return ""
+}
+
+type anthropicModelEntryJSON struct {
+	Type           string          `json:"type"`
+	ID             string          `json:"id"`
+	DisplayName    string          `json:"display_name"`
+	CreatedAt      string          `json:"created_at"`
+	MaxInputTokens json.RawMessage `json:"max_input_tokens"`
+	MaxTokens      json.RawMessage `json:"max_tokens"`
+	Lifecycle      string          `json:"lifecycle"`
+	DeprecatedAt   json.RawMessage `json:"deprecated_at"`
+	RetiresAt      json.RawMessage `json:"retires_at"`
+	Line           string          `json:"line"`
+	Capabilities   json.RawMessage `json:"capabilities"`
+}
+
+type anthropicModelListJSON struct {
+	Data    []anthropicModelEntryJSON `json:"data"`
+	HasMore bool                      `json:"has_more"`
+	FirstID *string                   `json:"first_id"`
+	LastID  *string                   `json:"last_id"`
+}
+
+func decodeAnthropicModelList(t *testing.T, resp *http.Response) anthropicModelListJSON {
+	t.Helper()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxy status = %d, want %d (body %q)", resp.StatusCode, http.StatusOK, readBody(t, resp))
+	}
+	body := readBody(t, resp)
+	var list anthropicModelListJSON
+	if err := json.Unmarshal([]byte(body), &list); err != nil {
+		t.Fatalf("models response is not JSON: %v (body %q)", err, body)
+	}
+	return list
+}
+
+func assertJSONNull(t *testing.T, raw json.RawMessage, field string) {
+	t.Helper()
+	if string(raw) != "null" {
+		t.Errorf("%s = %q, want null", field, raw)
+	}
+}
+
+func boolPtr(value bool) *bool { return &value }
 
 func TestModelsAnthropic(t *testing.T) {
 	proxyServer := newProxy(t, serviceToken,
@@ -1136,50 +1440,314 @@ func TestModelsAnthropic(t *testing.T) {
 		openAIInstance("https://openai.example", "openai-key", "gpt-only"),
 	)
 
-	resp := send(t, http.MethodGet, proxyServer.URL+"/v1/models", "", withAuth(config.ProtocolAnthropic, nil))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("proxy status = %d, want %d", resp.StatusCode, http.StatusOK)
-	}
+	resp := send(t, http.MethodGet, proxyServer.URL+"/anthropic/v1/models", "", withAuth(config.ProtocolAnthropic, nil))
+	list := decodeAnthropicModelList(t, resp)
 
-	body := readBody(t, resp)
-	var list struct {
-		Data []struct {
-			ID          string `json:"id"`
-			Type        string `json:"type"`
-			DisplayName string `json:"display_name"`
-			CreatedAt   string `json:"created_at"`
-		} `json:"data"`
-		HasMore bool   `json:"has_more"`
-		FirstID string `json:"first_id"`
-		LastID  string `json:"last_id"`
+	want := []struct {
+		id          string
+		displayName string
+		createdAt   string
+		line        string
+	}{
+		{"claude-sonnet-5", "Claude Sonnet 5", "2026-01-01T00:00:00Z", "sonnet"},
+		{"claude-opus-5", "Claude Opus 5", "2026-01-01T00:00:00Z", "opus"},
+		{"claude-fable-5", "Claude Fable 5", "2026-01-01T00:00:00Z", "fable"},
+		{"claude-haiku-4-5", "Claude Haiku 4.5", "2025-10-01T00:00:00Z", "haiku"},
 	}
-	if err := json.Unmarshal([]byte(body), &list); err != nil {
-		t.Fatalf("models response is not JSON: %v (body %q)", err, body)
+	if len(list.Data) != len(want) {
+		t.Fatalf("model count = %d, want %d", len(list.Data), len(want))
 	}
-	ids := make([]string, 0, len(list.Data))
-	for _, item := range list.Data {
-		ids = append(ids, item.ID)
-		if item.Type != "model" || item.DisplayName != item.ID {
-			t.Errorf("model entry has wrong shape: %+v", item)
+	for i, item := range list.Data {
+		expected := want[i]
+		if item.ID != expected.id {
+			t.Errorf("data[%d].id = %q, want official %q", i, item.ID, expected.id)
 		}
-		if _, err := time.Parse(time.RFC3339, item.CreatedAt); err != nil {
-			t.Errorf("model %q created_at = %q, want RFC3339: %v", item.ID, item.CreatedAt, err)
+		if item.Type != "model" || item.DisplayName != expected.displayName || item.CreatedAt != expected.createdAt {
+			t.Errorf("data[%d] has wrong shape: %+v", i, item)
 		}
-	}
-	want := []string{"sonnet", "opus", "fable", "haiku"}
-	if !reflect.DeepEqual(ids, want) {
-		t.Errorf("model ids = %v, want role names %v (fixed order, dedupe, no *)", ids, want)
-	}
-	for _, id := range ids {
-		if id == "claude-sonnet-real" || id == "claude-opus-real" || id == "claude-fable-real" || id == "fallback-model" {
-			t.Errorf("model ids must be role names, got upstream model %q", id)
+		if item.Line != expected.line {
+			t.Errorf("data[%d].line = %q, want %q", i, item.Line, expected.line)
 		}
+		if item.Lifecycle != "active" {
+			t.Errorf("data[%d].lifecycle = %q, want active", i, item.Lifecycle)
+		}
+		assertJSONNull(t, item.MaxInputTokens, "max_input_tokens")
+		assertJSONNull(t, item.MaxTokens, "max_tokens")
+		assertJSONNull(t, item.Capabilities, "capabilities")
+		assertJSONNull(t, item.DeprecatedAt, "deprecated_at")
+		assertJSONNull(t, item.RetiresAt, "retires_at")
 	}
 	if list.HasMore {
 		t.Error("has_more = true, want false")
 	}
-	if list.FirstID != "sonnet" || list.LastID != "haiku" {
-		t.Errorf("first_id/last_id = %q/%q, want sonnet/haiku", list.FirstID, list.LastID)
+	if list.FirstID == nil || *list.FirstID != want[0].id {
+		t.Errorf("first_id = %v, want %q", list.FirstID, want[0].id)
+	}
+	if list.LastID == nil || *list.LastID != want[len(want)-1].id {
+		t.Errorf("last_id = %v, want %q", list.LastID, want[len(want)-1].id)
+	}
+}
+
+func TestModelsAnthropicCapabilities(t *testing.T) {
+	first := anthropicInstance("https://anthropic-a.example", "key-a", map[string]string{
+		"sonnet": "mti-pro",
+		"opus":   "mti-flash",
+		"fable":  "mti-unknown",
+		"haiku":  "mti-zero",
+	})
+	first.ModelCapabilities = map[string]config.ModelCapability{
+		"mti-pro": {
+			MaxInputTokens:    1000000,
+			MaxTokens:         128000,
+			ImageInput:        boolPtr(true),
+			PDFInput:          boolPtr(false),
+			Thinking:          boolPtr(true),
+			StructuredOutputs: boolPtr(true),
+		},
+	}
+	second := anthropicInstance("https://anthropic-b.example", "key-b", map[string]string{
+		"sonnet": "mti-pro",
+	})
+	second.ModelCapabilities = map[string]config.ModelCapability{
+		"mti-pro":   {MaxInputTokens: 1},
+		"mti-flash": {ImageInput: boolPtr(true)},
+		"mti-zero":  {},
+	}
+	proxyServer := newProxy(t, serviceToken, first, second)
+
+	resp := send(t, http.MethodGet, proxyServer.URL+"/anthropic/v1/models", "", withAuth(config.ProtocolAnthropic, nil))
+	list := decodeAnthropicModelList(t, resp)
+	byLine := make(map[string]anthropicModelEntryJSON, len(list.Data))
+	for _, item := range list.Data {
+		byLine[item.Line] = item
+	}
+
+	type support struct {
+		Supported bool `json:"supported"`
+	}
+	type capabilityOutput struct {
+		ImageInput        *support `json:"image_input"`
+		PDFInput          *support `json:"pdf_input"`
+		Thinking          *support `json:"thinking"`
+		StructuredOutputs *support `json:"structured_outputs"`
+	}
+
+	sonnet := byLine["sonnet"]
+	if got := string(sonnet.MaxInputTokens); got != "1000000" {
+		t.Errorf("sonnet max_input_tokens = %s, want 1000000 (first declaration wins)", got)
+	}
+	if got := string(sonnet.MaxTokens); got != "128000" {
+		t.Errorf("sonnet max_tokens = %s, want 128000", got)
+	}
+	var sonnetCaps capabilityOutput
+	if err := json.Unmarshal(sonnet.Capabilities, &sonnetCaps); err != nil {
+		t.Fatalf("decode sonnet capabilities: %v (%s)", err, sonnet.Capabilities)
+	}
+	if sonnetCaps.ImageInput == nil || !sonnetCaps.ImageInput.Supported {
+		t.Errorf("sonnet image_input = %+v, want supported true", sonnetCaps.ImageInput)
+	}
+	if sonnetCaps.PDFInput == nil || sonnetCaps.PDFInput.Supported {
+		t.Errorf("sonnet pdf_input = %+v, want supported false", sonnetCaps.PDFInput)
+	}
+	if sonnetCaps.Thinking == nil || !sonnetCaps.Thinking.Supported {
+		t.Errorf("sonnet thinking = %+v, want supported true", sonnetCaps.Thinking)
+	}
+	if sonnetCaps.StructuredOutputs == nil || !sonnetCaps.StructuredOutputs.Supported {
+		t.Errorf("sonnet structured_outputs = %+v, want supported true", sonnetCaps.StructuredOutputs)
+	}
+
+	opus := byLine["opus"]
+	assertJSONNull(t, opus.MaxInputTokens, "opus max_input_tokens")
+	assertJSONNull(t, opus.MaxTokens, "opus max_tokens")
+	var opusCaps capabilityOutput
+	if err := json.Unmarshal(opus.Capabilities, &opusCaps); err != nil {
+		t.Fatalf("decode opus capabilities: %v (%s)", err, opus.Capabilities)
+	}
+	if opusCaps.ImageInput == nil || !opusCaps.ImageInput.Supported {
+		t.Errorf("opus image_input = %+v, want supported true (declared on second instance)", opusCaps.ImageInput)
+	}
+	if opusCaps.PDFInput != nil || opusCaps.Thinking != nil || opusCaps.StructuredOutputs != nil {
+		t.Errorf("opus capabilities contain undeclared fields: %s", opus.Capabilities)
+	}
+
+	fable := byLine["fable"]
+	assertJSONNull(t, fable.MaxInputTokens, "fable max_input_tokens")
+	assertJSONNull(t, fable.MaxTokens, "fable max_tokens")
+	assertJSONNull(t, fable.Capabilities, "fable capabilities")
+
+	haiku := byLine["haiku"]
+	assertJSONNull(t, haiku.MaxInputTokens, "haiku max_input_tokens (declared 0)")
+	assertJSONNull(t, haiku.MaxTokens, "haiku max_tokens (declared 0)")
+	assertJSONNull(t, haiku.Capabilities, "haiku capabilities (none declared)")
+}
+
+func TestModelsAnthropicRoleNamesFromConfig(t *testing.T) {
+	cfg, err := config.Parse([]byte(`{
+		"auth_token": "service-token",
+		"instances": {
+			"anthropic": [{
+				"base_url": "https://anthropic.example",
+				"api_key": "k",
+				"roles": {"sonnet": "mti-pro", "opus": "mti-flash"},
+				"role_names": {"Sonnet": "claude-sonnet-6", "opus": "claude-opus-5"},
+				"model_capabilities": {
+					"mti-pro": {"max_input_tokens": 200000, "max_tokens": 64000, "image_input": true},
+					"mti-flash": {"image_input": false}
+				}
+			}]
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	handler, err := proxy.New(cfg)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	proxyServer := httptest.NewServer(handler)
+	t.Cleanup(proxyServer.Close)
+
+	resp := send(t, http.MethodGet, proxyServer.URL+"/anthropic/v1/models", "", withAuth(config.ProtocolAnthropic, nil))
+	list := decodeAnthropicModelList(t, resp)
+	if len(list.Data) != 2 {
+		t.Fatalf("model count = %d, want 2", len(list.Data))
+	}
+
+	sonnet := list.Data[0]
+	if sonnet.ID != "claude-sonnet-6" {
+		t.Errorf("sonnet id = %q, want role_names override claude-sonnet-6", sonnet.ID)
+	}
+	if sonnet.DisplayName != "claude-sonnet-6" {
+		t.Errorf("sonnet display_name = %q, want id fallback", sonnet.DisplayName)
+	}
+	created, err := time.Parse(time.RFC3339, sonnet.CreatedAt)
+	if err != nil {
+		t.Errorf("sonnet created_at = %q, want RFC3339: %v", sonnet.CreatedAt, err)
+	} else if delta := time.Since(created); delta < -time.Minute || delta > time.Minute {
+		t.Errorf("sonnet created_at = %q, want current time", sonnet.CreatedAt)
+	}
+	if got := string(sonnet.MaxInputTokens); got != "200000" {
+		t.Errorf("sonnet max_input_tokens = %s, want 200000", got)
+	}
+	if got := string(sonnet.MaxTokens); got != "64000" {
+		t.Errorf("sonnet max_tokens = %s, want 64000", got)
+	}
+	if !strings.Contains(string(sonnet.Capabilities), `"image_input":{"supported":true}`) {
+		t.Errorf("sonnet capabilities = %s, want image_input supported", sonnet.Capabilities)
+	}
+	if strings.Contains(string(sonnet.Capabilities), "thinking") {
+		t.Errorf("sonnet capabilities must omit undeclared thinking: %s", sonnet.Capabilities)
+	}
+
+	opus := list.Data[1]
+	if opus.ID != "claude-opus-5" {
+		t.Errorf("opus id = %q, want claude-opus-5", opus.ID)
+	}
+	if opus.DisplayName != "Claude Opus 5" || opus.CreatedAt != "2026-01-01T00:00:00Z" {
+		t.Errorf("opus identity = %q/%q, want built-in table values", opus.DisplayName, opus.CreatedAt)
+	}
+	assertJSONNull(t, opus.MaxInputTokens, "opus max_input_tokens")
+	assertJSONNull(t, opus.MaxTokens, "opus max_tokens")
+	if !strings.Contains(string(opus.Capabilities), `"image_input":{"supported":false}`) {
+		t.Errorf("opus capabilities = %s, want image_input supported false", opus.Capabilities)
+	}
+}
+
+func TestModelsAnthropicPagination(t *testing.T) {
+	proxyServer := newProxy(t, serviceToken,
+		anthropicInstance("https://anthropic.example", "key", map[string]string{
+			"sonnet": "m1",
+			"opus":   "m2",
+			"fable":  "m3",
+			"haiku":  "m4",
+		}),
+	)
+	allIDs := []string{"claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-haiku-4-5"}
+
+	cases := []struct {
+		name    string
+		query   string
+		ids     []string
+		hasMore bool
+	}{
+		{"default", "", allIDs, false},
+		{"limit 2", "?limit=2", allIDs[:2], true},
+		{"after first", "?after_id=" + allIDs[0], allIDs[1:], false},
+		{"after first with limit", "?after_id=" + allIDs[0] + "&limit=2", allIDs[1:3], true},
+		{"after last", "?after_id=" + allIDs[3], nil, false},
+		{"after unknown", "?after_id=nope", nil, false},
+		{"before last with limit", "?before_id=" + allIDs[3] + "&limit=2", allIDs[1:3], true},
+		{"before second", "?before_id=" + allIDs[1] + "&limit=2", allIDs[:1], false},
+		{"before first", "?before_id=" + allIDs[0], nil, false},
+		{"before unknown", "?before_id=nope", nil, false},
+		{"lifecycle active", "?lifecycle=active", allIDs, false},
+		{"lifecycle repeated", "?lifecycle=active&lifecycle=retired", allIDs, false},
+		{"lifecycle comma", "?lifecycle=active,retired", allIDs, false},
+		{"lifecycle deprecated", "?lifecycle=deprecated", nil, false},
+		{"lifecycle retired", "?lifecycle=retired", nil, false},
+		{"limit max", "?limit=1000", allIDs, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := send(t, http.MethodGet, proxyServer.URL+"/anthropic/v1/models"+tc.query, "", withAuth(config.ProtocolAnthropic, nil))
+			list := decodeAnthropicModelList(t, resp)
+			ids := make([]string, 0, len(list.Data))
+			for _, item := range list.Data {
+				ids = append(ids, item.ID)
+			}
+			if len(ids) != len(tc.ids) {
+				t.Fatalf("ids = %v, want %v", ids, tc.ids)
+			}
+			for i := range ids {
+				if ids[i] != tc.ids[i] {
+					t.Fatalf("ids = %v, want %v", ids, tc.ids)
+				}
+			}
+			if list.HasMore != tc.hasMore {
+				t.Errorf("has_more = %v, want %v", list.HasMore, tc.hasMore)
+			}
+			if len(tc.ids) == 0 {
+				if list.FirstID != nil || list.LastID != nil {
+					t.Errorf("empty page first_id/last_id = %v/%v, want null/null", list.FirstID, list.LastID)
+				}
+				return
+			}
+			if list.FirstID == nil || *list.FirstID != tc.ids[0] {
+				t.Errorf("first_id = %v, want %q", list.FirstID, tc.ids[0])
+			}
+			if list.LastID == nil || *list.LastID != tc.ids[len(tc.ids)-1] {
+				t.Errorf("last_id = %v, want %q", list.LastID, tc.ids[len(tc.ids)-1])
+			}
+		})
+	}
+}
+
+func TestModelsAnthropicInvalidQuery(t *testing.T) {
+	proxyServer := newProxy(t, serviceToken,
+		anthropicInstance("https://anthropic.example", "key", map[string]string{"sonnet": "m1"}),
+	)
+	queries := []string{
+		"?limit=0",
+		"?limit=-1",
+		"?limit=1001",
+		"?limit=abc",
+		"?limit=",
+		"?lifecycle=foo",
+		"?lifecycle=",
+		"?lifecycle=active,deprecated,retired,active",
+		"?before_id=a&after_id=b",
+	}
+	for _, query := range queries {
+		t.Run(query, func(t *testing.T) {
+			resp := send(t, http.MethodGet, proxyServer.URL+"/anthropic/v1/models"+query, "", withAuth(config.ProtocolAnthropic, nil))
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (body %q)", resp.StatusCode, readBody(t, resp))
+			}
+			apiErr := decodeAnthropicError(t, resp)
+			if apiErr.Error.Type != "invalid_request_error" {
+				t.Errorf("error.type = %q, want invalid_request_error", apiErr.Error.Type)
+			}
+		})
 	}
 }
 
@@ -1200,7 +1768,7 @@ func TestModelsAuthAndMethod(t *testing.T) {
 	})
 
 	t.Run("anthropic rejects wrong x-api-key", func(t *testing.T) {
-		resp := send(t, http.MethodGet, proxyServer.URL+"/v1/models", "", map[string]string{
+		resp := send(t, http.MethodGet, proxyServer.URL+"/anthropic/v1/models", "", map[string]string{
 			"x-api-key": "wrong-token",
 		})
 		if resp.StatusCode != http.StatusUnauthorized {
@@ -1221,6 +1789,120 @@ func TestModelsAuthAndMethod(t *testing.T) {
 		}
 		if apiErr := decodeOpenAIError(t, resp); apiErr.Error.Code != "method_not_allowed" {
 			t.Errorf("error.code = %q, want method_not_allowed", apiErr.Error.Code)
+		}
+	})
+
+	t.Run("anthropic models post is rejected with anthropic error", func(t *testing.T) {
+		resp := send(t, http.MethodPost, proxyServer.URL+"/anthropic/v1/models", "", withAuth(config.ProtocolAnthropic, nil))
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("status = %d, want 405", resp.StatusCode)
+		}
+		if got := resp.Header.Get("Allow"); got != http.MethodGet {
+			t.Errorf("Allow = %q, want GET", got)
+		}
+		if apiErr := decodeAnthropicError(t, resp); apiErr.Error.Type != "invalid_request_error" {
+			t.Errorf("error.type = %q, want invalid_request_error", apiErr.Error.Type)
+		}
+	})
+}
+
+// TestModelsSchemaIsDecidedByPath covers §22.3/§22.8: neither entrypoint may
+// switch schema based on the credential header.
+func TestModelsSchemaIsDecidedByPath(t *testing.T) {
+	proxyServer := newProxy(t, serviceToken,
+		openAIInstance("https://openai.example", "openai-key", "gpt-a"),
+		anthropicInstance("https://anthropic.example", "anthropic-key", map[string]string{"sonnet": "claude-a"}),
+	)
+
+	type openAIShape struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string          `json:"id"`
+			Type    json.RawMessage `json:"type"`
+			OwnedBy string          `json:"owned_by"`
+		} `json:"data"`
+	}
+	type anthropicShape struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Type string `json:"type"`
+		} `json:"data"`
+		HasMore bool    `json:"has_more"`
+		FirstID *string `json:"first_id"`
+	}
+
+	openAICases := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{"bearer", withAuth(config.ProtocolOpenAI, nil)},
+		{"x-api-key", map[string]string{"x-api-key": serviceToken}},
+	}
+	for _, tc := range openAICases {
+		t.Run("v1/models with "+tc.name+" is openai", func(t *testing.T) {
+			resp := send(t, http.MethodGet, proxyServer.URL+"/v1/models", "", tc.headers)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body %q)", resp.StatusCode, readBody(t, resp))
+			}
+			var list openAIShape
+			body := readBody(t, resp)
+			if err := json.Unmarshal([]byte(body), &list); err != nil {
+				t.Fatalf("response is not JSON: %v (body %q)", err, body)
+			}
+			if list.Object != "list" || len(list.Data) != 1 || list.Data[0].ID != "gpt-a" {
+				t.Fatalf("openai list = %+v, want object=list data=[gpt-a]", list)
+			}
+			if len(list.Data[0].Type) != 0 || list.Data[0].OwnedBy != "model-router" {
+				t.Errorf("entry = %+v, want OpenAI base shape without type", list.Data[0])
+			}
+		})
+	}
+
+	anthropicCases := []struct {
+		name    string
+		headers map[string]string
+	}{
+		{"x-api-key", withAuth(config.ProtocolAnthropic, nil)},
+		{"bearer", map[string]string{"Authorization": "Bearer " + serviceToken}},
+	}
+	for _, tc := range anthropicCases {
+		t.Run("anthropic/v1/models with "+tc.name+" is anthropic", func(t *testing.T) {
+			resp := send(t, http.MethodGet, proxyServer.URL+"/anthropic/v1/models", "", tc.headers)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body %q)", resp.StatusCode, readBody(t, resp))
+			}
+			var list anthropicShape
+			body := readBody(t, resp)
+			if err := json.Unmarshal([]byte(body), &list); err != nil {
+				t.Fatalf("response is not JSON: %v (body %q)", err, body)
+			}
+			if len(list.Data) != 1 || list.Data[0].ID != "claude-sonnet-5" || list.Data[0].Type != "model" {
+				t.Fatalf("anthropic list = %+v, want one claude-sonnet-5 model entry", list)
+			}
+			if list.FirstID == nil || *list.FirstID != "claude-sonnet-5" {
+				t.Errorf("first_id = %v, want claude-sonnet-5", list.FirstID)
+			}
+		})
+	}
+
+	t.Run("anthropic/v1/models without credentials uses anthropic error", func(t *testing.T) {
+		resp := send(t, http.MethodGet, proxyServer.URL+"/anthropic/v1/models", "", nil)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", resp.StatusCode)
+		}
+		if apiErr := decodeAnthropicError(t, resp); apiErr.Error.Type != "authentication_error" {
+			t.Errorf("error.type = %q, want authentication_error", apiErr.Error.Type)
+		}
+	})
+
+	t.Run("anthropic chat completions is not served", func(t *testing.T) {
+		resp := send(t, http.MethodPost, proxyServer.URL+"/anthropic/v1/chat/completions", `{}`,
+			withAuth(config.ProtocolOpenAI, nil))
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", resp.StatusCode)
+		}
+		if apiErr := decodeOpenAIError(t, resp); apiErr.Error.Code != "not_found" {
+			t.Errorf("error.code = %q, want not_found", apiErr.Error.Code)
 		}
 	})
 }
@@ -1886,6 +2568,252 @@ func TestProbeModels(t *testing.T) {
 	})
 }
 
+func TestProbeModelsCapabilities(t *testing.T) {
+	server, _ := newAdminServer(t, adminTestConfig)
+
+	t.Run("adopts declared metadata while keeping models", func(t *testing.T) {
+		upstream, _, _ := newBackend(t, http.StatusOK, nil, `{"data":[
+			{"id":"m1","max_input_tokens":1000000,"max_tokens":128000,
+			 "capabilities":{"image_input":{"supported":true},"pdf_input":{"supported":false},
+			                 "thinking":{"supported":true},"structured_outputs":{"supported":true}}},
+			{"id":"m2","capabilities":{"image_input":{"supported":false}}},
+			{"id":"m3"},
+			{"id":"m4","max_input_tokens":-5,"max_tokens":0}
+		]}`)
+		resp := sendBasic(t, http.MethodPost, server.URL+"/api/probe/models",
+			probeBody("anthropic", upstream.URL, "k"), "admin", "secret")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		var result struct {
+			Models       []string                          `json:"models"`
+			Capabilities map[string]config.ModelCapability `json:"capabilities"`
+		}
+		if err := json.Unmarshal([]byte(readBody(t, resp)), &result); err != nil {
+			t.Fatalf("response is not JSON: %v", err)
+		}
+		if want := []string{"m1", "m2", "m3", "m4"}; !reflect.DeepEqual(result.Models, want) {
+			t.Errorf("models = %v, want %v", result.Models, want)
+		}
+		want := map[string]config.ModelCapability{
+			"m1": {
+				MaxInputTokens:    1000000,
+				MaxTokens:         128000,
+				ImageInput:        boolPtr(true),
+				PDFInput:          boolPtr(false),
+				Thinking:          boolPtr(true),
+				StructuredOutputs: boolPtr(true),
+			},
+			"m2": {ImageInput: boolPtr(false)},
+		}
+		if !reflect.DeepEqual(result.Capabilities, want) {
+			t.Errorf("capabilities = %#v, want %#v", result.Capabilities, want)
+		}
+	})
+
+	t.Run("absent metadata omits capabilities field", func(t *testing.T) {
+		upstream, _, _ := newBackend(t, http.StatusOK, nil, `{"data":[{"id":"m1"}]}`)
+		resp := sendBasic(t, http.MethodPost, server.URL+"/api/probe/models",
+			probeBody("openai", upstream.URL, "k"), "admin", "secret")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		body := readBody(t, resp)
+		if strings.Contains(body, "capabilities") {
+			t.Errorf("body = %q, want capabilities omitted", body)
+		}
+		if !strings.Contains(body, `"models":["m1"]`) {
+			t.Errorf("body = %q, want models unchanged", body)
+		}
+	})
+
+	t.Run("malformed metadata does not fail the probe", func(t *testing.T) {
+		upstream, _, _ := newBackend(t, http.StatusOK, nil,
+			`{"data":[{"id":"m1","max_input_tokens":"lots"},{"id":"m2"}]}`)
+		resp := sendBasic(t, http.MethodPost, server.URL+"/api/probe/models",
+			probeBody("anthropic", upstream.URL, "k"), "admin", "secret")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		body := readBody(t, resp)
+		if !strings.Contains(body, `"models":["m1","m2"]`) {
+			t.Errorf("body = %q, want model ids preserved", body)
+		}
+		if strings.Contains(body, "capabilities") {
+			t.Errorf("body = %q, want malformed capabilities ignored", body)
+		}
+	})
+
+	t.Run("Anthropic official schema still parses", func(t *testing.T) {
+		upstream, _, _ := newBackend(t, http.StatusOK, nil, `{"data":[{
+			"id":"m1","max_input_tokens":200000,"max_tokens":64000,
+			"capabilities":{"image_input":{"supported":true},"pdf_input":{"supported":false},
+			                 "thinking":{"supported":true},"structured_outputs":{"supported":false}}
+		}]}`)
+		resp := sendBasic(t, http.MethodPost, server.URL+"/api/probe/models",
+			probeBody("anthropic", upstream.URL, "k"), "admin", "secret")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		var result struct {
+			Capabilities map[string]config.ModelCapability `json:"capabilities"`
+		}
+		if err := json.Unmarshal([]byte(readBody(t, resp)), &result); err != nil {
+			t.Fatalf("response is not JSON: %v", err)
+		}
+		want := map[string]config.ModelCapability{
+			"m1": {
+				MaxInputTokens:    200000,
+				MaxTokens:         64000,
+				ImageInput:        boolPtr(true),
+				PDFInput:          boolPtr(false),
+				Thinking:          boolPtr(true),
+				StructuredOutputs: boolPtr(false),
+			},
+		}
+		if !reflect.DeepEqual(result.Capabilities, want) {
+			t.Errorf("capabilities = %#v, want %#v", result.Capabilities, want)
+		}
+	})
+
+	t.Run("adopts DeepSeek-style metadata aliases", func(t *testing.T) {
+		upstream, _, _ := newBackend(t, http.StatusOK, nil, `{"object":"list","data":[
+			{"id":"deepseek-flash","name":"DeepSeek-V4.1-Flash","context_window":1048576,
+			 "max_output_tokens":393216,"input_modalities":["text","image"],"output_modalities":["text"],
+			 "effort":{"supported_levels":["low","high","max"],"default_level":"high"},
+			 "api_capabilities":{"anthropic_messages":{"system_prompt_update":"in-history","tool_update":"addition-only"}}},
+			{"id":"deepseek-v4-pro","name":"DeepSeek-V4-Pro","context_window":1048576,
+			 "max_output_tokens":393216,"input_modalities":["text"],"output_modalities":["text"]}
+		]}`)
+		resp := sendBasic(t, http.MethodPost, server.URL+"/api/probe/models",
+			probeBody("openai", upstream.URL, "k"), "admin", "secret")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		var result struct {
+			Models       []string                          `json:"models"`
+			Capabilities map[string]config.ModelCapability `json:"capabilities"`
+		}
+		if err := json.Unmarshal([]byte(readBody(t, resp)), &result); err != nil {
+			t.Fatalf("response is not JSON: %v", err)
+		}
+		if want := []string{"deepseek-flash", "deepseek-v4-pro"}; !reflect.DeepEqual(result.Models, want) {
+			t.Errorf("models = %v, want %v", result.Models, want)
+		}
+		want := map[string]config.ModelCapability{
+			"deepseek-flash": {
+				MaxInputTokens: 1048576,
+				MaxTokens:      393216,
+				ImageInput:     boolPtr(true),
+				PDFInput:       boolPtr(false),
+				Thinking:       boolPtr(true),
+			},
+			"deepseek-v4-pro": {
+				MaxInputTokens: 1048576,
+				MaxTokens:      393216,
+				ImageInput:     boolPtr(false),
+				PDFInput:       boolPtr(false),
+			},
+		}
+		if !reflect.DeepEqual(result.Capabilities, want) {
+			t.Errorf("capabilities = %#v, want %#v", result.Capabilities, want)
+		}
+	})
+
+	t.Run("supports remaining alias spellings", func(t *testing.T) {
+		upstream, _, _ := newBackend(t, http.StatusOK, nil, `{"data":[
+			{"id":"context-length","context_length":111,"maxTokens":222},
+			{"id":"camel-case","contextWindow":333,"maxOutputTokens":444},
+			{"id":"completion-cap","max_completion_tokens":555},
+			{"id":"top-provider","top_provider":{"max_completion_tokens":666}},
+			{"id":"limit","limit":{"context":777,"output":888}},
+			{"id":"effort-string","effort":"high"},
+			{"id":"reasoning","reasoning":{"supported_efforts":["low"]}},
+			{"id":"effort-empty","effort":""},
+			{"id":"effort-null","effort":null},
+			{"id":"fractional","context_window":1.5,"max_output_tokens":2.0}
+		]}`)
+		resp := sendBasic(t, http.MethodPost, server.URL+"/api/probe/models",
+			probeBody("openai", upstream.URL, "k"), "admin", "secret")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		var result struct {
+			Capabilities map[string]config.ModelCapability `json:"capabilities"`
+		}
+		if err := json.Unmarshal([]byte(readBody(t, resp)), &result); err != nil {
+			t.Fatalf("response is not JSON: %v", err)
+		}
+		want := map[string]config.ModelCapability{
+			"context-length": {MaxInputTokens: 111, MaxTokens: 222},
+			"camel-case":     {MaxInputTokens: 333, MaxTokens: 444},
+			"completion-cap": {MaxTokens: 555},
+			"top-provider":   {MaxTokens: 666},
+			"limit":          {MaxInputTokens: 777, MaxTokens: 888},
+			"effort-string":  {Thinking: boolPtr(true)},
+			"reasoning":      {Thinking: boolPtr(true)},
+		}
+		if !reflect.DeepEqual(result.Capabilities, want) {
+			t.Errorf("capabilities = %#v, want %#v", result.Capabilities, want)
+		}
+	})
+
+	t.Run("Anthropic official fields win over aliases", func(t *testing.T) {
+		upstream, _, _ := newBackend(t, http.StatusOK, nil, `{"data":[{
+			"id":"m1","max_input_tokens":1000,"max_tokens":100,
+			"context_window":2000000,"max_output_tokens":200000,
+			"limit":{"context":9999,"output":9999},
+			"top_provider":{"max_completion_tokens":9999},
+			"capabilities":{"image_input":{"supported":false},"pdf_input":{"supported":true},
+			                 "thinking":{"supported":false},"structured_outputs":{"supported":true}},
+			"input_modalities":["text","image"],"effort":{"default_level":"high"}
+		}]}`)
+		resp := sendBasic(t, http.MethodPost, server.URL+"/api/probe/models",
+			probeBody("anthropic", upstream.URL, "k"), "admin", "secret")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		var result struct {
+			Capabilities map[string]config.ModelCapability `json:"capabilities"`
+		}
+		if err := json.Unmarshal([]byte(readBody(t, resp)), &result); err != nil {
+			t.Fatalf("response is not JSON: %v", err)
+		}
+		want := map[string]config.ModelCapability{
+			"m1": {
+				MaxInputTokens:    1000,
+				MaxTokens:         100,
+				ImageInput:        boolPtr(false),
+				PDFInput:          boolPtr(true),
+				Thinking:          boolPtr(false),
+				StructuredOutputs: boolPtr(true),
+			},
+		}
+		if !reflect.DeepEqual(result.Capabilities, want) {
+			t.Errorf("capabilities = %#v, want %#v", result.Capabilities, want)
+		}
+	})
+
+	t.Run("MTI entry without metadata omits capabilities", func(t *testing.T) {
+		upstream, _, _ := newBackend(t, http.StatusOK, nil, `{"data":[
+			{"id":"mti-pro","object":"model","created":1626777600,"owned_by":"deepseek",
+			 "supported_endpoint_types":["openai"]}
+		]}`)
+		resp := sendBasic(t, http.MethodPost, server.URL+"/api/probe/models",
+			probeBody("openai", upstream.URL, "k"), "admin", "secret")
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		body := readBody(t, resp)
+		if !strings.Contains(body, `"models":["mti-pro"]`) {
+			t.Errorf("body = %q, want models returned", body)
+		}
+		if strings.Contains(body, "capabilities") {
+			t.Errorf("body = %q, want capabilities omitted", body)
+		}
+	})
+}
+
 type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
@@ -1919,7 +2847,7 @@ func requestLogLine(t *testing.T, logs string) string {
 	t.Helper()
 
 	for _, line := range strings.Split(logs, "\n") {
-		if strings.Contains(line, " -> ") && strings.Contains(line, " from ") {
+		if strings.Contains(line, " from ") && strings.Count(line, " ") > 4 {
 			return line
 		}
 	}
@@ -1997,6 +2925,94 @@ func TestRequestLogFormat(t *testing.T) {
 	assertInOrder(t, line, []string{
 		" -> ", "/deepseek-v4-pro (opus[1m])", " in ", "↑31", "↓300", "from ",
 	})
+}
+
+// TestNonAICallOmitsTokenSegment covers §23 D1: a call that never reached a
+// route (favicon, health probe, unknown path) prints neither the model segment
+// nor the "↑n/a ↓n/a" token segment.
+func TestNonAICallOmitsTokenSegment(t *testing.T) {
+	backend, _, _ := newBackend(t, http.StatusOK, nil, `{"ok":true}`)
+	instance := anthropicInstance(backend.URL, anthropicKey, map[string]string{"sonnet": "model-a"})
+	instance.Name = "MTI"
+	proxyServer := newProxy(t, serviceToken, instance)
+	logs := captureLogs(t)
+
+	resp := send(t, http.MethodGet, proxyServer.URL+"/favicon.ico", "", map[string]string{
+		"x-api-key":  serviceToken,
+		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+	})
+	_ = resp.Body.Close()
+
+	line := logLineContaining(t, waitForLog(t, logs, "GET /favicon.ico in "), "GET /favicon.ico in ")
+	for _, want := range []string{"GET /favicon.ico in ", " from 127.0.0.1 Mozilla/5.0"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("log line missing %q: %s", want, line)
+		}
+	}
+	// §23: a call that never reached a route prints neither the model segment
+	// nor the token segment.
+	for _, unwanted := range []string{" -> ", "↑", "↓", "n/a"} {
+		if strings.Contains(line, unwanted) {
+			t.Errorf("non-AI call must not print %q: %s", unwanted, line)
+		}
+	}
+}
+
+// TestAllCandidatesFailedLogsAttempt covers §23 R3: when every upstream
+// candidate fails before a response is written, the "status=502 all candidates
+// failed" summary is preceded by a D2 request log naming the last candidate.
+func TestAllCandidatesFailedLogsAttempt(t *testing.T) {
+	closedBackend := func() string {
+		server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		closedURL := server.URL
+		server.Close()
+		return closedURL
+	}
+	first := openAIInstance(closedBackend(), openAIKey, "gpt-x")
+	first.Name = "FIRST"
+	last := openAIInstance(closedBackend(), openAIKey, "gpt-x")
+	last.Name = "LAST"
+	proxyServer := newProxy(t, serviceToken, first, last)
+	logs := captureLogs(t)
+
+	resp := send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions", `{"model":"gpt-x"}`,
+		withAuth(config.ProtocolOpenAI, nil))
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("proxy status = %d, want 502", resp.StatusCode)
+	}
+	_ = resp.Body.Close()
+
+	lines := strings.Split(waitForLog(t, logs, "status=502 all candidates failed"), "\n")
+	summary, request := -1, -1
+	for i, line := range lines {
+		if strings.Contains(line, "status=502 all candidates failed") {
+			summary = i
+		}
+		if strings.Contains(line, "POST /v1/chat/completions -> LAST/gpt-x (gpt-x) in ") {
+			request = i
+		}
+	}
+	if request < 0 {
+		t.Fatalf("no request log line for the last candidate in:\n%s", strings.Join(lines, "\n"))
+	}
+	if summary < 0 {
+		t.Fatalf("no 502 summary line in:\n%s", strings.Join(lines, "\n"))
+	}
+	if request > summary {
+		t.Errorf("request log line must precede the 502 summary")
+	}
+	line := lines[request]
+	for _, want := range []string{" -> LAST/gpt-x (gpt-x) in ", " from "} {
+		if !strings.Contains(line, want) {
+			t.Errorf("failed-candidate log line missing %q: %s", want, line)
+		}
+	}
+	// D2: no usage was produced, so the token segment is omitted.
+	for _, unwanted := range []string{"↑", "↓"} {
+		if strings.Contains(line, unwanted) {
+			t.Errorf("failed-candidate log line must not print %q: %s", unwanted, line)
+		}
+	}
 }
 
 func TestClientIdentification(t *testing.T) {
@@ -2095,12 +3111,20 @@ func TestAuthFailureIsLoggedWithoutSecrets(t *testing.T) {
 		t.Fatalf("proxy status = %d, want 401", resp.StatusCode)
 	}
 
-	line := requestLogLine(t, waitForLog(t, logs, " -> "))
+	line := logLineContaining(t, waitForLog(t, logs, "POST /v1/chat/completions in "),
+		"POST /v1/chat/completions in ")
 	for _, want := range []string{
-		" -> n/a/n/a (n/a) in ", "↑n/a ↓n/a from 203.0.113.9 claude-code/2.1.323",
+		"POST /v1/chat/completions in ", " from 203.0.113.9 claude-code/2.1.323",
 	} {
 		if !strings.Contains(line, want) {
 			t.Errorf("401 log line missing %q: %s", want, line)
+		}
+	}
+	// §23: a rejected call never reached a route, so neither the model segment
+	// nor the token segment appears.
+	for _, unwanted := range []string{" -> ", "↑", "↓", "n/a"} {
+		if strings.Contains(line, unwanted) {
+			t.Errorf("401 log line must not print %q: %s", unwanted, line)
 		}
 	}
 	if strings.Contains(line, serviceToken) || strings.Contains(line, openAIKey) {

@@ -17,7 +17,19 @@
         "api_key": "sk-replace-with-your-deepseek-key",
         "provider": "deepseek",
         "timeout": "15s",
-        "models": ["deepseek-chat", "deepseek-reasoner"]
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "model_capabilities": {
+          "deepseek-chat": {
+            "max_input_tokens": 1000000,
+            "max_tokens": 128000,
+            "image_input": true
+          },
+          "deepseek-reasoner": {
+            "max_input_tokens": 1000000,
+            "max_tokens": 128000,
+            "thinking": true
+          }
+        }
       }
     ],
     "anthropic": [
@@ -32,6 +44,27 @@
           "opus": "deepseek-v4-pro",
           "fable": "deepseek-v4-pro",
           "haiku": "deepseek-v4-flash"
+        },
+        "role_names": {
+          "sonnet": "claude-sonnet-5",
+          "opus": "claude-opus-5",
+          "fable": "claude-fable-5",
+          "haiku": "claude-haiku-4-5"
+        },
+        "model_capabilities": {
+          "deepseek-v4-flash": {
+            "max_input_tokens": 1000000,
+            "max_tokens": 128000,
+            "image_input": true,
+            "thinking": true
+          },
+          "deepseek-v4-pro": {
+            "max_input_tokens": 1000000,
+            "max_tokens": 128000,
+            "image_input": true,
+            "thinking": true,
+            "structured_outputs": true
+          }
         }
       },
       {
