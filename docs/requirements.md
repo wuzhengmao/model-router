@@ -13,15 +13,18 @@
 ## 2. 功能需求（FR）
 
 ### FR-1 监听与协议入口
-- 监听一个（或多个，后续扩展）指定端口。
+- 监听一个指定端口（配置项 `listen`）。
+  > ~~监听一个（或多个，后续扩展）指定端口~~——**多端口监听已取消**（2026-11-15 用户确认）：实际需求是单个监听端口同时承载两个协议入口；确需多端口时启动多个实例即可。
 - 提供 OpenAPI 标准协议入口（对应独立 path，如 `/v1/chat/completions`）。
 - 提供 Anthropic 标准协议入口（对应独立 path，如 `/v1/messages`）。
 - 两个协议互不转换，各自只对接各自兼容协议的后端模型。
 
 ### FR-2 模型发现与选择
-- 能自动查询后端可用模型（如调用后端 `/v1/models`），并据此选择/过滤可用模型。
-- 每种协议维护一个**有序**的模型列表，可配置排序。
-- Anthropic 协议下模型可按类别分组（如 `sonnet` / `opus`），组内各自有序；回退时优先在组内、再跨组。
+- ~~能自动查询后端可用模型（如调用后端 `/v1/models`），并据此选择/过滤可用模型。~~
+  > **自动查询后端模型已取消**（2026-11-15 用户确认）：模型由配置显式声明。运行时的 `/v1/models` 只聚合配置里声明的 `models`/`roles`（§8.2）；配置页的「查询模型」是管理面辅助功能（§9.4 `probe/models`），不参与运行时路由。
+- 每种协议维护一个**有序**的实例/模型列表，可配置排序（M3.1 起以「实例」为粒度，见 §9）。
+- ~~Anthropic 协议下模型可按类别分组（如 `sonnet` / `opus`），组内各自有序；回退时优先在组内、再跨组。~~
+  > **「组内有序 / 跨组回退」已取消**（2026-11-15 用户确认）：该需求演进为 `roles` 角色映射（§7.8「模型角色映射」）+ 实例顺序候选链（§11.2）。即：同一角色由声明该角色的实例承担，回退按 `instances` 的配置顺序逐级下移，不存在「组内排序」这一层结构。
 
 ### FR-3 回退与降级（核心）
 > 下述为规格化的状态机，默认参数见 §4。多模型"链式降级"的确切边界见 §5 开放问题 D-1。
@@ -75,12 +78,12 @@
 
 > 以上参数均可通过配置覆盖（配置方式在 M1 阶段为静态配置文件，后续为 Web 页面）。
 
-## 5. 开放问题（待 Claude Code 在设计文档中给出方案）
+## 5. 开放问题（已全部关闭）
 
-- **D-1 链式降级**：持续回退态中，若备用模型（M1）自身也连续失败，是否继续降级到 M2、M3…？默认倾向：是（沿列表链式下移）；需在设计文档明确状态迁移与恢复规则。
-- **D-2 token/s 统计口径**：✅ 已定（§15.4）——流式按「首个数据块 → 末个数据块」计算纯生成速度，非流式按响应体读取时长近似；不设滑动窗口，每次请求独立判定，输出 token <20 或生成时长 <1s 时跳过判定。
-- **D-3 并发回退一致性**：多并发请求下，失败计数、回退态、回退计时器如何共享与加锁。
-- **D-4 配置热更新**：M1 静态配置文件是否支持运行时热加载（后续 Web 配置必然需要）。
+- **D-1 链式降级**：✅ 已定（§11.2）——沿 `instances` 配置顺序逐级下移，即链式降级；每级独立按原始请求的 model/角色判断，不继承中间改写。
+- **D-2 token/s 统计口径**：✅ 已定（§15.4）——流式按「首个数据块 → 末个数据块」计算纯生成速度，非流式按响应体读取时长近似；不设滑动窗口，输出 token <100 或生成时长 <2s 时跳过判定；另有 §19 实时低速检测（10s 滑动字节窗口）用于流式中途判定。
+- **D-3 并发回退一致性**：✅ 已定（§11.3）——每个实例一份状态（`consecutiveFailures` / `degradedUntil`），由 `sync.Mutex` 统一保护（`internal/proxy/proxy.go` 的 `Handler.mu`）。
+- **D-4 配置热更新**：✅ 已定（§8.5）——`POST /api/reload` 重新读取 `-config` 指定文件，校验通过后原子切换 handler（`atomic.Pointer`），失败保留旧配置。
 
 ## 6. 里程碑规划
 
@@ -88,9 +91,11 @@
 |---|---|---|
 | M1 | 项目骨架 + 单模型透传壳子（OpenAI 协议）+ 服务访问认证（FR-4）+ 静态配置 + 构建脚本（先 windows amd64） | 已完成 |
 | M2 | 增加 Anthropic 协议入口 + 多模型列表与排序（含 matches/roles 模型映射） | 已完成 |
-| M3 | 模型自动查询/选择（`/v1/models`）+ Web 配置页面 | 未开始 |
-| M4 | 回退/降级机制（FR-3 完整实现） | 未开始 |
-| M5 | 跨平台构建（GitHub Actions）+ Docker（amd64/arm64） | 未开始 |
+| M3 | `/v1/models`（按配置聚合）+ Web 配置页面 + 环境变量覆盖 + 供应商预设 | 已完成 |
+| M4 | 回退/降级机制（FR-3 完整实现，实例粒度）+ fallback 可配置 + 实时低速检测 + gzip 解压修复 | 已完成 |
+| M5 | 跨平台构建（GitHub Actions）+ Docker（amd64/arm64） | 已完成 |
+
+> 全部里程碑已于 0.1.0（2026-11-15）交付。三项原始需求（多端口监听、自动查询后端模型、Anthropic 组内/跨组回退）已确认取消，见 §2。容器镜像发布名为 `wuzm219/model-router`。
 
 ## 7. M2 增量规格
 
@@ -829,7 +834,7 @@ M4 验收后，用户要求两点配置结构修正：
 - **build job（matrix 6 组合）**：`os=[windows-latest, ubuntu-latest, macos-latest]` × `arch=[amd64, arm64]`；步骤：checkout → `actions/setup-go`（go-version 从 `go.mod` 或固定 `1.27.x`）→ `go build -trimpath -ldflags "-s -w -X model-router/internal/version.Version=$VERSION" -o dist/model-router-$VERSION-$GOOS-$GOARCH[.exe]` → `actions/upload-artifact`（6 个产物，命名一致）。
 - **版本号**：从 `internal/version/version.txt` 读取；tag 触发时以 tag 去 `v` 前缀作为版本（如 `v0.0.1` → `0.0.1`），非 tag 用文件值。
 - **release job（仅 tag）**：`softprops/action-gh-release` 或 `gh release create` 上传 6 个产物。
-- **docker job（仅 ubuntu-latest）**：`docker/setup-buildx-action` → `docker buildx build --platform linux/amd64,linux/arm64`，tag 时推 `ghcr.io/<owner>/model-router:<version>` 与 `:latest`；非 tag 只构建不推送。
+- **docker job（仅 ubuntu-latest）**：`docker/setup-buildx-action` → `docker buildx build --platform linux/amd64,linux/arm64`，tag 时推 `wuzm219/model-router:<version>` 与 `:latest`（Docker Hub）；非 tag 只构建不推送。
 - Go 模块缓存（`actions/setup-go` 自带），失败即终止。
 
 ### 14.3 Dockerfile
@@ -843,7 +848,7 @@ M4 验收后，用户要求两点配置结构修正：
 
 ### 14.4 docker-compose.yml
 
-- 服务 `model-router`：`build: .` 或 `image: ghcr.io/.../model-router:0.0.1-rc`；`ports: ["18080:18080"]`；`volumes: ["./.docker:/home/nonroot/config:rw"]`；`environment` 可放 `MODEL_ROUTER_LISTEN=0.0.0.0:18080` 等。
+- 服务 `model-router`：`build: .` 或 `image: wuzm219/model-router:0.1.0`；`ports: ["18080:18080"]`；`volumes: ["./.docker:/home/nonroot/config:rw"]`；`environment` 可放 `MODEL_ROUTER_LISTEN=0.0.0.0:18080` 等。
 - `restart: unless-stopped`。
 - 作为部署示例，不强制要求生产配置。
 

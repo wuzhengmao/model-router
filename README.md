@@ -288,7 +288,7 @@ bash build-all.sh
 
 - 纯 Go，`CGO_ENABLED=0`。版本号唯一来源 `internal/version/version.txt`，构建脚本通过 `-ldflags -X` 注入。
 - 产物命名 `model-router-<version>-<os>-<arch>[.exe]`；`build.sh` 可用 `GOOS`/`GOARCH` 覆盖平台。
-- GitHub Actions（`.github/workflows/build.yml`）在 push / PR / tag `v*` 上运行 6 组合构建并上传产物；tag 时创建 GitHub Release，并在 ubuntu runner 上用 buildx 构建 `linux/amd64,linux/arm64` 镜像推送 `ghcr.io/<owner>/model-router:<version>` 与 `:latest`。
+- GitHub Actions（`.github/workflows/build.yml`）在 push / PR / tag `v*` 上运行 6 组合构建并上传产物；tag 时创建 GitHub Release，并在 ubuntu runner 上用 buildx 构建 `linux/amd64,linux/arm64` 镜像推送 `wuzm219/model-router:<version>` 与 `:latest`。
 
 ## Docker 部署
 
@@ -296,11 +296,11 @@ bash build-all.sh
 
 ```bash
 # 本地构建并运行（需要挂载配置文件）
-docker build -t model-router:0.1.0 .
+docker build -t wuzm219/model-router:0.1.0 .
 docker run -d --name model-router -p 18080:18080 \
   -e MODEL_ROUTER_LISTEN=0.0.0.0:18080 \
   -v "$PWD/.docker:/home/nonroot/config:rw" \
-  model-router:0.1.0
+  wuzm219/model-router:0.1.0
 
 curl -sS http://127.0.0.1:18080/v1/models -H "Authorization: Bearer <auth_token>"
 ```
@@ -314,7 +314,8 @@ docker compose logs -f model-router
 
 - 镜像内入口固定为 `/model-router -config /home/nonroot/config/config.json`，配置文件由挂载目录 `./.docker` 提供（主机 `.docker/config.json`）；配置含真实密钥，请勿提交。
 - 容器默认 `MODEL_ROUTER_LISTEN=0.0.0.0:18080`；也可用 `MODEL_ROUTER_AUTH_TOKEN` 等环境变量覆盖顶层配置（§8.9）。
-- 多架构构建：`docker buildx build --platform linux/amd64,linux/arm64 -t <tag> .`（Dockerfile 使用 `TARGETARCH`/`TARGETOS` build args）。
+- 镜像仓库名：`wuzm219/model-router`（Docker Hub）。CI tag 构建推 `wuzm219/model-router:<version>` 与 `:latest`。
+- 多架构构建：`docker buildx build --platform linux/amd64,linux/arm64 -t wuzm219/model-router:<version> .`（Dockerfile 使用 `TARGETARCH`/`TARGETOS` build args）。
 - 镜像不包含健康检查；生产环境请置于 TLS 反向代理之后。
 
 ## 目录结构

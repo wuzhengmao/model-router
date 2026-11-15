@@ -462,7 +462,7 @@ OpenAI：`{"error":{"message","type","code"}}`；Anthropic：`{"type":"error","e
 - `build` job：matrix 6 个组合（windows-latest/windows、ubuntu-latest/linux、macos-latest/darwin 各配 amd64/arm64）；`actions/setup-go@v5` 使用 `1.27.x` 与模块缓存；`CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X ...Version=${version}"` 产出 `dist/model-router-<version>-<goos>-<goarch>[.exe]`，逐组合上传 artifact（同名规则）。
 - 版本解析：读取 `internal/version/version.txt`；`refs/tags/v*` 时取 tag 去掉 `v` 前缀。每一步用 bash（windows-latest 亦使用 Git Bash），`fail-fast: true`。
 - `release` job：仅 tag，`needs: build`；下载全部 artifact 合并后由 `softprops/action-gh-release@v2` 发布。
-- `docker` job：ubuntu-latest；checkout → 解析版本与镜像名（`ghcr.io/<owner>/model-router`，仓库名小写化）→ `docker/setup-buildx-action` → tag 时登录 GHCR → `docker/build-push-action` 构建 `linux/amd64,linux/arm64`；tag 时推送 `:<version>` 与 `:latest`，非 tag 只构建不推送。`GITHUB_TOKEN` 仅需 `packages: write`/`contents: read`。
+- `docker` job：ubuntu-latest；checkout → 解析版本与镜像名（固定为 `wuzm219/model-router`，Docker Hub）→ `docker/setup-buildx-action` → tag 时登录 Docker Hub（`DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN`，未配置则跳过推送） → `docker/build-push-action` 构建 `linux/amd64,linux/arm64`；tag 时推送 `:<version>` 与 `:latest`，非 tag 只构建不推送。无需 `packages: write`；凭证走 Docker Hub secrets，缺省时只构建不推送。
 
 ### 21.2 Dockerfile
 

@@ -245,7 +245,7 @@ go test -race ./internal/proxy
 | ET-1602 | Workflow 内容 | 人工检查 matrix/trigger/permissions | 6 组合（windows/linux/darwin × amd64/arm64）；push+PR+tag；tag release；docker 双架构推 GHCR |
 | ET-1603 | 本地全平台构建 | `bash build-all.sh` | `dist/` 下 6 个 `model-router-0.0.1-rc-<os>-<arch>[.exe]`，退出码 0 |
 | ET-1604 | Compose 语法 | `docker compose config --quiet` | 退出码 0 |
-| ET-1605 | Docker 镜像构建 | `docker build -t model-router:m5-test .` | 成功（golang:1.27-alpine → distroless nonroot） |
+| ET-1605 | Docker 镜像构建 | `docker build -t wuzm219/model-router:m5-test .` | 成功（golang:1.27-alpine → distroless nonroot） |
 | ET-1606 | 容器运行与 /v1/models | 挂载测试配置运行容器，`curl /v1/models -H "Authorization: Bearer <token>"` | 200 + 本地生成的模型列表；无 token → 401；容器 `User=nonroot:nonroot` |
 | ET-1607 | 版本 | 构建产物 `-version` | `0.0.1-rc` |
 | ET-1608 | actionlint（可选） | `actionlint` | 若本机存在则通过；本次环境未安装，以 PyYAML 解析为准 |
