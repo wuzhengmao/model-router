@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 一键构建脚本：构建当前平台（M1 为 windows/amd64）的可执行文件，产物输出到 bin/。
+# 一键构建脚本：构建当前平台（M1 为 windows/amd64）的可执行文件，产物输出到 dist/。
 # 用法：
 #   bash build.sh                 # 当前平台
 #   GOOS=linux GOARCH=arm64 bash build.sh
@@ -22,7 +22,7 @@ if [[ "$GOOS" == "windows" ]]; then
   EXT=".exe"
 fi
 
-OUT_DIR="bin"
+OUT_DIR="dist"
 OUT="${OUT_DIR}/model-router-${VERSION}-${GOOS}-${GOARCH}${EXT}"
 mkdir -p "$OUT_DIR"
 
