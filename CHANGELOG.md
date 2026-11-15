@@ -23,6 +23,11 @@
 - 版本号升为 `0.1.0`（开发阶段最后一个小版本，正式发布前仍可能调整）。
 - 容器时区默认 `Asia/Shanghai`（Dockerfile 打入 `tzdata` 与 `zoneinfo/Asia/Shanghai`，`ENV TZ=Asia/Shanghai`），`docker logs` 时间与宿主机一致。
 - 文档示例与占位符统一使用中性名称（`DeepSeek` / `192.0.2.10` / `claude-cli`），不再出现私有环境名称。
+- 容器镜像名统一为 `wuzm219/model-router`（Docker Hub）：`docker-compose.yml`、README 示例、CI 推送目标同步；CI 的 `docker` job 改为登录 Docker Hub（`DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`），未配置凭证时只构建不推送。
+
+### Removed
+
+- 三项原始需求确认取消并已在 `docs/requirements.md` 标注：多端口监听（FR-1）、自动查询后端可用模型（FR-2）、Anthropic「组内有序 / 跨组回退」（FR-2，已由 `roles` 角色映射 + 实例顺序候选链取代）。
 
 ### Fixed
 
