@@ -153,6 +153,190 @@ func TestLoadNormalizesAnthropicRoles(t *testing.T) {
 	}
 }
 
+func TestRoleNamesConfig(t *testing.T) {
+	cfg, err := config.Parse([]byte(`{
+		"auth_token": "t",
+		"instances": {
+			"anthropic": [{
+				"base_url": "https://example.com",
+				"api_key": "k",
+				"roles": {"sonnet": "mti-pro", "haiku": "mti-flash"},
+				"role_names": {" Sonnet ": " claude-sonnet-6 ", "HAIKU": "claude-haiku-5"}
+			}]
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	want := map[string]string{
+		"sonnet": "claude-sonnet-6",
+		"haiku":  "claude-haiku-5",
+	}
+	if got := cfg.Instances[0].RoleNames; !reflect.DeepEqual(got, want) {
+		t.Errorf("role_names = %v, want %v (keys lowercased, values trimmed)", got, want)
+	}
+
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if !strings.Contains(string(data), `"role_names":{`) {
+		t.Errorf("marshalled config lost role_names: %s", data)
+	}
+	reparsed, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("reparse config: %v", err)
+	}
+	if got := reparsed.Instances[0].RoleNames; !reflect.DeepEqual(got, want) {
+		t.Errorf("reparsed role_names = %v, want %v", got, want)
+	}
+}
+
+func TestRoleNamesConfigRejectsInvalid(t *testing.T) {
+	cases := map[string]string{
+		"wildcard_key": `{"sonnet": "claude-sonnet-6", "*": "claude-any"}`,
+		"unknown_role": `{"gemini": "claude-gemini-5"}`,
+		"empty_value":  `{"sonnet": "   "}`,
+	}
+	for name, roleNames := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := writeConfig(t, `{
+				"auth_token": "t",
+				"instances": {"anthropic": [{
+					"base_url": "https://example.com",
+					"api_key": "k",
+					"roles": {"sonnet": "mti-pro"},
+					"role_names": `+roleNames+`
+				}]}
+			}`)
+			if _, err := config.Load(path); err == nil {
+				t.Fatalf("load config succeeded, want role_names error for %s", name)
+			}
+		})
+	}
+}
+
+func TestModelCapabilitiesConfig(t *testing.T) {
+	cfg, err := config.Parse([]byte(`{
+		"auth_token": "t",
+		"instances": {
+			"anthropic": [{
+				"base_url": "https://example.com",
+				"api_key": "k",
+				"roles": {"sonnet": "mti-pro", "haiku": "mti-flash"},
+				"model_capabilities": {
+					"mti-pro": {
+						"max_input_tokens": 1000000,
+						"max_tokens": 128000,
+						"image_input": true,
+						"pdf_input": false,
+						"thinking": true,
+						"structured_outputs": true
+					},
+					" mti-flash ": {"max_input_tokens": 0, "image_input": false}
+				}
+			}]
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	capabilities := cfg.Instances[0].ModelCapabilities
+	if len(capabilities) != 2 {
+		t.Fatalf("model_capabilities = %v, want 2 entries", capabilities)
+	}
+	pro, ok := capabilities["mti-pro"]
+	if !ok {
+		t.Fatalf("model_capabilities missing mti-pro: %v", capabilities)
+	}
+	if pro.MaxInputTokens != 1000000 || pro.MaxTokens != 128000 {
+		t.Errorf("mti-pro tokens = %d/%d, want 1000000/128000", pro.MaxInputTokens, pro.MaxTokens)
+	}
+	if pro.ImageInput == nil || !*pro.ImageInput {
+		t.Errorf("mti-pro image_input = %v, want true", pro.ImageInput)
+	}
+	if pro.PDFInput == nil || *pro.PDFInput {
+		t.Errorf("mti-pro pdf_input = %v, want false", pro.PDFInput)
+	}
+	if pro.Thinking == nil || !*pro.Thinking || pro.StructuredOutputs == nil || !*pro.StructuredOutputs {
+		t.Errorf("mti-pro thinking/structured_outputs = %v/%v, want true/true", pro.Thinking, pro.StructuredOutputs)
+	}
+	flash, ok := capabilities["mti-flash"]
+	if !ok {
+		t.Fatalf("model_capabilities key was not trimmed: %v", capabilities)
+	}
+	if flash.MaxInputTokens != 0 || flash.ImageInput == nil || *flash.ImageInput {
+		t.Errorf("mti-flash = %+v, want zero window and image_input false", flash)
+	}
+
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	for _, want := range []string{
+		`"model_capabilities":{`,
+		`"max_input_tokens":1000000`,
+		`"image_input":true`,
+		`"pdf_input":false`,
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("marshalled config missing %s: %s", want, data)
+		}
+	}
+	reparsed, err := config.Parse(data)
+	if err != nil {
+		t.Fatalf("reparse config: %v", err)
+	}
+	if got := reparsed.Instances[0].ModelCapabilities; !reflect.DeepEqual(got, capabilities) {
+		t.Errorf("reparsed model_capabilities = %v, want %v", got, capabilities)
+	}
+}
+
+func TestModelCapabilitiesConfigRejectsInvalid(t *testing.T) {
+	cases := map[string]string{
+		"negative_max_input_tokens": `{"m": {"max_input_tokens": -1}}`,
+		"negative_max_tokens":       `{"m": {"max_tokens": -1}}`,
+		"empty_model_name":          `{"  ": {"image_input": true}}`,
+	}
+	for name, capabilities := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := writeConfig(t, `{
+				"auth_token": "t",
+				"instances": {"anthropic": [{
+					"base_url": "https://example.com",
+					"api_key": "k",
+					"roles": {"sonnet": "m"},
+					"model_capabilities": `+capabilities+`
+				}]}
+			}`)
+			if _, err := config.Load(path); err == nil {
+				t.Fatalf("load config succeeded, want model_capabilities error for %s", name)
+			}
+		})
+	}
+}
+
+func TestModelCapabilitiesAllowedOnOpenAIInstance(t *testing.T) {
+	cfg, err := config.Parse([]byte(`{
+		"auth_token": "t",
+		"instances": {
+			"openai": [{
+				"base_url": "https://example.com",
+				"api_key": "k",
+				"models": ["gpt-a"],
+				"model_capabilities": {"gpt-a": {"max_tokens": 4096, "thinking": true}}
+			}]
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	capability := cfg.Instances[0].ModelCapabilities["gpt-a"]
+	if capability.MaxTokens != 4096 || capability.Thinking == nil || !*capability.Thinking {
+		t.Errorf("gpt-a capability = %+v, want max_tokens 4096 and thinking true", capability)
+	}
+}
+
 func TestFallbackExplicit(t *testing.T) {
 	path := writeConfig(t, `{
 		"auth_token": "t",
@@ -483,18 +667,18 @@ func TestLoadRejectsInvalidInstance(t *testing.T) {
 		group    string
 		instance string
 	}{
-		"missing_base_url":       {config.ProtocolOpenAI, `{"api_key": "k", "models": ["m"]}`},
-		"relative_base_url":      {config.ProtocolOpenAI, `{"base_url": "api.example.com", "api_key": "k", "models": ["m"]}`},
-		"missing_api_key":        {config.ProtocolOpenAI, `{"base_url": "https://example.com", "models": ["m"]}`},
-		"openai_missing_models":  {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k"}`},
-		"openai_empty_models":    {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k", "models": ["", "  "]}`},
-		"openai_with_roles":      {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k", "models": ["m"], "roles": {"sonnet": "x"}}`},
+		"missing_base_url":        {config.ProtocolOpenAI, `{"api_key": "k", "models": ["m"]}`},
+		"relative_base_url":       {config.ProtocolOpenAI, `{"base_url": "api.example.com", "api_key": "k", "models": ["m"]}`},
+		"missing_api_key":         {config.ProtocolOpenAI, `{"base_url": "https://example.com", "models": ["m"]}`},
+		"openai_missing_models":   {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k"}`},
+		"openai_empty_models":     {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k", "models": ["", "  "]}`},
+		"openai_with_roles":       {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k", "models": ["m"], "roles": {"sonnet": "x"}}`},
 		"anthropic_missing_roles": {config.ProtocolAnthropic, `{"base_url": "https://example.com", "api_key": "k"}`},
-		"anthropic_with_models":  {config.ProtocolAnthropic, `{"base_url": "https://example.com", "api_key": "k", "roles": {"sonnet": "x"}, "models": ["m"]}`},
-		"anthropic_invalid_role": {config.ProtocolAnthropic, `{"base_url": "https://example.com", "api_key": "k", "roles": {"gemini": "x"}}`},
-		"anthropic_empty_model":  {config.ProtocolAnthropic, `{"base_url": "https://example.com", "api_key": "k", "roles": {"sonnet": "  "}}`},
-		"invalid_timeout":        {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k", "models": ["m"], "timeout": "soon"}`},
-		"unknown_provider":       {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k", "provider": "nope", "models": ["m"]}`},
+		"anthropic_with_models":   {config.ProtocolAnthropic, `{"base_url": "https://example.com", "api_key": "k", "roles": {"sonnet": "x"}, "models": ["m"]}`},
+		"anthropic_invalid_role":  {config.ProtocolAnthropic, `{"base_url": "https://example.com", "api_key": "k", "roles": {"gemini": "x"}}`},
+		"anthropic_empty_model":   {config.ProtocolAnthropic, `{"base_url": "https://example.com", "api_key": "k", "roles": {"sonnet": "  "}}`},
+		"invalid_timeout":         {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k", "models": ["m"], "timeout": "soon"}`},
+		"unknown_provider":        {config.ProtocolOpenAI, `{"base_url": "https://example.com", "api_key": "k", "provider": "nope", "models": ["m"]}`},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -11,7 +11,7 @@ var versionFile string
 
 // Version is injected by the build script via
 //
-//	go build -ldflags "-X model-router/internal/version.Version=0.1.0"
+//	go build -ldflags "-X model-router/internal/version.Version=0.1.1"
 //
 // and left empty for plain `go run` / `go build` runs, which fall back to
 // version.txt so the version has exactly one source of truth.

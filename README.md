@@ -2,13 +2,13 @@
 
 OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理透传。
 
-> 当前版本：`0.1.0`（M4.6：gzip 解压修复 + 实时低速检测 + 实例 name 日志 + 请求日志 in/out/速度）
+> 当前版本：`0.1.1`（M6 能力申明、M7 协议路径分离、§23 日志三档、gzip 与低速检测等）
 > 需求：[docs/requirements.md](docs/requirements.md) ｜ 设计：[docs/design.md](docs/design.md) ｜ 测试：[docs/tests.md](docs/tests.md) ｜ 变更：[CHANGELOG.md](CHANGELOG.md)
 
 ## 能力范围（M1 ～ M4）
 
-- 两个协议入口，互不转换：`POST /v1/chat/completions`（OpenAI）、`POST /v1/messages`（Anthropic）。
-- **服务访问认证**：OpenAI 入口 `Authorization: Bearer <auth_token>`；Anthropic 入口 `x-api-key: <auth_token>` 或 `Authorization: Bearer <auth_token>`（双认证，任一匹配即通过）；失败 401（按入口协议错误体）。
+- 两个协议入口，互不转换：`POST /v1/chat/completions`（OpenAI）、`POST /v1/messages` 与 `POST /anthropic/v1/messages`（Anthropic，行为一致）。
+- **服务访问认证**：`/v1/chat/completions` 仅 `Authorization: Bearer <auth_token>`；Anthropic 入口与两个模型列表入口接受 `x-api-key: <auth_token>` 或 `Authorization: Bearer <auth_token>`（双认证，任一匹配即通过）；失败 401（按入口协议错误体）。
 - **实例化配置**：配置 `instances` 按协议分组为 `openai` / `anthropic` 两个有序数组；每个实例 = `base_url` + `api_key` + `timeout`，并声明自己的模型映射（OpenAI 用 `models` 数组，Anthropic 用 `roles` 对象）。
 - **回退参数可配置**：顶层 `fallback` 对象可设置 `failure_threshold`（默认 3）、`degrade_duration`（默认 `5m`）、`first_token_timeout`（默认 `10s`，0=禁用）、`min_tokens_per_second`（默认 30，0=禁用吞吐判定）、`idle_timeout`（默认 `30s`，0=禁用流式空闲超时）。
 - **供应商预设**：内置 11 个供应商（deepseek/openai/anthropic/zhipu/volcengine/moonshot/dashscope/siliconflow/groq/mistral/xai）。实例可用可选 `provider` 标记来源；`provider` 只影响「查询模型」的端点判定（通用 `models_override` 机制），不影响路由/转发。
@@ -21,7 +21,7 @@ OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理
 - **透传**：方法、路径、查询串、请求体（别名/角色命中时仅改顶层 `model`）与非认证请求头原样转发；响应原样回传，SSE 逐块 flush。
 - **上游认证分离**：OpenAI 实例使用 `Authorization: Bearer <api_key>`，Anthropic 实例使用 `x-api-key: <api_key>`；客户端 token 永不外传。
 - **请求日志**：每个请求打印 `req_model`（客户端原始模型）、`model`（实际转发模型）、`client`（客户端标识，十一级识别）、`ip`（来源 IP）与 `total`/`ttft`/`in`/`out`/`gen`（`gen` 满足吞吐门槛才显示数值，否则 `n/a`）。
-- **模型列表 `/v1/models`**：本地聚合配置声明（OpenAI 返回 `models` 值；Anthropic 返回已声明的角色名 `sonnet`/`opus`/`fable`/`haiku`，固定顺序、不含 `*`），按认证头判定协议并返回对应格式；不调上游。
+- **模型列表（路径决定格式）**：`GET /v1/models` 固定返回 OpenAI 格式（含可选能力字段），`GET /anthropic/v1/models` 固定返回 Anthropic 官方 schema；不调上游。
 - **Web 配置页 `/admin`**：可视化模式（回退参数输入框、OpenAI/Anthropic 双 tab、添加实例时先选供应商或自定义、实例卡片可拖动排序、测试连接、查询上游模型、勾选/手动填写）+ JSON 高级模式（含 `fallback` 与分组 `instances`；校验通过才可保存）。
 - **管理 API**：`GET/PUT /api/config`、`POST /api/reload`、`POST /api/config/validate`、`POST /api/probe/test`、`POST /api/probe/models`、`GET /api/providers`；HTTP Basic Auth。
 - **手动重载**：重读 `-config` 文件并原子切换，进程不重启；失败保留旧配置。
@@ -54,7 +54,10 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
            "api_key": "sk-...",
            "provider": "deepseek",
            "timeout": "15s",
-           "models": ["deepseek-chat", "deepseek-reasoner"]
+           "models": ["deepseek-chat", "deepseek-reasoner"],
+           "model_capabilities": {
+             "deepseek-chat": {"max_input_tokens": 1000000, "max_tokens": 128000, "image_input": true}
+           }
          }
        ],
        "anthropic": [
@@ -177,7 +180,7 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
 | 场景 | 行为 |
 |---|---|
 | `/v1/chat/completions` | 只使用 openai 实例展开的条目 |
-| `/v1/messages` | 只使用 anthropic 实例展开的条目 |
+| `/v1/messages`、`/anthropic/v1/messages` | 只使用 anthropic 实例展开的条目（同一 handler；后者仅本地多 `/anthropic` 前缀） |
 | 该协议没有实例 | 502（按入口协议错误体） |
 | 请求 `model` 精确命中条目的模型（R4a） | 转发该条目，**不改写** |
 | 请求 `model` 命中具体角色（R4c） | 转发并改写顶层 `model` 为该条目实际模型 |
@@ -206,19 +209,42 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
   - 首字节等待仍由实例 `timeout` 控制；`idle_timeout=0` 禁用空闲判定。
 - 回退状态仅在进程内存；重启或 reload（重建 handler）后清零。
 
-## 模型列表 `/v1/models`
+## 模型列表
+
+**路径决定格式，与认证头无关**（§22.3）：
 
 ```bash
-# OpenAI 格式
+# OpenAI 格式（Bearer 或 x-api-key 均可）
 curl -sS http://127.0.0.1:18080/v1/models -H "Authorization: Bearer <auth_token>"
-# Anthropic 格式（仅带 x-api-key 时）
 curl -sS http://127.0.0.1:18080/v1/models -H "x-api-key: <auth_token>"
+
+# Anthropic 官方格式（x-api-key 或 Bearer 均可）
+curl -sS http://127.0.0.1:18080/anthropic/v1/models -H "x-api-key: <auth_token>"
+curl -sS http://127.0.0.1:18080/anthropic/v1/models -H "Authorization: Bearer <auth_token>"
 ```
 
-- OpenAI：收集 openai 实例的 `models` 值，按实例顺序、出现顺序去重。
-- Anthropic：返回**预定义角色名** `sonnet`/`opus`/`fable`/`haiku`（不是 `roles` 映射的实际模型名），只返回至少有一个 anthropic 实例声明的角色，固定顺序、去重，不返回 `*`。客户端据此发角色名，代理再经 `roles` 映射到真实模型。
-- 仅 GET；其他方法 405。
-- 同时带两种认证头时按 OpenAI 处理。
+### OpenAI 入口 `/v1/models`
+
+- 收集 openai 实例的 `models` 值，按实例顺序、出现顺序去重；同名模型只出现一次。
+- 基础四字段：`id`、`object:"model"`、`created`、`owned_by:"model-router"`。
+- 配置了 `model_capabilities` 的模型追加（同时输出两套别名，值相同）：
+
+| 字段 | 来源 | 未声明时 |
+|---|---|---|
+| `context_window` / `max_input_tokens` | `max_input_tokens` | 省略 |
+| `max_output_tokens` / `max_tokens` | `max_tokens` | 省略 |
+| `input_modalities` | `image_input`/`pdf_input` | 省略（至少一个 `true` 才输出） |
+
+- 能力取**第一个声明该模型的实例**；该实例未声明能力时继续向后找。全部未声明 → 只输出基础四字段。
+- `input_modalities` 恒含 `"text"`；`image_input=true` 追加 `"image"`，`pdf_input=true` 追加 `"pdf"`。例：`image_input=true,pdf_input=false` → `["text","image"]`；两者都 false 或未声明 → 省略。
+- 查询参数一律忽略。
+
+### Anthropic 入口 `/anthropic/v1/models`
+
+- 按官方 schema 返回 `data`/`first_id`/`last_id`/`has_more`；模型 id 为官方名（`claude-sonnet-5` / `claude-opus-5` / `claude-fable-5` / `claude-haiku-4-5`，可用 `role_names` 覆盖），含 `type`/`display_name`/`created_at`/`line`/`lifecycle`/`max_input_tokens`/`max_tokens`/`capabilities`/`deprecated_at`/`retires_at`。
+- 查询参数：`limit`（1–1000）、`before_id`/`after_id`、`lifecycle`（`active`/`deprecated`/`retired`）；非法参数 400（Anthropic 格式）。
+
+两入口均仅 GET；其他方法 405 + `Allow: GET`，错误体按路径协议。
 
 ## 管理页与管理 API
 
@@ -264,7 +290,7 @@ Anthropic 入口：`{"type":"error","error":{"type":"...","message":"..."}}`。
 |---|---|---|---|
 | 缺 / 错客户端 token | 401 | `invalid_request_error` + `missing_api_key` / `invalid_api_key` | `authentication_error` |
 | 未知路径 | 404 | `invalid_request_error` + `not_found` | — |
-| `/v1/models` 非 GET | 405 | `invalid_request_error` + `method_not_allowed` | `invalid_request_error` |
+| 模型列表入口非 GET | 405 | `invalid_request_error` + `method_not_allowed` | `invalid_request_error` |
 | 该协议无实例 | 502 | `server_error` + `upstream_error` | `api_error` |
 | 上游连接失败 / 超时 | 502 | `server_error` + `upstream_error` | `api_error` |
 | 请求体超限 | 413 | `invalid_request_error` + `request_too_large` | `request_too_large` |
@@ -275,15 +301,15 @@ Anthropic 入口：`{"type":"error","error":{"type":"...","message":"..."}}`。
 
 ```bash
 bash build.sh
-./dist/model-router-0.1.0-windows-amd64.exe -version
-# 输出：0.1.0
+./dist/model-router-0.1.1-windows-amd64.exe -version
+# 输出：0.1.1
 ```
 
 本地全平台构建（windows/linux/darwin × amd64/arm64，共 6 个产物）：
 
 ```bash
 bash build-all.sh
-# 输出汇总：dist/model-router-0.1.0-<os>-<arch>[.exe]
+# 输出汇总：dist/model-router-0.1.1-<os>-<arch>[.exe]
 ```
 
 - 纯 Go，`CGO_ENABLED=0`。版本号唯一来源 `internal/version/version.txt`，构建脚本通过 `-ldflags -X` 注入。
@@ -296,11 +322,11 @@ bash build-all.sh
 
 ```bash
 # 本地构建并运行（需要挂载配置文件）
-docker build -t wuzm219/model-router:0.1.0 .
+docker build -t wuzm219/model-router:0.1.1 .
 docker run -d --name model-router -p 18080:18080 \
   -e MODEL_ROUTER_LISTEN=0.0.0.0:18080 \
   -v "$PWD/.docker:/home/nonroot/config:rw" \
-  wuzm219/model-router:0.1.0
+  wuzm219/model-router:0.1.1
 
 curl -sS http://127.0.0.1:18080/v1/models -H "Authorization: Bearer <auth_token>"
 ```

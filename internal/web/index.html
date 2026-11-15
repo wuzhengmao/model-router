@@ -94,7 +94,37 @@
   .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
   .chip { display: inline-flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--border); border-radius: 999px; padding: 4px 10px; font-size: 12px; color: var(--text); }
   .chip input { width: auto; }
-  .roles { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-top: 12px; }
+  .roles { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-top: 12px; }
+  .role-cell { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; }
+  .role-inputs { display: flex; flex-direction: row; gap: 6px; }
+  .role-inputs input { flex: 1 1 0; min-width: 0; padding: 6px 8px; }
+  .role-inputs input.public-name { flex: 0.9 1 0; }
+  .caps { margin-top: 12px; }
+  .caps-grid { display: grid; gap: 6px; max-width: 760px; overflow-x: auto; }
+  .cap-head, .cap-row {
+    display: grid;
+    grid-template-columns: minmax(130px, 260px) 104px 104px repeat(4, 52px);
+    gap: 6px;
+    align-items: center;
+  }
+  @media (max-width: 820px) {
+    .caps-grid { max-width: none; }
+    .cap-head, .cap-row { grid-template-columns: minmax(120px, 1fr) 88px 88px repeat(4, 40px); }
+  }
+  .cap-head { color: var(--muted); font-size: 11px; }
+  .cap-head span { text-align: center; white-space: nowrap; }
+  .cap-head span:first-child { text-align: left; }
+  .cap-model { font-size: 12px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cap-row input { padding: 5px 8px; min-width: 0; }
+  .cap-row input[type="number"] { text-align: right; }
+  .cap-row input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    margin: 0;
+    justify-self: center;
+    accent-color: var(--accent);
+  }
   .empty { color: var(--muted); padding: 6px 0; }
   .inline-note { color: var(--muted); font-size: 12px; }
   .modal {
@@ -254,6 +284,14 @@
     haiku: 'haiku（轻量）',
     '*': '* 托底',
   };
+  var DEFAULT_ROLE_NAMES = {
+    sonnet: 'claude-sonnet-5',
+    opus: 'claude-opus-5',
+    fable: 'claude-fable-5',
+    haiku: 'claude-haiku-4-5',
+  };
+  var CAPABILITY_INT_KEYS = ['max_input_tokens', 'max_tokens'];
+  var CAPABILITY_BOOL_KEYS = ['image_input', 'pdf_input', 'thinking', 'structured_outputs'];
 
   var statusEl = document.getElementById('status');
   var visualPane = document.getElementById('visual-pane');
@@ -337,10 +375,33 @@
       timeout: '15s',
       models: [],
       roles: {},
+      role_names: {},
+      capabilities: {},
+      remoteCapabilities: {},
+      capErrors: {},
       remoteModels: [],
       result: '',
       resultKind: '',
     };
+  }
+
+  function normalizeCapability(raw) {
+    var capability = {};
+    if (!raw || typeof raw !== 'object') {
+      return capability;
+    }
+    CAPABILITY_INT_KEYS.forEach(function (key) {
+      var value = Math.floor(Number(raw[key]));
+      if (isFinite(value) && value > 0) {
+        capability[key] = value;
+      }
+    });
+    CAPABILITY_BOOL_KEYS.forEach(function (key) {
+      if (typeof raw[key] === 'boolean') {
+        capability[key] = raw[key];
+      }
+    });
+    return capability;
   }
 
   function normalizeInstance(raw, protocol) {
@@ -356,6 +417,22 @@
     if (raw.roles && typeof raw.roles === 'object') {
       Object.keys(raw.roles).forEach(function (key) {
         inst.roles[key] = String(raw.roles[key]);
+      });
+    }
+    if (raw.role_names && typeof raw.role_names === 'object') {
+      Object.keys(raw.role_names).forEach(function (role) {
+        var name = String(raw.role_names[role] || '').trim();
+        if (name !== '') {
+          inst.role_names[role] = name;
+        }
+      });
+    }
+    if (raw.model_capabilities && typeof raw.model_capabilities === 'object') {
+      Object.keys(raw.model_capabilities).forEach(function (model) {
+        var capability = normalizeCapability(raw.model_capabilities[model]);
+        if (Object.keys(capability).length > 0) {
+          inst.capabilities[model] = capability;
+        }
       });
     }
     return inst;
@@ -741,6 +818,7 @@
 
   function buildOpenAIPicker(inst, resultEl) {
     var wrap = document.createElement('div');
+    var capsSection = buildCapabilities(inst);
 
     var heading = document.createElement('h3');
     heading.textContent = '模型列表（勾选或手动输入）';
@@ -772,10 +850,12 @@
           if (inst.models.indexOf(model) === -1) {
             inst.models.push(model);
           }
+          mergeRemoteCapabilities(inst, model);
         } else {
           inst.models = inst.models.filter(function (item) { return item !== model; });
         }
         modelsInput.value = inst.models.join(', ');
+        capsSection.refresh();
         setResult(resultEl, inst.models.length ? '已选择 ' + inst.models.length + ' 个模型。' : '', '');
       });
     });
@@ -789,9 +869,249 @@
       Array.prototype.forEach.call(chips.querySelectorAll('input[type="checkbox"]'), function (box) {
         box.checked = inst.models.indexOf(box.value) !== -1;
       });
+      capsSection.refresh();
+    });
+    modelsInput.addEventListener('change', function () {
+      inst.models.forEach(function (model) {
+        mergeRemoteCapabilities(inst, model);
+      });
+      capsSection.refresh();
     });
 
+    wrap.appendChild(capsSection.element);
     return wrap;
+  }
+
+  function capabilityModels(inst) {
+    var models = [];
+    var seen = {};
+    function add(model) {
+      if (model && !seen[model]) {
+        seen[model] = true;
+        models.push(model);
+      }
+    }
+    if (inst.protocol === 'openai') {
+      inst.models.forEach(add);
+    } else {
+      ROLE_KEYS.forEach(function (role) { add(inst.roles[role]); });
+    }
+    Object.keys(inst.capabilities).forEach(add);
+    return models;
+  }
+
+  function ensureCapability(inst, model) {
+    if (!inst.capabilities[model]) {
+      inst.capabilities[model] = {};
+    }
+    return inst.capabilities[model];
+  }
+
+  function pruneCapability(inst, model) {
+    var capability = inst.capabilities[model];
+    if (capability && Object.keys(capability).length === 0) {
+      delete inst.capabilities[model];
+    }
+  }
+
+  function mergeRemoteCapabilities(inst, model) {
+    var remote = inst.remoteCapabilities[model];
+    if (!remote) {
+      return;
+    }
+    var capability = ensureCapability(inst, model);
+    Object.keys(remote).forEach(function (key) {
+      if (capability[key] === undefined) {
+        capability[key] = remote[key];
+      }
+    });
+    pruneCapability(inst, model);
+  }
+
+  function cleanCapability(raw) {
+    var capability = {};
+    if (!raw || typeof raw !== 'object') {
+      return capability;
+    }
+    CAPABILITY_INT_KEYS.forEach(function (key) {
+      var value = raw[key];
+      if (typeof value === 'number' && isFinite(value) && value > 0 && Math.floor(value) === value) {
+        capability[key] = value;
+      }
+    });
+    CAPABILITY_BOOL_KEYS.forEach(function (key) {
+      if (typeof raw[key] === 'boolean') {
+        capability[key] = raw[key];
+      }
+    });
+    return capability;
+  }
+
+  function capErrorKey(model, key) {
+    return model + '\u0000' + key;
+  }
+
+  function clearCapabilityField(inst, model, key) {
+    var capability = inst.capabilities[model];
+    if (!capability) {
+      return;
+    }
+    delete capability[key];
+    pruneCapability(inst, model);
+  }
+
+  function buildCapabilityNumberInput(inst, model, key, showErrors) {
+    var input = document.createElement('input');
+    input.type = 'number';
+    input.min = '0';
+    input.step = '1';
+    input.inputMode = 'numeric';
+    input.placeholder = key === 'max_input_tokens' ? '如 1000000' : '如 128000';
+    input.title = key;
+    var capability = inst.capabilities[model];
+    if (capability && capability[key] !== undefined) {
+      input.value = String(capability[key]);
+    }
+    input.addEventListener('input', function () {
+      var raw = input.value.trim();
+      var errorKey = capErrorKey(model, key);
+      if (raw === '') {
+        delete inst.capErrors[errorKey];
+        clearCapabilityField(inst, model, key);
+      } else {
+        var value = Number(raw);
+        if (!isFinite(value) || value < 0 || Math.floor(value) !== value) {
+          inst.capErrors[errorKey] = '模型能力：' + model + ' 的 ' + key + ' 必须是 ≥0 的整数';
+        } else {
+          delete inst.capErrors[errorKey];
+          if (value === 0) {
+            clearCapabilityField(inst, model, key);
+          } else {
+            ensureCapability(inst, model)[key] = value;
+          }
+        }
+      }
+      showErrors();
+    });
+    return input;
+  }
+
+  function buildCapabilityBoolInput(inst, model, key) {
+    var input = document.createElement('input');
+    input.type = 'checkbox';
+    input.title = key;
+    input.setAttribute('aria-label', model + ' ' + key);
+    var capability = inst.capabilities[model];
+    input.checked = !!(capability && capability[key] === true);
+    input.addEventListener('change', function () {
+      var target = ensureCapability(inst, model);
+      if (input.checked) {
+        target[key] = true;
+      } else {
+        delete target[key];
+      }
+      pruneCapability(inst, model);
+    });
+    return input;
+  }
+
+  function buildCapabilityRow(inst, model, showErrors) {
+    var row = document.createElement('div');
+    row.className = 'cap-row';
+
+    var name = document.createElement('span');
+    name.className = 'cap-model';
+    name.textContent = model;
+    name.title = model;
+    row.appendChild(name);
+
+    CAPABILITY_INT_KEYS.forEach(function (key) {
+      row.appendChild(buildCapabilityNumberInput(inst, model, key, showErrors));
+    });
+    CAPABILITY_BOOL_KEYS.forEach(function (key) {
+      row.appendChild(buildCapabilityBoolInput(inst, model, key));
+    });
+    return row;
+  }
+
+  function buildCapabilities(inst) {
+    var section = document.createElement('div');
+    section.className = 'caps';
+
+    var heading = document.createElement('h3');
+    heading.textContent = '模型能力（按上游模型名，留空表示未声明）';
+    section.appendChild(heading);
+
+    var grid = document.createElement('div');
+    grid.className = 'caps-grid';
+    section.appendChild(grid);
+
+    var errorEl = document.createElement('div');
+    errorEl.className = 'result';
+    section.appendChild(errorEl);
+
+    function showErrors() {
+      var keys = Object.keys(inst.capErrors);
+      errorEl.textContent = keys.length > 0 ? inst.capErrors[keys[0]] : '';
+      errorEl.className = 'result' + (keys.length > 0 ? ' err' : '');
+    }
+
+    var renderedModels = null;
+
+    function refresh() {
+      var models = capabilityModels(inst);
+      var present = {};
+      models.forEach(function (model) { present[model] = true; });
+      Object.keys(inst.capErrors).forEach(function (key) {
+        var model = key.slice(0, key.indexOf('\u0000'));
+        if (!present[model]) {
+          delete inst.capErrors[key];
+        }
+      });
+      showErrors();
+
+      var modelKey = models.join('\u0000');
+      if (modelKey === renderedModels) {
+        return;
+      }
+      renderedModels = modelKey;
+
+      grid.textContent = '';
+      if (models.length === 0) {
+        var empty = document.createElement('div');
+        empty.className = 'inline-note';
+        empty.textContent = inst.protocol === 'openai'
+          ? '先在模型列表中勾选或输入模型名（或点击「查询模型」后选择模型），这里会出现能力配置行。'
+          : '先在角色映射中填写上游模型名（或点击「查询模型」后选择模型），这里会出现能力配置行。';
+        grid.appendChild(empty);
+        return;
+      }
+
+      var head = document.createElement('div');
+      head.className = 'cap-head';
+      [
+        ['模型', '上游模型名'],
+        ['输入窗口', 'max_input_tokens'],
+        ['输出上限', 'max_tokens'],
+        ['图片', 'image_input'],
+        ['PDF', 'pdf_input'],
+        ['思考', 'thinking'],
+        ['结构化', 'structured_outputs'],
+      ].forEach(function (item) {
+        var cell = document.createElement('span');
+        cell.textContent = item[0];
+        cell.title = item[1];
+        head.appendChild(cell);
+      });
+      grid.appendChild(head);
+
+      models.forEach(function (model) {
+        grid.appendChild(buildCapabilityRow(inst, model, showErrors));
+      });
+    }
+
+    refresh();
+    return { element: section, refresh: refresh };
   }
 
   function buildAnthropicPicker(inst) {
@@ -810,22 +1130,74 @@
     });
     wrap.appendChild(datalist);
 
+    var capsSection = buildCapabilities(inst);
+
     var roles = document.createElement('div');
     roles.className = 'roles';
     ROLE_KEYS.forEach(function (role) {
-      var roleField = field(ROLE_LABELS[role], inst.roles[role] || '', role === '*' ? '托底模型（可选）' : '模型名');
-      roleField.input.setAttribute('list', datalistID);
-      roles.appendChild(roleField.label);
-      roleField.input.addEventListener('input', function () {
-        var value = roleField.input.value.trim();
+      var cell = document.createElement('label');
+      cell.className = 'role-cell';
+      var caption = document.createElement('span');
+      caption.textContent = ROLE_LABELS[role];
+      cell.appendChild(caption);
+
+      var inputs = document.createElement('div');
+      inputs.className = 'role-inputs';
+      var modelInput = document.createElement('input');
+      modelInput.type = 'text';
+      modelInput.placeholder = role === '*' ? '托底模型（可选）' : '上游模型';
+      modelInput.title = '上游实际模型名';
+      modelInput.value = inst.roles[role] || '';
+      modelInput.setAttribute('list', datalistID);
+      inputs.appendChild(modelInput);
+
+      var publicInput = null;
+      if (role !== '*') {
+        publicInput = document.createElement('input');
+        publicInput.type = 'text';
+        publicInput.className = 'public-name';
+        publicInput.placeholder = DEFAULT_ROLE_NAMES[role];
+        publicInput.title = '对外模型名（role_names），留空使用内置默认 ' + DEFAULT_ROLE_NAMES[role];
+        publicInput.value = inst.role_names[role] || '';
+        inputs.appendChild(publicInput);
+      }
+      cell.appendChild(inputs);
+      roles.appendChild(cell);
+
+      modelInput.addEventListener('input', function () {
+        var value = modelInput.value.trim();
         if (value === '') {
           delete inst.roles[role];
         } else {
           inst.roles[role] = value;
         }
       });
+      modelInput.addEventListener('change', function () {
+        var value = modelInput.value.trim();
+        if (value !== '') {
+          mergeRemoteCapabilities(inst, value);
+        }
+        capsSection.refresh();
+      });
+      if (publicInput) {
+        publicInput.addEventListener('input', function () {
+          var value = publicInput.value.trim();
+          if (value === '') {
+            delete inst.role_names[role];
+          } else {
+            inst.role_names[role] = value;
+          }
+        });
+      }
     });
     wrap.appendChild(roles);
+
+    var hint = document.createElement('p');
+    hint.className = 'hint';
+    hint.textContent = '每行左侧为上游实际模型，右侧为对外模型名（role_names）：留空使用内置官方名（如 claude-sonnet-5）。';
+    wrap.appendChild(hint);
+
+    wrap.appendChild(capsSection.element);
     return wrap;
   }
 
@@ -870,12 +1242,27 @@
     try {
       var data = await api('/api/probe/models', { method: 'POST', body: JSON.stringify(probePayload(inst)) });
       inst.remoteModels = (data && Array.isArray(data.models)) ? data.models : [];
-      inst.result = '已获取 ' + inst.remoteModels.length + ' 个上游模型。';
+      inst.remoteCapabilities = {};
+      if (data && data.capabilities && typeof data.capabilities === 'object') {
+        Object.keys(data.capabilities).forEach(function (model) {
+          var capability = normalizeCapability(data.capabilities[model]);
+          if (Object.keys(capability).length > 0) {
+            inst.remoteCapabilities[model] = capability;
+          }
+        });
+        capabilityModels(inst).forEach(function (model) {
+          mergeRemoteCapabilities(inst, model);
+        });
+      }
+      var capabilityCount = Object.keys(inst.remoteCapabilities).length;
+      inst.result = '已获取 ' + inst.remoteModels.length + ' 个上游模型' +
+        (capabilityCount > 0 ? '（' + capabilityCount + ' 个声明了能力元数据）' : '') + '。';
       inst.resultKind = 'ok';
       setResult(resultEl, inst.result, inst.resultKind);
       return true;
     } catch (err) {
       inst.remoteModels = [];
+      inst.remoteCapabilities = {};
       inst.result = '该上游不支持模型列表查询，请手动输入。（' + err.message + '）';
       inst.resultKind = 'err';
       setResult(resultEl, inst.result, inst.resultKind);
@@ -892,6 +1279,10 @@
       instances: { openai: [], anthropic: [] },
     };
     instances.forEach(function (inst) {
+      var capErrorKeys = Object.keys(inst.capErrors);
+      if (capErrorKeys.length > 0) {
+        throw new Error(inst.capErrors[capErrorKeys[0]]);
+      }
       var item = {
         base_url: inst.base_url.trim(),
         api_key: inst.api_key.trim(),
@@ -912,6 +1303,26 @@
       } else {
         item.roles = Object.assign({}, inst.roles);
         out.instances.anthropic.push(item);
+      }
+      var roleNames = {};
+      Object.keys(inst.role_names).forEach(function (role) {
+        var name = String(inst.role_names[role] || '').trim();
+        if (name !== '') {
+          roleNames[role] = name;
+        }
+      });
+      if (Object.keys(roleNames).length > 0) {
+        item.role_names = roleNames;
+      }
+      var capabilities = {};
+      Object.keys(inst.capabilities).forEach(function (model) {
+        var capability = cleanCapability(inst.capabilities[model]);
+        if (Object.keys(capability).length > 0) {
+          capabilities[model] = capability;
+        }
+      });
+      if (Object.keys(capabilities).length > 0) {
+        item.model_capabilities = capabilities;
       }
     });
     return out;

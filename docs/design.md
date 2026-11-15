@@ -10,6 +10,7 @@
 - **M3.1**：配置改为 `instances`（提供商实例 + 模型映射）、实例展开路由、可视化配置页、probe/validate API。
 - **M4.x**：实例粒度回退降级、`fallback` 配置、流式空闲超时、请求日志（客户端/来源 IP）、双认证、`[1m]` 变体、吞吐样本门槛（§18～§23）。
 - **M5**：跨平台构建与容器化（§21）。
+- **M6/M7**：模型列表对齐官方 schema、协议路径分离与 OpenAI 入口能力字段（§21、§22）。
 
 不做：协议转换（永不）。
 
@@ -68,7 +69,12 @@ Client                                model-router                         Upstr
         "api_key": "sk-...",
         "provider": "deepseek",
         "timeout": "15s",
-        "roles": {"sonnet": "deepseek-v4-flash", "opus": "deepseek-v4-pro", "*": "deepseek-chat"}
+        "roles": {"sonnet": "deepseek-v4-flash", "opus": "deepseek-v4-pro", "*": "deepseek-chat"},
+        "role_names": {"sonnet": "claude-sonnet-5"},
+        "model_capabilities": {
+          "deepseek-v4-flash": {"max_input_tokens": 1000000, "max_tokens": 128000, "image_input": true, "thinking": true},
+          "deepseek-v4-pro": {"max_input_tokens": 1000000, "max_tokens": 128000, "image_input": true, "thinking": true}
+        }
       }
     ]
   }
@@ -89,6 +95,8 @@ Client                                model-router                         Upstr
 | `instances.<protocol>[].timeout` | 否 | `15s` | Go duration，必须为正 |
 | `instances.openai[].models` | 是 | — | 去空白、丢弃空项、去重、保留顺序；至少 1 项；不得出现 `roles` |
 | `instances.anthropic[].roles` | 是 | — | 键 ∈ sonnet/opus/fable/haiku/*（小写归一化）；值去空白且非空；至少 1 项；不得出现 `models` |
+| `instances.anthropic[].role_names` | 否 | 空 | 键 ∈ sonnet/opus/fable/haiku（小写归一化，不允许 `*`）；值去空白且非空；非法键/空值启动失败 |
+| `instances.<protocol>[].model_capabilities` | 否 | 空 | 键为上游模型名（去空白且非空）；`max_input_tokens`/`max_tokens` ≥0（0 = 未声明）；四个能力字段为布尔；负值/空键启动失败 |
 
 实例不再有 `protocol` 字段：协议由所在分组决定；实例对象中出现 `protocol` 会被严格解码拒绝。
 
@@ -157,8 +165,9 @@ JSON 对象不保留键顺序，因此 anthropic 条目按固定顺序展开：`
 ## 6. 认证
 
 - 客户端认证（按入口）：
-  - `/v1/chat/completions`、`/v1/models`（OpenAI 判定）：`Authorization: Bearer <auth_token>`；
-  - `/v1/messages`（Anthropic 判定）：**双认证**——先取 `x-api-key` 匹配，否则回退 `Authorization: Bearer`；`/v1/models` 仅带 `x-api-key` 时按 Anthropic 处理；
+  - `/v1/chat/completions`：`Authorization: Bearer <auth_token>`；
+  - `/v1/messages`、`/anthropic/v1/messages`、`/anthropic/v1/models`：**双认证**——先取 `x-api-key` 匹配，否则回退 `Authorization: Bearer`；
+  - `/v1/models`：同为双认证（`x-api-key` 或 Bearer 均可，§22.3），但响应格式始终为 OpenAI，与认证头无关；
   - 常量时间比较（两个候选头各自 `subtle.ConstantTimeCompare`）；失败 401 按入口协议错误体。Anthropic 入口缺失凭据的文案为 `missing x-api-key or Authorization header`，有头但不匹配为 `invalid service access token`（§23.1）。
 - 认证先于路由：未认证访问未知路径 → 401（OpenAI 格式）。
 - 上游认证：openai 条目 `Authorization: Bearer <api_key>`；anthropic 条目 `x-api-key: <api_key>`；客户端 Authorization/x-api-key 均不进入上游。
@@ -168,7 +177,7 @@ JSON 对象不保留键顺序，因此 anthropic 条目按固定顺序展开：`
 | 维度 | 规则 |
 |---|---|
 | 方法 | 原样转发 |
-| 路径 | `base_url` + 原始请求路径（`url.JoinPath`） |
+| 路径 | `base_url` + 上游路径（`url.JoinPath`）：`/anthropic/v1/messages` 只在本地存在，上游仍收到 `/v1/messages`（§22.3）；其余入口原样 |
 | 查询串 | 原样附加 |
 | 请求头 | 剔除 hop-by-hop、`Content-Length`、`Authorization`、`x-api-key`（按协议替换）后复制 |
 | 请求体 | 路由前读入内存（≤10 MiB）；R4c/R4d 命中时仅改写顶层 `model`，其余发送原始字节 |
@@ -179,16 +188,49 @@ JSON 对象不保留键顺序，因此 anthropic 条目按固定顺序展开：`
 - `http.MaxBytesReader` 限制 10 MiB；超限 413 不转发；其他读取错误 400。
 - 每个实例一个 `http.Client`，`timeout` 作用于连接、TLS 握手、等待响应头；不设置总超时，避免截断 SSE。
 
-## 9. `/v1/models`
+## 9. 模型列表入口（`/v1/models` 与 `/anthropic/v1/models`）
 
-- 协议判定：同时带 `x-api-key` 且无 `Authorization` → Anthropic；其余 → OpenAI。
-- 仅 GET；其他 405（`Allow: GET`）。
-- 聚合：
-  - OpenAI：按实例顺序收集各实例 `models`，按出现顺序去重。
-  - Anthropic：返回已声明的**角色名**（`sonnet → opus → fable → haiku` 固定顺序，去重，不含 `*`），只要任一 anthropic 实例声明了该角色；不返回 `roles` 映射值（客户端用角色名请求，再由路由映射到实际模型）。
-- OpenAI 格式：`{"object":"list","data":[{"id","object":"model","created":<unix>,"owned_by":"model-router"}]}`。
-- Anthropic 格式：`{"data":[{"id","type":"model","display_name","created_at":"<RFC3339>"}],"has_more":false,"first_id","last_id"}`；空列表时 first/last 为 `""`。
-- 不调用上游。
+- 路径决定格式，与认证头无关（§22.3）：
+  - `GET /v1/models` → 固定 OpenAI 格式；
+  - `GET /anthropic/v1/models` → 固定 Anthropic 格式。
+- 两入口都仅 GET；其他 405（`Allow: GET`），错误体按路径所属协议。
+- 认证：两入口都先取 `x-api-key` 匹配，否则回退 `Authorization: Bearer`（§22.3 双认证）。
+- 不调用上游，本地应答。
+- OpenAI（§22.4）：
+  - 按 openai 实例顺序收集各实例 `models`，按出现顺序去重；模型 id 重叠时只出现一次。
+  - 基础四字段：`{"id","object":"model","created":<unix>,"owned_by":"model-router"}`。
+  - 能力字段（可选，同时输出两套别名，值相同）：
+
+    | 字段 | 来源（`model_capabilities[<模型>]`） | 未声明时 |
+    |---|---|---|
+    | `context_window` / `max_input_tokens` | `max_input_tokens` | 省略两字段 |
+    | `max_output_tokens` / `max_tokens` | `max_tokens` | 省略两字段 |
+    | `input_modalities` | 由 `image_input`/`pdf_input` 推导 | 至少一个为 `true` 才输出；否则省略 |
+
+  - 能力来源：按 openai 实例顺序找第一个声明该模型的 `model_capabilities`；首个声明该模型的实例未配能力时继续向后找；全部未声明 → 只输出基础四字段。
+  - `input_modalities` 构造：恒含 `"text"`；`image_input=true` 追加 `"image"`；`pdf_input=true` 追加 `"pdf"`；`false`/未声明不追加。两项均非 `true` → 整个字段省略。
+  - 所有查询参数一律忽略（含 Anthropic 专用参数）。
+- Anthropic（M6 §21 官方 schema）：
+  - 每个已声明角色返回一项，固定顺序 `sonnet → opus → fable → haiku`；`*` 不返回。
+  - `id` 优先取 `role_names`（按 anthropic 实例配置顺序的第一个声明），否则内置官方名：
+
+    | 角色 | id | display_name | created_at |
+    |---|---|---|---|
+    | sonnet | `claude-sonnet-5` | Claude Sonnet 5 | `2026-01-01T00:00:00Z` |
+    | opus | `claude-opus-5` | Claude Opus 5 | `2026-01-01T00:00:00Z` |
+    | fable | `claude-fable-5` | Claude Fable 5 | `2026-01-01T00:00:00Z` |
+    | haiku | `claude-haiku-4-5` | Claude Haiku 4.5 | `2025-10-01T00:00:00Z` |
+
+  - `display_name`/`created_at` 按 `id` 查内置表；不在表中的自定义 id 回退为 `display_name=id`、`created_at=当前时间`（RFC3339）。
+  - 恒定字段：`type="model"`、`lifecycle="active"`、`deprecated_at=null`、`retires_at=null`、`line=<角色>`。
+  - `max_input_tokens`/`max_tokens`：取该角色映射到的上游模型（首个声明该角色的实例的 `roles[角色]`）在**首个**声明该模型的 `model_capabilities` 中的值；未声明或 0 → `null`。
+  - `capabilities`：同一份声明中的 `image_input`/`pdf_input`/`thinking`/`structured_outputs`，每项输出 `{supported: <bool>}`；未声明的子项不输出；四项全未声明时整体为 `null`。
+  - 列表级：`data`、`first_id`、`last_id`、`has_more`；空页时 `first_id`/`last_id` 为 `null`。
+  - 查询参数：
+    - `limit`：1–1000，默认 20；非整数、0、负数、>1000 → 400。
+    - `before_id`/`after_id`：互斥，同时出现 → 400；未知 id → 空页（`data:[]`、`has_more:false`、first/last `null`）。`after_id` 从该 id 之后取 `limit` 条；`before_id` 取该 id 之前紧邻的 `limit` 条；`has_more` 表示翻页方向上仍有数据。
+    - `lifecycle`：可重复/逗号分隔，仅 `active`/`deprecated`/`retired`，最多 3 个；缺省为 `active`+`deprecated`。本代理只产生 `active`，故 `deprecated`/`retired` 过滤结果为空。
+  - 非法查询 → 400，错误体为 Anthropic 格式（`invalid_request_error`）。
 
 ## 10. 管理页、管理 API 与重载
 
@@ -198,7 +240,7 @@ JSON 对象不保留键顺序，因此 anthropic 条目按固定顺序展开：`
 - `POST /api/reload`：`config.Load` → `proxy.New` → `atomic.Pointer` 整体替换；失败保持旧状态。不重新绑定监听地址。
 - `GET /api/providers`：返回内置供应商清单（`providers.List()`），仅 GET。
 - `Server` 持有 `atomic.Pointer[serverState{cfg, handler}]`；每请求加载一次，在途请求使用旧 handler。
-- 管理页：可视化模式（双 tab、实例卡片、测试连接、查询模型、勾选/手填、保存）+ JSON 模式（校验通过才启用保存）。页面为内嵌静态资源。
+- 管理页：可视化模式（双 tab、实例卡片、测试连接、查询模型、勾选/手填、角色对外名、模型能力、保存）+ JSON 模式（校验通过才启用保存）。页面为内嵌静态资源。
 
 ## 11. Probe 与 Validate
 
@@ -225,7 +267,20 @@ JSON 对象不保留键顺序，因此 anthropic 条目按固定顺序展开：`
 - 请求体 `{protocol, base_url, api_key, provider?, timeout?}`；`provider` 非空且必须是已知 id，否则 400。
 - 默认 `GET {base_url}/v1/models`（openai `Authorization: Bearer`；anthropic `x-api-key` + `anthropic-version: 2023-06-01`）。
 - 若 `provider` 对该 `protocol` 声明了 `models_override`，改用 override 的 `base_url`，认证按 `override.auth`（`bearer` → `Authorization: Bearer`；`x-api-key` → `x-api-key` + `anthropic-version`）。解析 `data[].id`（跳过空 id）。
-- 成功 → 200 `{models:[...]}`；网络错误/非 2xx/无法解析/缺少 `data` → 502 `{error}`（前端引导手动输入）。`data: []` 视为合法的空列表。
+- 成功 → 200 `{models:[...], capabilities?:{<模型名>:{...}}}`；网络错误/非 2xx/无法解析/缺少 `data` → 502 `{error}`（前端引导手动输入）。`data: []` 视为合法的空列表。
+- `capabilities` 为 M6 新增的可选字段：按上游模型名收集能力元数据（同时识别 Anthropic 官方 schema 与 OpenAI/DeepSeek 风格字段名），形状与配置项 `model_capabilities` 一致；`models` 字段形状不变（向后兼容）。仅输出至少声明了一项元数据的模型，全部未声明时省略该字段。解析为 best-effort：能力元数据缺失或类型异常不影响 `models` 解析；窗口 `0`/负数不输出；`supported:false` 保留为显式 `false`。
+  字段兼容表（同一行从左到右取第一个可用值；Anthropic 官方字段与别名同时声明时官方字段优先）：
+
+  | 能力 | 字段名（按优先级） |
+  |---|---|
+  | 输入窗口 | `max_input_tokens` → `context_window` → `context_length` → `contextWindow` → `limit.context` |
+  | 输出上限 | `max_tokens` → `max_output_tokens` → `maxTokens` → `maxOutputTokens` → `max_completion_tokens` → `top_provider.max_completion_tokens` → `limit.output` |
+  | 图片输入 | `capabilities.image_input.supported`；未声明时回退 `input_modalities` 含 `image` |
+  | PDF 输入 | `capabilities.pdf_input.supported`；未声明时回退 `input_modalities` 含 `pdf` |
+  | 思考 | `capabilities.thinking.supported`；未声明时回退 `effort` 存在（对象或非空字符串）或 `reasoning` 字段存在 |
+  | 结构化输出 | 仅 `capabilities.structured_outputs.supported` |
+
+  `input_modalities` 数组存在即视为对输入模态的显式声明：不含 `image`/`pdf` 时输出显式 `false`；数组缺失时对应布尔字段未声明（不输出）。数值仅接受正整数 JSON 字面量，`0`、负数、小数、指数与字符串均视为未声明。
 - `404` 使用明确文案：`该上游不支持模型列表查询（未实现 /v1/models），请手动输入模型名`，而不是裸的 HTTP 状态码。
 - 响应体读取上限 4 MiB。
 
@@ -251,7 +306,7 @@ OpenAI：`{"error":{"message","type","code"}}`；Anthropic：`{"type":"error","e
 
 ## 13. 版本与构建
 
-- 版本唯一来源 `internal/version/version.txt`（`0.1.0`），构建脚本注入 `-ldflags -X`。
+- 版本唯一来源 `internal/version/version.txt`（`0.1.1`），构建脚本注入 `-ldflags -X`。
 - `CGO_ENABLED=0`、`-trimpath`、`-s -w`；产物 `dist/model-router-<version>-<goos>-<goarch>[.exe]`。
 
 ## 14. 关键决策与未覆盖情形
@@ -612,3 +667,91 @@ POST /v1/messages -> req_model="opus[1m]" model="mti-flash" (anthropic) client=c
 - **D-M4.6-1 编码选择权归代理**：客户端 `Accept-Encoding` 不再透传；即使客户端要求 `identity`，上游仍按 Transport 协商返回 gzip，由代理解压后明文下发。
 - **D-M4.6-2 不可解码编码**：`br` / `zstd` 等只记 warn，不解压、不解析；客户端收到的响应不变。
 - **D-M4.6-3 不回填 Content-Length**：解压后流式走 chunked；非流式由 Go server 按实际写出字节处理。
+
+## 25. M6 `/v1/models` 官方 schema（§21）
+
+### 25.1 配置与运行时
+
+- `config.Instance` 新增 `role_names`（`map[string]string`）与 `model_capabilities`（`map[string]ModelCapability`）；`ModelCapability` 的四个能力字段用 `*bool` 区分“未声明”与“显式 false”，窗口用 `int`（0 = 未声明）。
+- `applyDefaults` 归一化并校验：
+  - `role_names` 键小写/trim，仅接受 sonnet/opus/fable/haiku（`*` 非法）；值 trim 后非空；否则启动失败。
+  - `model_capabilities` 键 trim 后非空；`max_input_tokens`/`max_tokens` 不得为负；否则启动失败。
+- `proxy.New` 把两者复制进 `instanceRuntime`，供 `/v1/models` 读取；不参与路由、回退、日志与转发。
+
+### 25.2 聚合规则
+
+- 角色集合与顺序沿用 M3：只列任一 anthropic 实例声明过的具体角色，固定 `sonnet → opus → fable → haiku`，不含 `*`。
+- 对外 id：按 anthropic 实例配置顺序取第一个 `role_names[角色]`；全部未配置时用内置官方名（§9 表）。
+- identity：用对外 id 查内置表；查不到则 `display_name=id`、`created_at` 取 `h.now()` 的 UTC RFC3339。
+- 能力来源：先确定角色的上游模型 = 首个声明该角色的实例的 `roles[角色]`（与路由一致）；再按实例顺序找第一个 `model_capabilities[上游模型]` 声明。全部未声明 → `max_*` 与 `capabilities` 均为 `null`。
+- OpenAI 入口只读 openai 实例的 `models` 与 `model_capabilities`，忽略 `role_names` 与查询参数（M7 起使用能力字段，§26）。
+
+### 25.3 分页
+
+- 过滤 `lifecycle` 后再按游标切页；顺序即固定角色顺序。
+- 无游标：`[0, limit)`；`after_id`：`(index, index+limit]`；`before_id`：`[index-limit, index)`（下界 0）。
+- 未知游标（含已被过滤掉的 id）→ 空页，`has_more=false`，first/last 为 `null`。
+- `has_more` 表示翻页方向上还有数据：无游标/`after_id` 时看页面之后，`before_id` 时看页面之前。
+
+### 25.4 决策与未覆盖
+
+- **D-M6-1 按 id 查内置表**：`role_names` 覆盖成另一个内置 id 时，`display_name`/`created_at` 跟随该 id 的内置行；只有完全不在表中的自定义 id 才回退。
+- **D-M6-2 首个声明优先**：`role_names` 或 `model_capabilities` 被多个实例声明时，一律取配置顺序的第一个声明（对应 §21.5 规则 1/2）。
+- **D-M6-3 空游标参数**：`?after_id=` / `?before_id=`（值为空）视为未提供游标；两参数同时出现（即使值为空）仍按双游标报 400。
+- **D-M6-4 重复/多值参数**：`limit` 只取第一个值；`lifecycle` 的所有值合并后再校验，token 数 >3 → 400。
+- **D-M6-5 未覆盖情形**：需求未定义负的 `max_*`（本实现拒绝）、`model_capabilities` 空键（本实现拒绝）、`role_names` 出现在 OpenAI 实例（本实现接受但不使用）、`role_names` 未声明角色的覆盖（本实现照常参与该角色的对外 id）、两个角色映射到同一对外 id（不校验、不去重，按角色各输出一条）。
+
+### 25.5 配置页与 probe 能力回填（§21.6）
+
+- Anthropic 实例卡片：
+  - 角色映射每个具体角色一行，左侧输入上游实际模型，右侧输入对外模型名（`role_names`）；对外名留空 = 使用内置官方名，输入框以官方名作为 placeholder 提示；`*` 托底行没有对外名。`role_names` 只写具体角色，与后端校验一致。
+  - 「模型能力」区块按上游模型名列出紧凑网格：模型名 + `max_input_tokens` + `max_tokens` + 四个勾选框（`image_input` / `pdf_input` / `thinking` / `structured_outputs`），表头只出现一次。行的集合 = 角色映射值（sonnet→opus→fable→haiku→`*` 顺序去重）∪ 已配置 `model_capabilities` 的键；上游返回但未被任何角色使用的模型不生成行，避免卡片过长。
+  - 窗口输入：留空或 `0` 均视为未声明；负数/非整数在行下方报错并阻止保存（前端校验，后端 `config.Parse` 兜底）。勾选框：勾选写入 `true`；取消勾选删除该字段。
+  - 保存构建配置时丢弃空的能力对象（全部字段未声明 → 不写该模型条目）；`role_names` 与 `model_capabilities` 在新增/删除实例、切换协议 tab、JSON 模式往返时随实例状态保留。
+- 「查询模型」probe：
+  - 前端把 `/api/probe/models` 返回的 `capabilities` 存为实例级临时数据（不写配置），对**当前角色映射使用到的上游模型**合并缺失字段；已由用户/配置声明的字段不被覆盖（D-M6-7）。
+  - 上游未提供能力元数据的模型（或手动输入的模型）保持空行，供手填。
+- **D-M6-6 勾选框的显式 false**：UI 只有「勾选/未勾选」两态，无法区分“未声明”与“显式 false”。本实现保留数据语义：由 JSON 或上游带入的显式 `false` 在取消勾选前不会被删除，因此仅含显式 `false` 的能力行视觉上像“全部留空”，但保存后仍保留该条目。需求未定义该情形；需要表达显式 false 时建议用 JSON 高级模式（或让上游声明）。
+- **D-M6-7 查询结果不覆盖已填值**：probe 能力回填只补缺失字段，用户手填/旧配置优先；重复查询不会把用户改过的值改回上游值。需求未明确覆盖策略，取“手填优先”以避免静默丢失用户输入。
+
+## 26. M7 协议路径分离 + OpenAI 入口能力（§22）
+
+### 26.1 路径分派
+
+- 精确匹配，不上溯、不重定向：
+
+  | 路径 | 协议 | 行为 |
+  |---|---|---|
+  | `/v1/chat/completions` | OpenAI | 转发（不变） |
+  | `/v1/models` | OpenAI | 本地 OpenAI 格式列表（不再按认证头切换） |
+  | `/v1/messages` | Anthropic | 转发（向前兼容） |
+  | `/anthropic/v1/messages` | Anthropic | 与 `/v1/messages` 同一 handler；上游路径剥掉 `/anthropic` 前缀 |
+  | `/anthropic/v1/models` | Anthropic | 本地 Anthropic 格式列表 |
+  | 其他（含 `/anthropic/v1/chat/completions`） | — | 404，OpenAI 格式 |
+
+- 认证先于路径分发：`/v1/models` 与 `/anthropic/v1/models` 都接受 `x-api-key` 或 Bearer；`/v1/chat/completions` 仍仅 Bearer；未知路径按 OpenAI 认证与错误体。
+- 两条 messages 入口共用同一 handler，认证、路由、回退、状态码/响应体、日志字段完全一致；`logRequest` 记录客户端实际请求路径（`/v1/messages` 或 `/anthropic/v1/messages`），字段顺序不变。
+- 能力配置不参与路由、回退与转发。
+
+### 26.2 OpenAI 入口能力字段（§22.4）
+
+- `instanceRuntime.capabilities` 对两种协议都填充；OpenAI 列表按模型名查能力。
+- 去重后每个 id 只出现一次；能力取配置顺序中第一个声明该模型的 `model_capabilities`（首个实例未声明时继续向后找）。
+- 字段映射：`context_window`/`max_input_tokens` ← `max_input_tokens`；`max_output_tokens`/`max_tokens` ← `max_tokens`；均 >0 才输出。
+- `input_modalities`：恒含 `"text"`；`image_input=true` 追加 `"image"`；`pdf_input=true` 追加 `"pdf"`；至少一个为 `true` 才输出字段，否则省略。
+- 未声明任何能力的模型只输出 `id`/`object`/`created`/`owned_by`，保持标准 OpenAI 兼容。
+
+### 26.3 配置页（§22.5）
+
+- OpenAI 实例卡片在「模型列表」下方复用 Anthropic 侧同一套 `.caps` 紧凑网格（模型名 + 两窗口 + 四勾选）。
+- 行集合 = 该实例 `models`（去重保序）∪ 已配置 `model_capabilities` 键；保存时空能力对象不写入。
+- 「查询模型」返回的能力自动填入当前已选模型的缺失字段，用户已填值不被覆盖；勾选新模型时立即合并其远程能力。
+- `model_capabilities` 的配置校验、显式 `false` 语义、空值规则与 Anthropic 实例一致（§21.5、D-M6-6）。
+
+### 26.4 决策与未覆盖
+
+- **D-M7-1 `/v1/models` 接受 `x-api-key`**：§22.8 要求“同一请求带 x-api-key 而非 Bearer 时仍返回 OpenAI 格式”，故两 models 入口统一双认证；响应格式仍只由路径决定。`/v1/chat/completions` 不受影响。
+- **D-M7-2 `input_modalities` 输出条件**：按 §22.8 的“两者都 false 或未声明 → 省略”，实现为“至少一个 `true` 才输出”；`true` 的顺序固定为 `text`、`image`、`pdf`。
+- **D-M7-3 能力键不在 `models` 中**：需求未定义；配置校验不拒绝，配置页会把该键并入能力行并原样保存（与 Anthropic 侧“能力键 ∪ 角色值”一致），不静默删除用户数据。
+- **D-M7-4 未知路径的协议归属**：`/anthropic/v1/chat/completions` 等未列入矩阵的路径按“未知 → OpenAI 格式”处理，认证也按 OpenAI 规则（Bearer）。
+- **D-M7-5 查询参数**：`/v1/models` 继续忽略全部查询参数；分页/过滤仅属于 `/anthropic/v1/models`。
