@@ -538,6 +538,26 @@ func TestLoadProvider(t *testing.T) {
 	}
 }
 
+func TestLoadInstanceName(t *testing.T) {
+	path := writeConfig(t, `{
+		"auth_token": "token",
+		"instances": {
+			"openai": [{"name": "MTI", "base_url": "https://example.com", "api_key": "k", "models": ["m"]}],
+			"anthropic": [{"base_url": "https://example.com", "api_key": "k", "roles": {"sonnet": "m"}}]
+		}
+	}`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config with name: %v", err)
+	}
+	if got := cfg.Instances[0].Name; got != "MTI" {
+		t.Errorf("name = %q, want MTI", got)
+	}
+	if got := cfg.Instances[1].Name; got != "" {
+		t.Errorf("name = %q, want empty when omitted", got)
+	}
+}
+
 func TestExampleConfigIsValid(t *testing.T) {
 	data, err := os.ReadFile("../../config.example.json")
 	if err != nil {

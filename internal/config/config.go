@@ -32,6 +32,7 @@ const (
 	DefaultDegradeDuration    = 5 * time.Minute
 	DefaultMinTokensPerSecond = 30.0
 	DefaultIdleTimeout        = 30 * time.Second
+	DefaultFirstTokenTimeout  = 10 * time.Second
 )
 
 // Model roles an anthropic instance can map via instances.anthropic[].roles.
@@ -150,10 +151,11 @@ func (d OptionalDuration) MarshalJSON() ([]byte, error) {
 
 // Fallback holds the optional fallback state-machine parameters.
 type Fallback struct {
-	FailureThreshold   int      `json:"failure_threshold"`
-	DegradeDuration    Duration `json:"degrade_duration"`
-	MinTokensPerSecond float64  `json:"min_tokens_per_second"`
+	FailureThreshold   int              `json:"failure_threshold"`
+	DegradeDuration    Duration         `json:"degrade_duration"`
+	MinTokensPerSecond float64          `json:"min_tokens_per_second"`
 	IdleTimeout        OptionalDuration `json:"idle_timeout"`
+	FirstTokenTimeout  OptionalDuration `json:"first_token_timeout"`
 
 	configured bool
 }
@@ -165,6 +167,7 @@ func (f *Fallback) UnmarshalJSON(data []byte) error {
 		DegradeDuration    *Duration         `json:"degrade_duration"`
 		MinTokensPerSecond *float64          `json:"min_tokens_per_second"`
 		IdleTimeout        *OptionalDuration `json:"idle_timeout"`
+		FirstTokenTimeout  *OptionalDuration `json:"first_token_timeout"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -180,6 +183,7 @@ func (f *Fallback) UnmarshalJSON(data []byte) error {
 		DegradeDuration:    Duration(DefaultDegradeDuration),
 		MinTokensPerSecond: DefaultMinTokensPerSecond,
 		IdleTimeout:        OptionalDuration(DefaultIdleTimeout),
+		FirstTokenTimeout:  OptionalDuration(DefaultFirstTokenTimeout),
 		configured:         true,
 	}
 	if raw.FailureThreshold != nil {
@@ -200,6 +204,9 @@ func (f *Fallback) UnmarshalJSON(data []byte) error {
 	if raw.IdleTimeout != nil {
 		f.IdleTimeout = *raw.IdleTimeout
 	}
+	if raw.FirstTokenTimeout != nil {
+		f.FirstTokenTimeout = *raw.FirstTokenTimeout
+	}
 	return nil
 }
 
@@ -209,6 +216,7 @@ func (f *Fallback) applyDefaults() {
 		f.DegradeDuration = Duration(DefaultDegradeDuration)
 		f.MinTokensPerSecond = DefaultMinTokensPerSecond
 		f.IdleTimeout = OptionalDuration(DefaultIdleTimeout)
+		f.FirstTokenTimeout = OptionalDuration(DefaultFirstTokenTimeout)
 		return
 	}
 	if f.FailureThreshold < 1 {
@@ -223,6 +231,9 @@ func (f *Fallback) applyDefaults() {
 	if f.IdleTimeout < 0 {
 		f.IdleTimeout = OptionalDuration(DefaultIdleTimeout)
 	}
+	if f.FirstTokenTimeout < 0 {
+		f.FirstTokenTimeout = OptionalDuration(DefaultFirstTokenTimeout)
+	}
 }
 
 // FallbackValues is the effective, concrete fallback configuration.
@@ -231,6 +242,7 @@ type FallbackValues struct {
 	DegradeDuration    time.Duration
 	MinTokensPerSecond float64
 	IdleTimeout        time.Duration
+	FirstTokenTimeout  time.Duration
 }
 
 // Values returns the effective fallback parameters. An explicit
@@ -243,6 +255,7 @@ func (f Fallback) Values() FallbackValues {
 		DegradeDuration:    time.Duration(f.DegradeDuration),
 		MinTokensPerSecond: f.MinTokensPerSecond,
 		IdleTimeout:        time.Duration(f.IdleTimeout),
+		FirstTokenTimeout:  time.Duration(f.FirstTokenTimeout),
 	}
 	if values.FailureThreshold <= 0 {
 		values.FailureThreshold = DefaultFailureThreshold
@@ -256,12 +269,18 @@ func (f Fallback) Values() FallbackValues {
 	if values.IdleTimeout < 0 {
 		values.IdleTimeout = DefaultIdleTimeout
 	}
+	if values.FirstTokenTimeout < 0 {
+		values.FirstTokenTimeout = DefaultFirstTokenTimeout
+	}
 	if !f.configured {
 		if values.MinTokensPerSecond == 0 {
 			values.MinTokensPerSecond = DefaultMinTokensPerSecond
 		}
 		if values.IdleTimeout == 0 {
 			values.IdleTimeout = DefaultIdleTimeout
+		}
+		if values.FirstTokenTimeout == 0 {
+			values.FirstTokenTimeout = DefaultFirstTokenTimeout
 		}
 	}
 	return values
@@ -289,12 +308,15 @@ type Config struct {
 type Instance struct {
 	// Protocol is derived from the JSON group and is not accepted as an
 	// instance field.
-	Protocol string   `json:"-"`
-	BaseURL  string   `json:"base_url"`
-	APIKey   string   `json:"api_key"`
+	Protocol string `json:"-"`
+	BaseURL  string `json:"base_url"`
+	APIKey   string `json:"api_key"`
 	// Provider is an optional built-in provider id; empty means custom.
-	Provider string            `json:"provider,omitempty"`
-	Timeout  Duration          `json:"timeout"`
+	Provider string `json:"provider,omitempty"`
+	// Name is an optional display name used only in logs; it never takes part
+	// in routing, matching or fallback.
+	Name    string            `json:"name,omitempty"`
+	Timeout Duration          `json:"timeout"`
 	Models   []string          `json:"models,omitempty"`
 	Roles    map[string]string `json:"roles,omitempty"`
 }

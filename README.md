@@ -2,24 +2,25 @@
 
 OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理透传。
 
-> 当前版本：`0.0.1-rc`（M3-providers：供应商预设 + 实例 provider 标记 + 通用 models_override）
+> 当前版本：`0.1.0`（M4.6：gzip 解压修复 + 实时低速检测 + 实例 name 日志 + 请求日志 in/out/速度）
 > 需求：[docs/requirements.md](docs/requirements.md) ｜ 设计：[docs/design.md](docs/design.md) ｜ 测试：[docs/tests.md](docs/tests.md) ｜ 变更：[CHANGELOG.md](CHANGELOG.md)
 
 ## 能力范围（M1 ～ M4）
 
 - 两个协议入口，互不转换：`POST /v1/chat/completions`（OpenAI）、`POST /v1/messages`（Anthropic）。
-- **服务访问认证**：OpenAI 入口 `Authorization: Bearer <auth_token>`；Anthropic 入口 `x-api-key: <auth_token>`；失败 401（按入口协议错误体）。
+- **服务访问认证**：OpenAI 入口 `Authorization: Bearer <auth_token>`；Anthropic 入口 `x-api-key: <auth_token>` 或 `Authorization: Bearer <auth_token>`（双认证，任一匹配即通过）；失败 401（按入口协议错误体）。
 - **实例化配置**：配置 `instances` 按协议分组为 `openai` / `anthropic` 两个有序数组；每个实例 = `base_url` + `api_key` + `timeout`，并声明自己的模型映射（OpenAI 用 `models` 数组，Anthropic 用 `roles` 对象）。
-- **回退参数可配置**：顶层 `fallback` 对象可设置 `failure_threshold`（默认 3）、`degrade_duration`（默认 `5m`）、`min_tokens_per_second`（默认 30，0=禁用吞吐判定）、`idle_timeout`（默认 `30s`，0=禁用流式空闲超时）。
+- **回退参数可配置**：顶层 `fallback` 对象可设置 `failure_threshold`（默认 3）、`degrade_duration`（默认 `5m`）、`first_token_timeout`（默认 `10s`，0=禁用）、`min_tokens_per_second`（默认 30，0=禁用吞吐判定）、`idle_timeout`（默认 `30s`，0=禁用流式空闲超时）。
 - **供应商预设**：内置 11 个供应商（deepseek/openai/anthropic/zhipu/volcengine/moonshot/dashscope/siliconflow/groq/mistral/xai）。实例可用可选 `provider` 标记来源；`provider` 只影响「查询模型」的端点判定（通用 `models_override` 机制），不影响路由/转发。
 - **实例展开路由**：
   - 精确匹配（R4a）：请求 `model` 等于某个声明的模型 → 转发该实例，**不改写**。
-  - 角色匹配（R4c）：`model` 等于 `sonnet`/`opus`/`fable`/`haiku` 或以 `claude-<role>-` 开头 → 命中声明该角色的条目，改写顶层 `model` 为实例映射的模型。
+  - 角色匹配（R4c）：`model` 等于 `sonnet`/`opus`/`fable`/`haiku` 或以 `claude-<role>-` 开头 → 命中声明该角色的条目，改写顶层 `model` 为实例映射的模型；尾部 `[1m]` 后缀（如 `opus[1m]`）在判定前剥除，大小写不敏感。
   - 托底（R4d）：未命中精确/角色且存在 `"*"` 角色 → 命中第一个，改写顶层 `model`。
   - 回退（R5）：都未命中 → 转发展开后的首条目，不改写。
-- **实例粒度回退降级（M4）**：每个协议下实例按配置顺序构成候选链；连接失败/超时自动在本次请求内回退到下一候选；连续失败 3 次进入 5 分钟持续回退（跳过该实例）；回退期结束后首次探测失败立即重新计时；成功清零。吞吐低于 30 token/s 会在响应完成后记录失败（已发出的响应不回退）。
+- **实例粒度回退降级（M4）**：每个协议下实例按配置顺序构成候选链；连接失败/超时自动在本次请求内回退到下一候选；连续失败 3 次进入 5 分钟持续回退（跳过该实例）；回退期结束后首次探测失败立即重新计时；成功清零。吞吐判定仅在「生成时长 >2s 且输出 >100 token」时进行，低于 `min_tokens_per_second` 记为失败（已发出的响应不回退、不打断）。
 - **透传**：方法、路径、查询串、请求体（别名/角色命中时仅改顶层 `model`）与非认证请求头原样转发；响应原样回传，SSE 逐块 flush。
 - **上游认证分离**：OpenAI 实例使用 `Authorization: Bearer <api_key>`，Anthropic 实例使用 `x-api-key: <api_key>`；客户端 token 永不外传。
+- **请求日志**：每个请求打印 `req_model`（客户端原始模型）、`model`（实际转发模型）、`client`（客户端标识，十一级识别）、`ip`（来源 IP）与 `total`/`ttft`/`in`/`out`/`gen`（`gen` 满足吞吐门槛才显示数值，否则 `n/a`）。
 - **模型列表 `/v1/models`**：本地聚合配置声明（OpenAI 返回 `models` 值；Anthropic 返回已声明的角色名 `sonnet`/`opus`/`fable`/`haiku`，固定顺序、不含 `*`），按认证头判定协议并返回对应格式；不调上游。
 - **Web 配置页 `/admin`**：可视化模式（回退参数输入框、OpenAI/Anthropic 双 tab、添加实例时先选供应商或自定义、实例卡片可拖动排序、测试连接、查询上游模型、勾选/手动填写）+ JSON 高级模式（含 `fallback` 与分组 `instances`；校验通过才可保存）。
 - **管理 API**：`GET/PUT /api/config`、`POST /api/reload`、`POST /api/config/validate`、`POST /api/probe/test`、`POST /api/probe/models`、`GET /api/providers`；HTTP Basic Auth。
@@ -42,6 +43,7 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
      "fallback": {
        "failure_threshold": 3,
        "degrade_duration": "5m",
+       "first_token_timeout": "10s",
        "min_tokens_per_second": 30,
        "idle_timeout": "30s"
      },
@@ -101,7 +103,7 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
      -d '{"model":"sonnet","max_tokens":64,"messages":[{"role":"user","content":"ping"}]}'
    ```
 
-   `model=sonnet` 命中角色映射，代理会改写为实例声明的实际模型（上例 `deepseek-v4-flash`）；也可直接发送 `claude-sonnet-4-5` 这类官方版本 ID（`claude-<role>-` 前缀）。
+   `model=sonnet` 命中角色映射，代理会改写为实例声明的实际模型（上例 `deepseek-v4-flash`）；也可直接发送 `claude-sonnet-4-5` 这类官方版本 ID（`claude-<role>-` 前缀）。Anthropic 入口也接受 `Authorization: Bearer <auth_token>`（双认证，Claude Code 等 SDK 只发 Bearer 时可用）。
 
 ## 配置说明
 
@@ -110,7 +112,7 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
 | 字段 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
 | `listen` | 否 | `127.0.0.1:8080` | 监听地址，形如 `host:port` |
-| `auth_token` | 是 | — | 客户端访问本代理的 token；OpenAI 入口走 Bearer，Anthropic 入口走 `x-api-key` |
+| `auth_token` | 是 | — | 客户端访问本代理的 token；OpenAI 入口走 Bearer，Anthropic 入口走 `x-api-key` 或 Bearer（双认证） |
 | `admin_user` | 否 | `admin` | 管理页/管理 API 的 Basic Auth 用户名 |
 | `admin_password` | 否 | 空（管理面禁用） | 管理页/管理 API 的 Basic Auth 密码 |
 | `fallback` | 否 | 见下 | 回退状态机参数 |
@@ -122,7 +124,8 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
 |---|---|---|
 | `failure_threshold` | 3 | 整数 ≥1 |
 | `degrade_duration` | `5m` | Duration 字符串 >0 |
-| `min_tokens_per_second` | 30 | 浮点 ≥0；0 = 禁用吞吐判定（留空=缺省 30） |
+| `first_token_timeout` | `10s` | Duration ≥0；0 = 禁用首 token 超时（留空=缺省 10s） |
+| `min_tokens_per_second` | 30 | 浮点 ≥0；0 = 禁用吞吐判定（留空=缺省 30）；仅当生成时长 >2s 且输出 >100 token 时判定 |
 | `idle_timeout` | `30s` | Duration ≥0；0 = 禁用流式空闲超时（留空=缺省 30s） |
 
 `instances.openai[]` 字段：
@@ -196,7 +199,7 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
   3. 连续失败 ≥ `failure_threshold` 次 → 进入持续回退 `degrade_duration`，后续请求跳过该实例；
   4. 回退期结束后的首次探测若再失败 → 立即重新计时；成功则清零恢复；
   5. 所有候选都在回退中 → 强制尝试链头一次；全部失败 → 502。
-- 吞吐：非流式响应完成后统计 `usage` 的 `completion_tokens`（OpenAI）/`output_tokens`（Anthropic），`tokens/耗时 < min_tokens_per_second` 记为失败（仅影响后续请求，已发出的响应不回退）。流式响应在流结束时按 SSE 中出现的 usage 做同样判定，但**不打断流**。`min_tokens_per_second=0` 禁用该判定。
+- 吞吐（M4.4 修订）：耗时按「首数据块→末数据块」的**纯生成时长**计算（建连/TTFT 不计入）。仅当「生成时长 >2s」且「输出 >100 token」且「能拿到 usage」时才计算 token/s，低于 `min_tokens_per_second` 记为失败（仅影响后续请求，已发出的响应不回退、不打断）。不满足样本门槛 → 跳过并视为健康。`min_tokens_per_second=0` 禁用该判定。
 - 空闲超时（M4.1）：流式响应 committed 后，连续 `idle_timeout`（默认 30s）无新数据块 → 终止上游读取并记实例失败：
   - Anthropic：先补 `content_block_stop`（若在块内），再补 `message_delta`（`stop_reason=pause_turn`）与 `message_stop`，客户端 SDK 可自动续接。
   - OpenAI：直接中断客户端连接（流截断，不补 `[DONE]`）。
@@ -272,15 +275,15 @@ Anthropic 入口：`{"type":"error","error":{"type":"...","message":"..."}}`。
 
 ```bash
 bash build.sh
-./dist/model-router-0.0.1-rc-windows-amd64.exe -version
-# 输出：0.0.1-rc
+./dist/model-router-0.1.0-windows-amd64.exe -version
+# 输出：0.1.0
 ```
 
 本地全平台构建（windows/linux/darwin × amd64/arm64，共 6 个产物）：
 
 ```bash
 bash build-all.sh
-# 输出汇总：dist/model-router-0.0.1-rc-<os>-<arch>[.exe]
+# 输出汇总：dist/model-router-0.1.0-<os>-<arch>[.exe]
 ```
 
 - 纯 Go，`CGO_ENABLED=0`。版本号唯一来源 `internal/version/version.txt`，构建脚本通过 `-ldflags -X` 注入。
@@ -293,11 +296,11 @@ bash build-all.sh
 
 ```bash
 # 本地构建并运行（需要挂载配置文件）
-docker build -t model-router:0.0.1-rc .
+docker build -t model-router:0.1.0 .
 docker run -d --name model-router -p 18080:18080 \
   -e MODEL_ROUTER_LISTEN=0.0.0.0:18080 \
   -v "$PWD/.docker:/home/nonroot/config:rw" \
-  model-router:0.0.1-rc
+  model-router:0.1.0
 
 curl -sS http://127.0.0.1:18080/v1/models -H "Authorization: Bearer <auth_token>"
 ```

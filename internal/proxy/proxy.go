@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -74,6 +76,7 @@ const (
 
 // instanceRuntime is one configured instance plus its in-memory fallback state.
 type instanceRuntime struct {
+	name    string
 	baseURL *url.URL
 	apiKey  string
 	models  []string
@@ -100,6 +103,7 @@ type Options struct {
 	DegradeDuration    time.Duration
 	MinTokensPerSecond float64
 	IdleTimeout        time.Duration
+	FirstTokenTimeout  time.Duration
 }
 
 // Handler routes OpenAI and Anthropic requests to their configured instances
@@ -112,6 +116,7 @@ type Handler struct {
 	degradeDuration    time.Duration
 	minTokensPerSecond float64
 	idleTimeout        time.Duration
+	firstTokenTimeout  time.Duration
 }
 
 // New builds a Handler with the default fallback parameters.
@@ -135,6 +140,7 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Handler, error) {
 	degradeDuration := fallback.DegradeDuration
 	minTokensPerSecond := fallback.MinTokensPerSecond
 	idleTimeout := fallback.IdleTimeout
+	firstTokenTimeout := fallback.FirstTokenTimeout
 	if opts.FailureThreshold > 0 {
 		threshold = opts.FailureThreshold
 	}
@@ -147,6 +153,9 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Handler, error) {
 	if opts.IdleTimeout > 0 {
 		idleTimeout = opts.IdleTimeout
 	}
+	if opts.FirstTokenTimeout != 0 {
+		firstTokenTimeout = opts.FirstTokenTimeout
+	}
 
 	h := &Handler{
 		authToken:          cfg.AuthToken,
@@ -156,6 +165,7 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Handler, error) {
 		degradeDuration:    degradeDuration,
 		minTokensPerSecond: minTokensPerSecond,
 		idleTimeout:        idleTimeout,
+		firstTokenTimeout:  firstTokenTimeout,
 	}
 	for i, inst := range cfg.Instances {
 		proto := protocol(strings.ToLower(strings.TrimSpace(inst.Protocol)))
@@ -173,7 +183,12 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Handler, error) {
 			return nil, fmt.Errorf("instances[%d]: base_url must be an absolute http(s) URL, got %q", i, inst.BaseURL)
 		}
 
+		name := strings.TrimSpace(inst.Name)
+		if name == "" {
+			name = inst.BaseURL
+		}
 		ir := &instanceRuntime{
+			name:    name,
 			baseURL: base,
 			apiKey:  inst.APIKey,
 			client:  newClient(inst.Timeout.Duration()),
@@ -250,9 +265,12 @@ func newClient(timeout time.Duration) *http.Client {
 
 // ServeHTTP implements http.Handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	proto, known := protocolForPath(r)
 	if !h.authorized(proto, r) {
 		h.writeAuthError(w, proto, r)
+		// §17.6: rejected calls are logged too, without any credential values.
+		logRequest(r, attemptMetrics{}, time.Since(start))
 		return
 	}
 	if !known {
@@ -370,7 +388,7 @@ type openAIModelEntry struct {
 }
 
 type openAIModelList struct {
-	Object string            `json:"object"`
+	Object string             `json:"object"`
 	Data   []openAIModelEntry `json:"data"`
 }
 
@@ -421,32 +439,43 @@ func newAnthropicModelList(models []string) anthropicModelList {
 	return list
 }
 
-// authorized reports whether the request carries the configured service token:
-// OpenAI entrypoints use Authorization: Bearer, Anthropic entrypoints use
-// x-api-key. Comparisons are constant-time to avoid timing side channels.
-func (h *Handler) authorized(proto protocol, r *http.Request) bool {
-	if proto == protocolAnthropic {
-		token := r.Header.Get("x-api-key")
-		if token == "" {
-			return false
-		}
-		return subtle.ConstantTimeCompare([]byte(token), []byte(h.authToken)) == 1
-	}
+const bearerPrefix = "Bearer "
 
-	const prefix = "Bearer "
-	value := r.Header.Get("Authorization")
-	if len(value) <= len(prefix) || !strings.EqualFold(value[:len(prefix)], prefix) {
-		return false
+// hasBearerPrefix reports whether value starts with "Bearer " case-insensitively.
+func hasBearerPrefix(value string) bool {
+	return len(value) >= len(bearerPrefix) && strings.EqualFold(value[:len(bearerPrefix)], bearerPrefix)
+}
+
+// bearerToken extracts a non-empty Bearer credential from an Authorization value.
+func bearerToken(value string) (string, bool) {
+	if !hasBearerPrefix(value) || len(value) == len(bearerPrefix) {
+		return "", false
 	}
-	token := value[len(prefix):]
-	return subtle.ConstantTimeCompare([]byte(token), []byte(h.authToken)) == 1
+	return value[len(bearerPrefix):], true
+}
+
+// tokenMatches compares a presented token to the service token in constant time.
+func (h *Handler) tokenMatches(token string) bool {
+	return token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(h.authToken)) == 1
+}
+
+// authorized reports whether the request carries the configured service token:
+// OpenAI entrypoints use Authorization: Bearer only; Anthropic entrypoints accept
+// x-api-key first and fall back to Authorization: Bearer (§17.2). Comparisons are
+// constant-time to avoid timing side channels.
+func (h *Handler) authorized(proto protocol, r *http.Request) bool {
+	if proto == protocolAnthropic && h.tokenMatches(r.Header.Get("x-api-key")) {
+		return true
+	}
+	token, ok := bearerToken(r.Header.Get("Authorization"))
+	return ok && h.tokenMatches(token)
 }
 
 func (h *Handler) writeAuthError(w http.ResponseWriter, proto protocol, r *http.Request) {
 	if proto == protocolAnthropic {
 		message := "invalid service access token"
-		if r.Header.Get("x-api-key") == "" {
-			message = "missing x-api-key header"
+		if r.Header.Get("x-api-key") == "" && !hasBearerPrefix(r.Header.Get("Authorization")) {
+			message = "missing x-api-key or Authorization header"
 		}
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", message)
 		return
@@ -483,6 +512,7 @@ type candidate struct {
 // candidates in order, retry on pre-response failures, and record outcomes.
 func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto protocol, insts []*instanceRuntime, body []byte) {
 	start := time.Now()
+	reqModel, _ := requestModel(body)
 	chain := buildChain(proto, insts, body)
 	now := h.now()
 
@@ -492,35 +522,35 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 			continue
 		}
 		attempted = true
-		committed, err := h.tryCandidate(w, r, proto, cand, body)
+		committed, metrics, err := h.tryCandidate(w, r, proto, cand, body)
 		if committed {
 			if err != nil {
 				log.Printf("%s %s response committed with error: %v", r.Method, r.URL.Path, err)
-			} else {
-				log.Printf("%s %s -> model=%q (%s) in %s",
-					r.Method, r.URL.Path, cand.model, proto, time.Since(start).Round(time.Millisecond))
 			}
+			metrics.reqModel = reqModel
+			logRequest(r, metrics, time.Since(start))
 			return
 		}
-		log.Printf("%s %s candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.baseURL, err)
+		log.Printf("%s %s candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.name, err)
 	}
 
 	if !attempted && len(chain) > 0 {
 		// All candidates are in sustained degradation: force the chain head once.
 		cand := chain[0]
-		committed, err := h.tryCandidate(w, r, proto, cand, body)
+		committed, metrics, err := h.tryCandidate(w, r, proto, cand, body)
 		if committed {
 			if err != nil {
 				log.Printf("%s %s forced response committed with error: %v", r.Method, r.URL.Path, err)
-			} else {
-				log.Printf("%s %s -> model=%q (%s, forced) in %s",
-					r.Method, r.URL.Path, cand.model, proto, time.Since(start).Round(time.Millisecond))
 			}
+			metrics.reqModel = reqModel
+			logRequest(r, metrics, time.Since(start))
 			return
 		}
-		log.Printf("%s %s forced candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.baseURL, err)
+		log.Printf("%s %s forced candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.name, err)
 	}
 
+	log.Printf("%s %s -> (%s) total=%ss status=502 all candidates failed",
+		r.Method, r.URL.Path, proto, formatSeconds(time.Since(start)))
 	writeProtocolError(w, proto, http.StatusBadGateway, "upstream request failed")
 }
 
@@ -674,8 +704,23 @@ func contains(values []string, want string) bool {
 	return false
 }
 
-// requestRole maps a role name or claude-<role>- id to the concrete role.
+// longContextSuffix is the long-context variant marker Claude Code appends to a
+// role or model id (e.g. "opus[1m]"); it is not part of the routing name (§17.3).
+const longContextSuffix = "[1m]"
+
+// trimLongContextSuffix drops one trailing "[1m]" marker, case-insensitively.
+func trimLongContextSuffix(model string) string {
+	if len(model) >= len(longContextSuffix) &&
+		strings.EqualFold(model[len(model)-len(longContextSuffix):], longContextSuffix) {
+		return model[:len(model)-len(longContextSuffix)]
+	}
+	return model
+}
+
+// requestRole maps a role name or claude-<role>- id to the concrete role,
+// ignoring a trailing long-context marker first (§17.3).
 func requestRole(model string) (string, bool) {
+	model = trimLongContextSuffix(model)
 	for _, role := range concreteRoles {
 		if model == role {
 			return role, true
@@ -731,11 +776,162 @@ func rewriteModel(body []byte, model string) []byte {
 	return rewritten
 }
 
+// attemptMetrics carries per-attempt measurements for logging (§17.6) and the
+// generation-speed judgement (§17.4).
+type attemptMetrics struct {
+	instName    string
+	reqModel    string
+	model       string
+	inTokens    int
+	hasIn       bool
+	outTokens   int
+	hasOut      bool
+	genDuration time.Duration
+	hasGen      bool
+	genTPS      float64
+	hasTPS      bool
+}
+
+const (
+	minThroughputSampleTokens   = 100
+	minThroughputSampleDuration = 2 * time.Second
+)
+
+// judgeThroughput computes generation speed over the generation window only and
+// applies the minimum-sample guard. It returns slow=true when the sample is
+// large enough and below min_tokens_per_second. Skipped samples are healthy.
+func (h *Handler) judgeThroughput(m *attemptMetrics) (slow bool) {
+	if h.minTokensPerSecond <= 0 || !m.hasOut || !m.hasGen {
+		return false
+	}
+	if m.outTokens < minThroughputSampleTokens || m.genDuration < minThroughputSampleDuration {
+		return false
+	}
+	tps := float64(m.outTokens) / m.genDuration.Seconds()
+	m.genTPS, m.hasTPS = tps, true
+	return tps < h.minTokensPerSecond
+}
+
+func formatSeconds(d time.Duration) string {
+	return fmt.Sprintf("%.3f", d.Seconds())
+}
+
+func formatOptionalInt(value int, ok bool) string {
+	if !ok {
+		return "n/a"
+	}
+	return strconv.Itoa(value)
+}
+
+func formatTPS(tps float64) string {
+	return fmt.Sprintf("%.0f", tps)
+}
+
+// clientMarkers maps User-Agent substrings to client identifiers, in the
+// precedence order of §16.2. Matching is case-insensitive.
+var clientMarkers = []struct {
+	needles []string
+	id      string
+}{
+	{[]string{"openai-python", "openai/python"}, "openai-python"},
+	{[]string{"openai-node", "openai/node"}, "openai-node"},
+	{[]string{"anthropic-sdk-typescript", "anthropic/js"}, "anthropic-js"},
+	{[]string{"anthropic-sdk-python", "anthropic/python"}, "anthropic-python"},
+	{[]string{"dsh"}, "dsh"},
+}
+
+// clientID derives a client identifier from request headers only (§16.2).
+func clientID(r *http.Request) string {
+	ua := strings.TrimSpace(r.Header.Get("User-Agent"))
+	lower := strings.ToLower(ua)
+	if version, ok := strings.CutPrefix(lower, "claude-cli/"); ok {
+		if idx := strings.IndexByte(version, ' '); idx >= 0 {
+			version = version[:idx]
+		}
+		if version == "" {
+			return "claude-code"
+		}
+		return "claude-code/" + version
+	}
+	if r.Header.Get("X-Claude-Code-Session-Id") != "" {
+		return "claude-code"
+	}
+	if strings.Contains(strings.ToLower(r.Header.Get("anthropic-beta")), "claude-code") {
+		return "claude-code"
+	}
+	for _, marker := range clientMarkers {
+		for _, needle := range marker.needles {
+			if strings.Contains(lower, needle) {
+				return marker.id
+			}
+		}
+	}
+	if strings.HasPrefix(lower, "curl/") {
+		return "curl"
+	}
+	if ua == "" {
+		return "unknown"
+	}
+	short := ua
+	if len(short) > 32 {
+		short = short[:32]
+	}
+	if idx := strings.IndexByte(short, ' '); idx >= 0 {
+		short = short[:idx]
+	}
+	return short
+}
+
+// clientIP returns the caller address without its port (§16.3). Under a docker
+// bridge only the gateway address is visible unless X-Forwarded-For is set.
+func clientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		first, _, _ := strings.Cut(forwarded, ",")
+		first = strings.TrimSpace(first)
+		if first != "" && !strings.EqualFold(first, "unknown") {
+			return first
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// logRequest emits the §18.3 one-line request log. The gen segment is omitted
+// entirely unless the throughput sample passed the §17.4 threshold.
+func logRequest(r *http.Request, m attemptMetrics, total time.Duration) {
+	name, model, reqModel := m.instName, m.model, m.reqModel
+	if name == "" {
+		name = "n/a"
+	}
+	if model == "" {
+		model = "n/a"
+	}
+	if reqModel == "" {
+		reqModel = "n/a"
+	}
+	gen := ""
+	if m.hasTPS {
+		gen = formatTPS(m.genTPS) + "t/s "
+	}
+	log.Printf("%s %s -> %s/%s (%s) in %ss ↑%s ↓%s %sfrom %s %s",
+		r.Method, r.URL.Path, name, model, reqModel,
+		formatSeconds(total),
+		formatOptionalInt(m.inTokens, m.hasIn),
+		formatOptionalInt(m.outTokens, m.hasOut),
+		gen,
+		clientIP(r), clientID(r))
+}
+
 // tryCandidate attempts one candidate. committed reports that a response was
 // (at least partially) written to the client, so no further candidate may be
 // tried. A non-nil error with committed=false is a retryable pre-response
-// failure (connection/dial/response-header errors).
-func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto protocol, cand *candidate, body []byte) (committed bool, err error) {
+// failure (connection/dial/response-header/first-token-timeout errors).
+func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto protocol, cand *candidate, body []byte) (committed bool, m attemptMetrics, err error) {
+	m.instName = cand.inst.name
+	m.model = cand.model
 	attemptBody := body
 	if cand.rewrite {
 		attemptBody = rewriteModel(body, cand.model)
@@ -744,7 +940,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	target, err := url.JoinPath(cand.inst.baseURL.String(), r.URL.Path)
 	if err != nil {
 		h.recordFailure(cand.inst)
-		return false, fmt.Errorf("join upstream URL: %w", err)
+		return false, m, fmt.Errorf("join upstream URL: %w", err)
 	}
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
@@ -753,7 +949,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(attemptBody))
 	if err != nil {
 		h.recordFailure(cand.inst)
-		return false, fmt.Errorf("build upstream request: %w", err)
+		return false, m, fmt.Errorf("build upstream request: %w", err)
 	}
 	outReq.ContentLength = int64(len(attemptBody))
 
@@ -761,6 +957,10 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	removeHopByHop(outReq.Header)
 	// ContentLength field is authoritative; a stale header would conflict with it.
 	outReq.Header.Del("Content-Length")
+	// Never forward the client's Accept-Encoding (§20.2): with the header absent
+	// the Go transport negotiates gzip itself and transparently decompresses the
+	// response, so the SSE parser and byte-rate window see plaintext.
+	outReq.Header.Del("Accept-Encoding")
 	// Client credentials are only for this proxy and never reach upstream.
 	outReq.Header.Del("Authorization")
 	if proto == protocolAnthropic {
@@ -770,74 +970,148 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 		outReq.Header.Set("Authorization", "Bearer "+cand.inst.apiKey)
 	}
 
-	attemptStart := time.Now()
 	resp, err := cand.inst.client.Do(outReq)
 	if err != nil {
 		h.recordFailure(cand.inst)
-		return false, fmt.Errorf("upstream request: %w", err)
+		return false, m, fmt.Errorf("upstream request: %w", err)
 	}
 	defer resp.Body.Close()
+	headersAt := time.Now()
 
-	copyHeader(w.Header(), resp.Header)
-	removeHopByHop(w.Header())
+	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	decompressGzip := encoding == "gzip" || encoding == "x-gzip"
+	parseable := true
 	streaming := isEventStream(resp.Header)
-	if streaming {
-		// Appending platform-generated tail events requires chunked framing.
-		w.Header().Del("Content-Length")
+	var respBody io.ReadCloser = resp.Body
+	switch {
+	case encoding == "" || encoding == "identity":
+	case decompressGzip:
+		// The transport was not asked for compression, so this only happens when
+		// the upstream compresses regardless (§20.2). Decompress before any
+		// parsing; streams defer the gzip header read to the first chunk so
+		// first_token_timeout still covers a silent upstream.
+		gz, gzErr := newGzipBody(resp.Body, streaming)
+		if gzErr != nil {
+			h.recordFailure(cand.inst)
+			return false, m, fmt.Errorf("decompress upstream gzip body: %w", gzErr)
+		}
+		respBody = gz
+	default:
+		// br/zstd/etc: forward verbatim, but usage and the byte rate cannot be
+		// parsed behind an encoding the proxy does not decode.
+		parseable = false
+		log.Printf("instance %s: upstream content-encoding %q is not decodable; usage and byte rate are unavailable", cand.inst.name, encoding)
 	}
-	w.WriteHeader(resp.StatusCode)
+
+	writeResponseHead := func() {
+		copyHeader(w.Header(), resp.Header)
+		removeHopByHop(w.Header())
+		if decompressGzip {
+			// The client receives plaintext (§20.2).
+			w.Header().Del("Content-Encoding")
+			w.Header().Del("Content-Length")
+		}
+		if streaming {
+			// Appending platform-generated tail events requires chunked framing.
+			w.Header().Del("Content-Length")
+		}
+		w.WriteHeader(resp.StatusCode)
+	}
 
 	if streaming {
-		outcome, streamErr := h.copySSE(w, resp.Body, h.idleTimeout)
-		elapsed := time.Since(attemptStart)
+		// For streams, headers are committed together with the first data chunk
+		// so a first-token timeout can still fail over to another instance.
+		outcome, streamErr := h.copySSE(w, respBody, h.idleTimeout, h.firstTokenTimeout,
+			h.minTokensPerSecond, proto == protocolAnthropic, parseable, writeResponseHead)
+		if outcome.firstTokenTimeout {
+			h.recordFailure(cand.inst)
+			return false, m, fmt.Errorf("first token timeout after %s", h.firstTokenTimeout)
+		}
+		if !outcome.committed {
+			if streamErr != nil {
+				h.recordFailure(cand.inst)
+				return false, m, fmt.Errorf("read stream: %w", streamErr)
+			}
+			// Empty stream: commit the (empty) response and treat as success.
+			writeResponseHead()
+			cand.inst.recordSuccess()
+			return true, m, nil
+		}
+
+		if outcome.chunks > 0 {
+			m.genDuration = outcome.lastBlockAt.Sub(outcome.firstBlockAt)
+			m.hasGen = outcome.chunks > 1
+		}
+		m.inTokens, m.hasIn = outcome.state.inTokens, outcome.state.hasIn
+		m.outTokens, m.hasOut = outcome.state.tokens, outcome.state.hasTokens
+
 		if outcome.idle {
 			if proto == protocolAnthropic && !outcome.state.finished {
 				if err := writePauseTurnTail(w, &outcome.state); err != nil {
 					h.recordFailure(cand.inst)
-					return true, fmt.Errorf("write pause_turn tail: %w", err)
+					return true, m, fmt.Errorf("write pause_turn tail: %w", err)
 				}
 			} else if proto == protocolOpenAI {
 				truncateClientConnection(w)
 			}
 			h.recordFailure(cand.inst)
-			log.Printf("instance %s idle for %s; stream terminated", cand.inst.baseURL, h.idleTimeout)
-			return true, nil
+			log.Printf("instance %s idle for %s; stream terminated", cand.inst.name, h.idleTimeout)
+			return true, m, nil
+		}
+		if outcome.slow {
+			// §19 real-time low throughput: the verdict already implies a failed
+			// attempt, so the post-hoc throughput judgement is skipped.
+			h.recordFailure(cand.inst)
+			log.Printf("instance %s slow stream (realtime): %.0fB/s", cand.inst.name, outcome.slowBytesPerSecond)
+			if proto == protocolAnthropic && !outcome.state.finished {
+				if err := writePauseTurnTail(w, &outcome.state); err != nil {
+					return true, m, fmt.Errorf("write pause_turn tail: %w", err)
+				}
+			}
+			return true, m, nil
 		}
 		if streamErr != nil {
 			h.recordFailure(cand.inst)
-			return true, fmt.Errorf("copy response body: %w", streamErr)
+			return true, m, fmt.Errorf("copy response body: %w", streamErr)
 		}
-		if outcome.state.hasTokens && elapsed > 0 &&
-			float64(outcome.state.tokens)/elapsed.Seconds() < h.minTokensPerSecond {
+		if h.judgeThroughput(&m) {
 			h.recordFailure(cand.inst)
-			log.Printf("instance %s slow stream: %d tokens in %s",
-				cand.inst.baseURL, outcome.state.tokens, elapsed.Round(time.Millisecond))
+			log.Printf("instance %s slow stream: %st/s", cand.inst.name, formatTPS(m.genTPS))
 		} else {
 			cand.inst.recordSuccess()
 		}
-		return true, nil
+		return true, m, nil
 	}
 
-	var tokens int
-	var tokensOK bool
-	capture := &cappedBuffer{limit: tokenCaptureLimit}
-	copyErr := copyBodyTee(w, resp.Body, capture)
-	if !capture.truncated {
-		tokens, tokensOK = parseUsageTokens(proto, capture.bytes())
+	writeResponseHead()
+	var copyErr error
+	if parseable {
+		var usage usageTokens
+		capture := &cappedBuffer{limit: tokenCaptureLimit}
+		copyErr = copyBodyTee(w, respBody, capture)
+		readDone := time.Now()
+		if !capture.truncated {
+			usage = parseUsage(proto, capture.bytes())
+		}
+		m.inTokens, m.hasIn = usage.in, usage.hasIn
+		m.outTokens, m.hasOut = usage.out, usage.hasOut
+		m.genDuration = readDone.Sub(headersAt)
+		m.hasGen = true
+	} else {
+		copyErr = copyBody(w, respBody)
 	}
-	elapsed := time.Since(attemptStart)
 
 	if copyErr != nil {
 		h.recordFailure(cand.inst)
-		return true, fmt.Errorf("copy response body: %w", copyErr)
+		return true, m, fmt.Errorf("copy response body: %w", copyErr)
 	}
-	if tokensOK && elapsed > 0 && float64(tokens)/elapsed.Seconds() < h.minTokensPerSecond {
+	if h.judgeThroughput(&m) {
 		h.recordFailure(cand.inst)
-		log.Printf("instance %s slow: %d tokens in %s", cand.inst.baseURL, tokens, elapsed.Round(time.Millisecond))
+		log.Printf("instance %s slow: %st/s", cand.inst.name, formatTPS(m.genTPS))
 	} else {
 		cand.inst.recordSuccess()
 	}
-	return true, nil
+	return true, m, nil
 }
 
 func isEventStream(header http.Header) bool {
@@ -870,28 +1144,45 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 
 func (b *cappedBuffer) bytes() []byte { return b.buf }
 
-// parseUsageTokens extracts completion_tokens (openai) or output_tokens
-// (anthropic); ok=false means the usage field was absent or unparseable.
-func parseUsageTokens(proto protocol, body []byte) (int, bool) {
+// usageTokens is the usage subset mirrored from OpenAI or Anthropic responses.
+type usageTokens struct {
+	in     int
+	hasIn  bool
+	out    int
+	hasOut bool
+}
+
+// parseUsage extracts prompt/input and completion/output token counts. Missing
+// or unparseable usage yields hasIn/hasOut=false.
+func parseUsage(proto protocol, body []byte) usageTokens {
 	var payload struct {
 		Usage struct {
+			PromptTokens     *int `json:"prompt_tokens"`
 			CompletionTokens *int `json:"completion_tokens"`
+			InputTokens      *int `json:"input_tokens"`
 			OutputTokens     *int `json:"output_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return 0, false
+		return usageTokens{}
+	}
+	var usage usageTokens
+	if payload.Usage.PromptTokens != nil {
+		usage.in, usage.hasIn = *payload.Usage.PromptTokens, true
+	}
+	if payload.Usage.InputTokens != nil {
+		usage.in, usage.hasIn = *payload.Usage.InputTokens, true
 	}
 	if proto == protocolAnthropic {
 		if payload.Usage.OutputTokens != nil {
-			return *payload.Usage.OutputTokens, true
+			usage.out, usage.hasOut = *payload.Usage.OutputTokens, true
 		}
-		return 0, false
+		return usage
 	}
 	if payload.Usage.CompletionTokens != nil {
-		return *payload.Usage.CompletionTokens, true
+		usage.out, usage.hasOut = *payload.Usage.CompletionTokens, true
 	}
-	return 0, false
+	return usage
 }
 
 // copyBody streams the upstream body to the client, flushing after each chunk
@@ -944,6 +1235,51 @@ func copyBodyTee(w http.ResponseWriter, src io.Reader, capture io.Writer) error 
 	}
 }
 
+// gzipBody decompresses a gzip-encoded upstream body. Close closes the
+// underlying body so the stream timers can still abort a stalled upstream.
+// A lazy body defers gzip.NewReader to the first Read; that keeps the stream's
+// first-token timer in charge of how long the upstream may stay silent.
+type gzipBody struct {
+	src    io.ReadCloser
+	lazy   bool
+	reader *gzip.Reader
+	err    error
+}
+
+func newGzipBody(src io.ReadCloser, lazy bool) (*gzipBody, error) {
+	b := &gzipBody{src: src, lazy: lazy}
+	if !lazy {
+		if err := b.init(); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
+func (b *gzipBody) init() error {
+	if b.reader != nil || b.err != nil {
+		return b.err
+	}
+	reader, err := gzip.NewReader(b.src)
+	if err != nil {
+		b.err = err
+		return err
+	}
+	b.reader = reader
+	return nil
+}
+
+func (b *gzipBody) Read(p []byte) (int, error) {
+	if err := b.init(); err != nil {
+		return 0, err
+	}
+	return b.reader.Read(p)
+}
+
+func (b *gzipBody) Close() error {
+	return b.src.Close()
+}
+
 // sseState tracks the minimal Anthropic/OpenAI stream state needed for the
 // pause_turn tail and streaming throughput judgement.
 type sseState struct {
@@ -952,6 +1288,8 @@ type sseState struct {
 	blockIndex int
 	tokens     int
 	hasTokens  bool
+	inTokens   int
+	hasIn      bool
 	finished   bool
 }
 
@@ -984,12 +1322,22 @@ func (s *sseState) processLine(line string) {
 		Type  string `json:"type"`
 		Index *int   `json:"index"`
 		Usage struct {
+			PromptTokens     *int `json:"prompt_tokens"`
 			CompletionTokens *int `json:"completion_tokens"`
+			InputTokens      *int `json:"input_tokens"`
 			OutputTokens     *int `json:"output_tokens"`
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(payload), &event); err != nil {
 		return
+	}
+	if event.Usage.PromptTokens != nil {
+		s.inTokens = *event.Usage.PromptTokens
+		s.hasIn = true
+	}
+	if event.Usage.InputTokens != nil {
+		s.inTokens = *event.Usage.InputTokens
+		s.hasIn = true
 	}
 	if event.Usage.CompletionTokens != nil {
 		s.tokens = *event.Usage.CompletionTokens
@@ -1013,47 +1361,146 @@ func (s *sseState) processLine(line string) {
 }
 
 type sseOutcome struct {
-	idle  bool
-	state sseState
+	idle               bool
+	firstTokenTimeout  bool
+	slow               bool
+	slowBytesPerSecond float64
+	committed          bool
+	chunks             int
+	firstBlockAt       time.Time
+	lastBlockAt        time.Time
+	state              sseState
 }
 
-// copySSE streams an SSE body, resetting the idle timer on every chunk. When
-// idle > 0 and no chunk arrives for that long, it closes the upstream body and
-// reports outcome.idle; the caller then emits protocol-specific tail events.
-func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle time.Duration) (sseOutcome, error) {
-	var outcome sseOutcome
-	var idleHit atomic.Bool
+// §19 real-time throughput detection: token counts are unavailable mid-stream,
+// so byte throughput is measured and converted with a rough ratio.
+const (
+	realtimeSlowWindow = 10 * time.Second
+	bytesPerToken      = 3
+)
+
+// byteSample is one upstream chunk in the real-time throughput window.
+type byteSample struct {
+	ts time.Time
+	n  int
+}
+
+// copySSE streams an SSE body. It arms a first-token timer until the first
+// chunk (commit is invoked just before that chunk is written) and then switches
+// to an idle timer reset on every chunk. When a timer fires the upstream body is
+// closed and the outcome reports which phase timed out.
+//
+// It also tracks byte throughput over a sliding 10s window (§19). Once the
+// window is full and the rate is below minTokensPerSecond*bytesPerToken the
+// outcome reports slow; with slowInterrupt (Anthropic) the upstream body is
+// closed immediately, otherwise (OpenAI) the stream keeps flowing.
+//
+// parse is false for bodies in an encoding the proxy cannot decode (§20.2);
+// such streams are forwarded but neither usage nor the byte window is tracked.
+func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, firstToken time.Duration, minTokensPerSecond float64, slowInterrupt, parse bool, commit func()) (outcome sseOutcome, err error) {
+	var firstHit, idleHit, slowHit atomic.Bool
+	var timerMu sync.Mutex
 	var timer *time.Timer
-	if idle > 0 {
-		timer = time.AfterFunc(idle, func() {
-			idleHit.Store(true)
+
+	var window []byteSample
+	var windowBytes int
+	var firstChunkAt time.Time
+	var slowBytes float64
+
+	defer func() {
+		outcome.slow = slowHit.Load()
+		outcome.slowBytesPerSecond = slowBytes
+	}()
+
+	arm := func(d time.Duration, idleStage bool) {
+		timerMu.Lock()
+		defer timerMu.Unlock()
+		if timer != nil {
+			timer.Stop()
+			timer = nil
+		}
+		if d <= 0 {
+			return
+		}
+		timer = time.AfterFunc(d, func() {
+			if idleStage {
+				idleHit.Store(true)
+			} else {
+				firstHit.Store(true)
+			}
 			_ = body.Close()
 		})
-		defer timer.Stop()
 	}
+	defer func() {
+		timerMu.Lock()
+		if timer != nil {
+			timer.Stop()
+		}
+		timerMu.Unlock()
+	}()
+	arm(firstToken, false)
 
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := body.Read(buf)
 		if n > 0 {
-			outcome.state.feed(buf[:n])
+			now := time.Now()
+			if !outcome.committed {
+				commit()
+				outcome.committed = true
+			}
+			if outcome.chunks == 0 {
+				outcome.firstBlockAt = now
+			}
+			outcome.lastBlockAt = now
+			outcome.chunks++
+			if parse {
+				outcome.state.feed(buf[:n])
+				if minTokensPerSecond > 0 {
+					if firstChunkAt.IsZero() {
+						firstChunkAt = now
+					}
+					window = append(window, byteSample{ts: now, n: n})
+					windowBytes += n
+					for len(window) > 0 && window[0].ts.Before(now.Add(-realtimeSlowWindow)) {
+						windowBytes -= window[0].n
+						window = window[1:]
+					}
+					if now.Sub(firstChunkAt) >= realtimeSlowWindow {
+						rate := float64(windowBytes) / realtimeSlowWindow.Seconds()
+						if rate < minTokensPerSecond*bytesPerToken && !slowHit.Swap(true) {
+							slowBytes = rate
+							if slowInterrupt {
+								_ = body.Close()
+							}
+						}
+					}
+				}
+			}
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				return outcome, werr
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
-			if timer != nil {
-				timer.Reset(idle)
-			}
+			arm(idle, true)
 		}
 		if err == io.EOF {
 			return outcome, nil
 		}
 		if err != nil {
-			if idleHit.Load() {
+			if firstHit.Load() && outcome.chunks == 0 {
+				outcome.firstTokenTimeout = true
+				return outcome, nil
+			}
+			if idleHit.Load() && outcome.committed {
 				outcome.idle = true
+				return outcome, nil
+			}
+			if slowHit.Load() {
+				// The body was closed by the slow-stream detector; report the
+				// declared slow outcome instead of a spurious read error.
 				return outcome, nil
 			}
 			return outcome, err

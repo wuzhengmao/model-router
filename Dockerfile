@@ -8,6 +8,8 @@ ARG TARGETOS=linux
 ARG TARGETARCH
 ARG VERSION=""
 
+RUN apk add --no-cache tzdata
+
 COPY go.mod ./
 COPY . .
 
@@ -25,6 +27,11 @@ RUN set -eux; \
 FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /model-router /model-router
+
+# Container logs must carry Beijing time (§17.7); distroless ships no tzdata.
+COPY --from=build /usr/share/zoneinfo/Asia/Shanghai /usr/share/zoneinfo/Asia/Shanghai
+COPY --from=build /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+ENV TZ=Asia/Shanghai
 
 USER nonroot:nonroot
 EXPOSE 18080

@@ -524,7 +524,7 @@ func TestThroughputFailure(t *testing.T) {
 		}, first, second), slowCalls
 	}
 
-	t.Run("openai low completion_tokens records failure but still forwards", func(t *testing.T) {
+	t.Run("openai low completion_tokens does NOT record failure", func(t *testing.T) {
 		slowBody := `{"id":"slow","usage":{"completion_tokens":1},"choices":[]}`
 		server, slowCalls := newSlowProxy(t, config.ProtocolOpenAI, slowBody, 20*time.Millisecond)
 		body := `{"model":"gpt-x"}`
@@ -536,17 +536,17 @@ func TestThroughputFailure(t *testing.T) {
 		if got := readBody(t, resp); got != slowBody {
 			t.Errorf("body = %q, want slow response forwarded verbatim", got)
 		}
-		// The slow instance was marked degraded; the next request skips it.
+		// Below min sample (1 token < 20): skipped, not degraded; next request hits it again.
 		resp = send(t, http.MethodPost, server.URL+"/v1/chat/completions", body, withAuth(config.ProtocolOpenAI, nil))
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("second status = %d, want 200", resp.StatusCode)
 		}
-		if got := slowCalls(); got != 1 {
-			t.Errorf("slow backend calls = %d, want 1 (degraded after low throughput)", got)
+		if got := slowCalls(); got != 2 {
+			t.Errorf("slow backend calls = %d, want 2 (below min sample, no degradation)", got)
 		}
 	})
 
-	t.Run("anthropic low output_tokens records failure", func(t *testing.T) {
+	t.Run("anthropic low output_tokens does NOT record failure", func(t *testing.T) {
 		slowBody := `{"id":"slow","usage":{"output_tokens":1},"content":[]}`
 		server, slowCalls := newSlowProxy(t, config.ProtocolAnthropic, slowBody, 20*time.Millisecond)
 		body := `{"model":"sonnet"}`
@@ -560,8 +560,8 @@ func TestThroughputFailure(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("second status = %d, want 200", resp.StatusCode)
 		}
-		if got := slowCalls(); got != 1 {
-			t.Errorf("slow backend calls = %d, want 1", got)
+		if got := slowCalls(); got != 2 {
+			t.Errorf("slow backend calls = %d, want 2 (below min sample, no degradation)", got)
 		}
 	})
 
@@ -817,49 +817,6 @@ func TestIdleTimeoutOpenAITruncates(t *testing.T) {
 	}
 }
 
-func TestSlowStreamIsNotInterrupted(t *testing.T) {
-	chunks := []string{
-		`data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"a"}}]}` + "\n\n",
-		`data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"b"}}],"usage":{"completion_tokens":1}}` + "\n\n",
-		"data: [DONE]\n\n",
-	}
-	slow, slowCalls := newSlowSSEBackend(t, chunks, 25*time.Millisecond)
-	fast, fastCalls := newResponseBackend(t, `{"id":"fast"}`, 0)
-	proxyServer := newProxyWithOptions(t, proxy.Options{
-		FailureThreshold:   1,
-		MinTokensPerSecond: 1e9,
-		IdleTimeout:        time.Second,
-	},
-		openAIInstance(slow.URL, "slow-key", "gpt-x"),
-		openAIInstance(fast.URL, "fast-key", "gpt-x"),
-	)
-
-	resp := send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions",
-		`{"model":"gpt-x"}`, withAuth(config.ProtocolOpenAI, nil))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	body := readBody(t, resp)
-	for _, want := range []string{`"content":"a"`, `"content":"b"`, "[DONE]"} {
-		if !strings.Contains(body, want) {
-			t.Errorf("slow stream body missing %q:\n%s", want, body)
-		}
-	}
-
-	// Low throughput was recorded without interrupting; the next request skips it.
-	resp = send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions",
-		`{"model":"gpt-x"}`, withAuth(config.ProtocolOpenAI, nil))
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("second status = %d, want 200", resp.StatusCode)
-	}
-	if got := slowCalls(); got != 1 {
-		t.Errorf("slow stream calls = %d, want 1 (degraded after low throughput)", got)
-	}
-	if got := fastCalls(); got != 1 {
-		t.Errorf("fast calls = %d, want 1", got)
-	}
-}
-
 func TestIdleTimeoutFromConfig(t *testing.T) {
 	const events = `event: message_start
 data: {"type":"message_start","message":{"id":"msg_1","usage":{"output_tokens":2}}}
@@ -884,5 +841,164 @@ data: {"type":"content_block_start","index":0,"content_block":{"type":"text","te
 	}
 	if !strings.Contains(body, `"output_tokens":2`) {
 		t.Errorf("tail did not reuse seen usage tokens; body:\n%s", body)
+	}
+}
+
+// newTrickleSSEBackend emits one tiny SSE comment per interval and then tail.
+// §19's real-time detector needs a genuinely long-lived, low-byte-rate stream.
+func newTrickleSSEBackend(t *testing.T, chunks int, interval time.Duration, tail string) (*httptest.Server, func() int32) {
+	t.Helper()
+
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		for i := 0; i < chunks; i++ {
+			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(interval)
+		}
+		_, _ = io.WriteString(w, tail)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server, calls.Load
+}
+
+func TestRealtimeSlowAnthropicPauseTurn(t *testing.T) {
+	upstream, _ := newTrickleSSEBackend(t, 40, 300*time.Millisecond, "")
+	fallback, _, fallbackCalls := newBackend(t, http.StatusOK, nil, `{"ok":true}`)
+	proxyServer := newProxyWithOptions(t, proxy.Options{
+		FailureThreshold: 1,
+		DegradeDuration:  time.Hour,
+	},
+		anthropicInstance(upstream.URL, "first-key", map[string]string{"sonnet": "model-a"}),
+		anthropicInstance(fallback.URL, "second-key", map[string]string{"sonnet": "model-b"}),
+	)
+	logs := captureLogs(t)
+
+	start := time.Now()
+	resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages",
+		`{"model":"sonnet","messages":[]}`, withAuth(config.ProtocolAnthropic, nil))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body := readBody(t, resp)
+	if elapsed := time.Since(start); elapsed < 10*time.Second {
+		t.Fatalf("stream ended after %s, want the 10s window to fill before the verdict", elapsed)
+	}
+	for _, want := range []string{
+		"event: message_delta",
+		`"stop_reason":"pause_turn"`,
+		`"stop_sequence":null`,
+		"event: message_stop",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("stream body missing %q:\n%s", want, body)
+		}
+	}
+	if got := waitForLog(t, logs, "slow stream"); !strings.Contains(got, "slow stream (realtime)") {
+		t.Errorf("log missing the realtime slow marker:\n%s", got)
+	} else if strings.Contains(got, "slow stream:") {
+		t.Errorf("post-hoc throughput judgement must be skipped after a realtime verdict:\n%s", got)
+	}
+
+	// The interrupted instance was recorded as failed; the next request falls back.
+	resp = send(t, http.MethodPost, proxyServer.URL+"/v1/messages",
+		`{"model":"sonnet","messages":[]}`, withAuth(config.ProtocolAnthropic, nil))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second status = %d, want 200", resp.StatusCode)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if got := fallbackCalls(); got != 1 {
+		t.Errorf("fallback calls = %d, want 1 (slow instance degraded)", got)
+	}
+}
+
+func TestRealtimeSlowOpenAINotInterrupted(t *testing.T) {
+	const chunks = 36
+	upstream, _ := newTrickleSSEBackend(t, chunks, 300*time.Millisecond, "data: [DONE]\n\n")
+	fallback, _, fallbackCalls := newBackend(t, http.StatusOK, nil, `{"ok":true}`)
+	proxyServer := newProxyWithOptions(t, proxy.Options{
+		FailureThreshold: 1,
+		DegradeDuration:  time.Hour,
+	},
+		openAIInstance(upstream.URL, "first-key", "gpt-x"),
+		openAIInstance(fallback.URL, "second-key", "gpt-x"),
+	)
+	logs := captureLogs(t)
+
+	resp := send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions",
+		`{"model":"gpt-x"}`, withAuth(config.ProtocolOpenAI, nil))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body := readBody(t, resp)
+	if count := strings.Count(body, "keepalive"); count != chunks {
+		t.Errorf("forwarded chunks = %d, want %d (OpenAI slow streams must not be interrupted)", count, chunks)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("stream body missing the terminating [DONE]:\n%s", body)
+	}
+	if got := waitForLog(t, logs, "slow stream"); !strings.Contains(got, "slow stream (realtime)") {
+		t.Errorf("log missing the realtime slow marker:\n%s", got)
+	}
+
+	resp = send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions",
+		`{"model":"gpt-x"}`, withAuth(config.ProtocolOpenAI, nil))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second status = %d, want 200", resp.StatusCode)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if got := fallbackCalls(); got != 1 {
+		t.Errorf("fallback calls = %d, want 1 (slow instance degraded)", got)
+	}
+}
+
+func TestRealtimeSlowWindowNotFull(t *testing.T) {
+	// Three tiny chunks over ~3s: the byte rate is far below the threshold, but
+	// the 10s window is not full, so no real-time verdict may fire (§19.4).
+	upstream, upstreamCalls := newTrickleSSEBackend(t, 3, time.Second, "")
+	proxyServer := newProxyWithOptions(t, proxy.Options{
+		FailureThreshold: 1,
+		DegradeDuration:  time.Hour,
+	},
+		anthropicInstance(upstream.URL, "first-key", map[string]string{"sonnet": "model-a"}),
+	)
+	logs := captureLogs(t)
+
+	resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages",
+		`{"model":"sonnet","messages":[]}`, withAuth(config.ProtocolAnthropic, nil))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body := readBody(t, resp)
+	if strings.Contains(body, "pause_turn") {
+		t.Errorf("stream below the 10s window must not be judged slow:\n%s", body)
+	}
+	// This test asserts the *absence* of a realtime verdict, so it cannot wait
+	// for "slow stream" (it never appears). Waiting for the request log line
+	// instead guarantees the handler finished judging before we check.
+	if got := waitForLog(t, logs, " -> "); strings.Contains(got, "slow stream (realtime)") {
+		t.Errorf("log reports a realtime slow verdict before the window filled:\n%s", got)
+	}
+
+	resp = send(t, http.MethodPost, proxyServer.URL+"/v1/messages",
+		`{"model":"sonnet","messages":[]}`, withAuth(config.ProtocolAnthropic, nil))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second status = %d, want 200", resp.StatusCode)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if got := upstreamCalls(); got != 2 {
+		t.Errorf("upstream calls = %d, want 2 (no failure recorded)", got)
 	}
 }

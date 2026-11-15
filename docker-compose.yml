@@ -1,7 +1,7 @@
 services:
   model-router:
     build: .
-    image: model-router:0.0.1-rc
+    image: model-router:0.1.0
     ports:
       - "18080:18080"
     environment:

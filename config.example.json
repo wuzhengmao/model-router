@@ -12,6 +12,7 @@
   "instances": {
     "openai": [
       {
+        "name": "DeepSeek",
         "base_url": "https://api.deepseek.com",
         "api_key": "sk-replace-with-your-deepseek-key",
         "provider": "deepseek",
@@ -21,6 +22,7 @@
     ],
     "anthropic": [
       {
+        "name": "DeepSeek-Anthropic",
         "base_url": "https://api.deepseek.com/anthropic",
         "api_key": "sk-replace-with-your-deepseek-key",
         "provider": "deepseek",
@@ -33,6 +35,7 @@
         }
       },
       {
+        "name": "DeepSeek-Tail",
         "base_url": "https://api.deepseek.com/anthropic",
         "api_key": "sk-replace-with-your-deepseek-key",
         "provider": "deepseek",

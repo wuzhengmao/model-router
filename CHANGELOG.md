@@ -2,6 +2,33 @@
 
 本文件记录项目的重要变更，遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的结构与语义化版本号规则。
 
+## [0.1.0] - 2026-11-15
+
+### Added
+
+- M4.2 三段超时职责划分：新增 `fallback.first_token_timeout`（默认 `10s`，`0` 禁用）——实例 `timeout` 管到响应头、首 token 超时管响应头→首个数据块（未提交可回退）、`idle_timeout` 管块间间隔。
+- M4.2 流式吞吐改为纯生成速度判定（首数据块→末数据块），并加最小样本保护：生成时长 `<2s` 或输出 `<100` token 时不判定、按成功计。
+- M4.2 每请求日志打印输入/输出 token 数与生成速度（`in` / `out` / `ttft` / `gen` / `total`）。
+- M4.2 低速在 OpenAI 与 Anthropic 一律不打断（仅记一次失败），`pause_turn` 只由 `idle_timeout` 触发。
+- M4.3 / M4.4 请求日志显示客户端类型（`client=`，十一级识别规则：dsh / claude-cli / curl / python / node / go-http-client 等）与来源 IP（`ip=`，优先 `X-Forwarded-For` 首段，回退 `RemoteAddr`）。
+- M4.4 Anthropic 入口双认证：客户端可携带 `x-api-key: <auth_token>` **或** `Authorization: Bearer <auth_token>`，两者任一匹配即通过（官方 Anthropic SDK 用前者、Claude Code 用后者，两侧兼容）。
+- M4.4 `[1m]` 长上下文变体：`opus[1m]` / `sonnet[1m]` 等带后缀的模型名剥除后缀后参与角色匹配，不再漏到 `*` 托底。
+- M4.5 实例 `name` 字段：仅用于日志显示（不参与路由、不改变转发），缺省回退 `base_url`；Web 配置页实例卡片新增名称输入框。
+- M4.5 日志格式改版：`POST <path> -> <name>/<model> (<req_model>) in <total>s ↑<in> ↓<out> <gen>t/s from <ip> <client>`；生成速度不满足样本门槛时整段省略。
+- M4.5.1 实时低速检测（§19）：10 秒滑动窗口按字节速率（`bytesPerToken = 3`）计算，Anthropic 触发后中断流并补 `pause_turn` 收尾、OpenAI 触发后只记失败不打断；窗口未满 10 秒不判定（避免冷启动误判）。
+- M4.6 gzip 响应体修复（§20）：不再透传客户端 `Accept-Encoding`（交给 Go Transport 自主协商并透明解压），并对上游强制压缩的响应按 `Content-Encoding` 解压后转发（`br` / `zstd` 等不可解码编码保留透传并标记不可解析，跳过 usage 与字节速率判定）。
+
+### Changed
+
+- 版本号升为 `0.1.0`（开发阶段最后一个小版本，正式发布前仍可能调整）。
+- 容器时区默认 `Asia/Shanghai`（Dockerfile 打入 `tzdata` 与 `zoneinfo/Asia/Shanghai`，`ENV TZ=Asia/Shanghai`），`docker logs` 时间与宿主机一致。
+- 文档示例与占位符统一使用中性名称（`DeepSeek` / `192.0.2.10` / `claude-cli`），不再出现私有环境名称。
+
+### Fixed
+
+- 请求日志中 `↑n/a ↓n/a`：客户端带 `Accept-Encoding: gzip` 时上游返回压缩 SSE，内部解析读到压缩字节导致 usage 解析失败（同时会造成低速误判）；现已解压后再解析。
+- 日志断言测试偶发失败（时序竞态）：`logRequest` 在响应体写完、客户端读完后才执行，测试改为轮询等待日志出现（`waitForLog`，10ms 轮询 / 2s 超时）。
+
 ## [0.0.1-rc] - 2026-11-13
 
 ### Added
@@ -65,11 +92,25 @@
 - M4.1 流式空闲超时：committed 后按 chunk 到达 Reset 的 `time.AfterFunc` 计时；超时关闭上游读取并记实例失败。Anthropic 补发 `content_block_stop`（若在块内）+ `message_delta(stop_reason=pause_turn)` + `message_stop`；OpenAI 通过 Hijack 直接中断客户端连接（不补 `[DONE]`）。
 - M4.1 流式吞吐：SSE 解析 `usage.output_tokens` / `completion_tokens`，流结束后低于 `min_tokens_per_second` 仅记失败、不打断；非流式逻辑不变。
 - M4.1 测试：idle_timeout 缺省/显式/0/非法；Anthropic 静默流收到 pause_turn 收尾（含 content_block_stop 与 usage）；OpenAI 静默流连接截断；OpenAI 慢速流完整结束且仅记失败；配置驱动的 idle_timeout 生效。
+- M4.3 请求日志增加客户端标识与来源 IP（§16）：每请求一行追加 `client=`（按十一级规则识别 `claude-code/<version>`、`claude-code`、`openai-python`、`openai-node`、`anthropic-js`、`anthropic-python`、`dsh`、`curl`、UA 前缀、`unknown`）与 `ip=`（`X-Forwarded-For` 首段，否则 `RemoteAddr` 去端口）；401 请求同样打印一行，`client`/`ip` 带出但不含任何密钥。规则为纯字符串匹配、大小写不敏感。
+- M4.3 测试：`TestRequestLogFormat`（字段顺序与取值）、`TestClientIdentification`（十一级 UA/头规则）、`TestClientIP`（XFF 首段/`unknown`/RemoteAddr 去端口）、`TestAuthFailureIsLoggedWithoutSecrets`（401 行含 client/ip 且不泄露 token）。
+- M4.4 Anthropic 入口双认证（§17.2）：先取 `x-api-key` 匹配，否则回退 `Authorization: Bearer`（前缀大小写不敏感）；两者均缺失/不匹配 → 401。OpenAI 入口仍只认 Bearer。两候选头各自 `subtle.ConstantTimeCompare`，上游仍使用实例 `api_key`、客户端 token 不外传。
+- M4.4 `[1m]` 变体识别（§17.3）：R4c 角色判定前剥除 `model` 尾部 `[1m]`（大小写不敏感），`opus[1m]`/`sonnet[1m]`/`claude-opus-4-5[1m]` 正确命中角色并改写为 `roles[<role>]`，不再漏到 `*` 托底。
+- M4.4 吞吐判定样本门槛（§17.4）：生成时长改为“首数据块→末数据块”（响应开始计时，建连/TTFT 不计入）；仅当输出 >100 token 且生成时长 >2s 且能拿到 usage 时才计算 token/s，不满足门槛 → 跳过并视为健康（不记失败）。
+- M4.4 请求日志最终格式（§17.6）：新增 `req_model=`（客户端原始模型，拿不到为 `n/a`），`model=` 为实际转发模型；`gen=` 仅在满足样本门槛时显示数值，否则 `n/a`。字段顺序固定：`req_model` → `model` → 协议 → `client` → `ip` → `total` → `ttft` → `in` → `out` → `gen`。
+- M4.4 容器时区（§17.7）：Dockerfile build 阶段安装 `tzdata`，运行阶段 COPY `zoneinfo/Asia/Shanghai` 与 `/etc/localtime`，`ENV TZ=Asia/Shanghai`，容器日志时间戳为北京时间（UTC+8）。
+- M4.4 测试：`TestAnthropicDoubleAuth`（x-api-key / Bearer / 小写 bearer / 缺失 / 有头但错）、`TestRouteByRoles` 的 `[1m]` 子用例（含 `opus[1M]`、`claude-*[1m]`）、`TestRouteWildcardFallback` 的 `opus[1x]`/`opus [1m]` 反例、`TestThroughputFailure` 改为断言样本不足不记失败、`TestRequestLogFormat` 断言 `req_model` 与 `gen=n/a`。
 
 ### Changed
 
+- M4.6 修复 gzip 压缩响应体导致 usage 解析与 §19 实时低速判定失效：转发上游前删除客户端 `Accept-Encoding`，交给 Go `http.Transport` 协商并透明解压；上游强制 `Content-Encoding: gzip` 时再用 `gzip.Reader` 解压后转发并移除 `Content-Encoding`/`Content-Length`。SSE 状态机、`parseUsage` 与字节速率窗口改为按解压后字节计算，客户端仍收到明文响应；`br`/`zstd` 等不可解码编码保持透传并打 warn，gzip 解压失败按上游错误返回 502 并 `recordFailure`。
 - M4.1 流式响应会先移除上游 `Content-Length`（补发收尾事件时需要 chunked 帧）；SSE 响应头其余字段仍原样透传。
 - M4.1 流式吞吐判定由“跳过”改为“按 SSE usage 判定但从不打断流”。
+- M4.4 Anthropic 入口 401 文案调整：`x-api-key` 空且 `Authorization` 不以 `Bearer ` 开头 → `missing x-api-key or Authorization header`；有头但不匹配 → `invalid service access token`。
+- M4.4 吞吐耗时口径由“单次候选尝试总耗时（含建连/等待响应头）”改为“纯生成窗口”（流式首块→末块、非流式响应头→响应体读完），与 §17.4 一致；样本不足时不再产生失败记录。
+- M4.3 请求日志行新增 `req_model`（客户端原始模型）与 `client` / `ip` 字段；`model` 仍为实际转发模型，原有 `total`/`ttft`/`in`/`out`/`gen` 不变。
+- M4.4 `[1m]` 后缀不再作为未命中处理：`sonnet[1m]`、`opus[1m]` 等由角色路由正确处理（此前会落到 `*` 托底或 R5）。
+- M4.4 Docker 运行镜像增加时区数据（`zoneinfo/Asia/Shanghai` + `/etc/localtime` + `TZ`）；distroless 本身无 tzdata，镜像仅因此增加一个 zoneinfo 文件。
 - M5 GitHub Actions 跨平台构建：`.github/workflows/build.yml` 在 push / PR / tag `v*` 上以 6 组合（windows/linux/darwin × amd64/arm64）构建并上传产物；tag 时创建 Release，并在 ubuntu runner 上用 buildx 构建 `linux/amd64,linux/arm64` 镜像推送 GHCR（`:<version>` 与 `:latest`）。
 - M5 Docker 镜像：multi-stage `golang:1.27-alpine` → `gcr.io/distroless/static-debian12:nonroot`；`CGO_ENABLED=0`、`TARGETOS/TARGETARCH` 多架构构建、非 root、`EXPOSE 18080`，入口 `-config /home/nonroot/config/config.json`，默认 `MODEL_ROUTER_LISTEN=0.0.0.0:18080`。
 - M5 `docker-compose.yml` 部署示例：端口 18080、挂载 `./.docker` 目录（`.docker/config.json`）、环境变量覆盖、`restart: unless-stopped`。

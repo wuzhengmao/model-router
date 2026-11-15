@@ -1,4 +1,4 @@
-# model-router 设计文档（M1 ～ M3.1）
+# model-router 设计文档（M1 ～ M4.4）
 
 > 需求以 [requirements.md](requirements.md) 为准（FR-4、§7、§8、§9）；测试用例见 [tests.md](tests.md)。
 
@@ -8,8 +8,10 @@
 - **M2**：Anthropic `/v1/messages`、多后端路由、别名/角色映射、协议化错误体。
 - **M3**：`/v1/models`、Web 配置页、管理 REST API、原子 reload、环境变量覆盖（§8.9）。
 - **M3.1**：配置改为 `instances`（提供商实例 + 模型映射）、实例展开路由、可视化配置页、probe/validate API。
+- **M4.x**：实例粒度回退降级、`fallback` 配置、流式空闲超时、请求日志（客户端/来源 IP）、双认证、`[1m]` 变体、吞吐样本门槛（§18～§23）。
+- **M5**：跨平台构建与容器化（§21）。
 
-不做：回退降级（M4）、跨平台 CI/Docker（M5）、协议转换（永不）。
+不做：协议转换（永不）。
 
 ## 2. 模块与职责
 
@@ -149,15 +151,15 @@ JSON 对象不保留键顺序，因此 anthropic 条目按固定顺序展开：`
 - 多实例声明同一角色/`*` → 按实例顺序取第一个。
 - 该协议没有展开条目 → 502，不读 body、不转发。
 - 改写实现：`map[string]json.RawMessage` 解析后仅替换顶层 `model` 再 `json.Marshal`；其余字段语义不变，顶层 key 顺序可能变化。
-- `best`、`sonnet[1m]`、`opus[1m]`、`opusplan` 不做特殊处理：有 `*` 时被托底，否则 R5。
+- `[1m]` 变体（`sonnet[1m]`、`opus[1m]`、`claude-opus-4-5[1m]`）在 R4c 判定前剥除尾部 `[1m]`（大小写不敏感），剥除后按角色规则命中并改写（§23.2）；`best`、`opusplan` 仍不做特殊处理：有 `*` 时被托底，否则 R5。
 - M4 起，基础实例确定后还会构建候选链并执行回退状态机，详见 §18。
 
 ## 6. 认证
 
 - 客户端认证（按入口）：
   - `/v1/chat/completions`、`/v1/models`（OpenAI 判定）：`Authorization: Bearer <auth_token>`；
-  - `/v1/messages`、`/v1/models`（仅带 `x-api-key`）：`x-api-key: <auth_token>`；
-  - 常量时间比较；失败 401 按入口协议错误体。
+  - `/v1/messages`（Anthropic 判定）：**双认证**——先取 `x-api-key` 匹配，否则回退 `Authorization: Bearer`；`/v1/models` 仅带 `x-api-key` 时按 Anthropic 处理；
+  - 常量时间比较（两个候选头各自 `subtle.ConstantTimeCompare`）；失败 401 按入口协议错误体。Anthropic 入口缺失凭据的文案为 `missing x-api-key or Authorization header`，有头但不匹配为 `invalid service access token`（§23.1）。
 - 认证先于路由：未认证访问未知路径 → 401（OpenAI 格式）。
 - 上游认证：openai 条目 `Authorization: Bearer <api_key>`；anthropic 条目 `x-api-key: <api_key>`；客户端 Authorization/x-api-key 均不进入上游。
 
@@ -249,7 +251,7 @@ OpenAI：`{"error":{"message","type","code"}}`；Anthropic：`{"type":"error","e
 
 ## 13. 版本与构建
 
-- 版本唯一来源 `internal/version/version.txt`（`0.0.1-rc`），构建脚本注入 `-ldflags -X`。
+- 版本唯一来源 `internal/version/version.txt`（`0.1.0`），构建脚本注入 `-ldflags -X`。
 - `CGO_ENABLED=0`、`-trimpath`、`-s -w`；产物 `dist/model-router-<version>-<goos>-<goarch>[.exe]`。
 
 ## 14. 关键决策与未覆盖情形
@@ -345,8 +347,9 @@ OpenAI：`{"error":{"message","type","code"}}`；Anthropic：`{"type":"error","e
 
 - 连接失败 / dial 超时 / 等待响应头超时（实例 `timeout`）→ 可重试失败，记录计数并换下一候选。
 - 响应体复制错误（含客户端断开）→ 已提交，记录失败但不重试。
-- 非流式响应：边转发边捕获响应体（上限 4 MiB），完成后解析 usage：OpenAI `completion_tokens`、Anthropic `output_tokens`；`tokens / 本次尝试耗时秒数 < min_tokens_per_second` → 记录失败（响应已发出，不影响本次结果）。
-- 流式响应（M4.1）：转发 SSE 时解析每行 `data:` JSON 中的 usage；流正常结束后按同一阈值判定，**只记失败、不打断流**。缺少 usage 不判定。
+- 非流式响应：边转发边捕获响应体（上限 4 MiB），完成后解析 usage：OpenAI `completion_tokens`、Anthropic `output_tokens`；生成速度 = `tokens / 生成时长`（`响应体读取完成 − 响应头到达`），满足样本门槛（≥100 token 且生成时长 >2s）后，`生成速度 < min_tokens_per_second` → 记录失败（响应已发出，不影响本次结果）。
+- 流式响应（M4.1）：转发 SSE 时解析每行 `data:` JSON 中的 usage；流正常结束后按同一口径（`末块到达 − 首块到达`）与同一门槛判定，**只记失败、不打断流**。
+- **样本门槛（M4.4）**：输出 token ≤100、生成时长 ≤2s 或拿不到 usage → 跳过判定并 `recordSuccess`，不记失败（§23.3）。
 - 流式空闲超时（M4.1）：committed 后以每个 chunk 到达时 `Reset` 的 `time.AfterFunc` 计时；`idle_timeout` 内无新数据 → 关闭上游读取、记实例失败，并按协议补发收尾/截断（§20）。
 - 缺少 usage 或非流式响应体超过捕获上限 → 不判定（按成功记录）。
 
@@ -361,8 +364,8 @@ OpenAI：`{"error":{"message","type","code"}}`；Anthropic：`{"type":"error","e
 - **D-M4-1 Anthropic 精确模型候选链**：§11.2 只定义“角色 R”链；实现把 R4a exact 请求按“值相等不改写 / 否则用 `*` 改写”处理，作为最小扩展。
 - **D-M4-2 R5 无 `*` 兜底**：§11.2 说无 `*` 则跳过，可能导致空链；实现回退到首个实例且不改写，保持 M3 R5 行为。
 - **D-M4-3 成功定义**：任意 HTTP 响应（含 4xx/5xx）都视为实例成功并清零失败计数；仅连接/超时/吞吐计失败。
-- **D-M4-4 吞吐范围**：仅非流式、usage 可解析且响应体 ≤4 MiB 时判定；流式（M4.1）按 SSE 中的 usage 在流结束后判定但不打断；`min_tokens_per_second=0` 时完全不判定；`completion_tokens=0` 且耗时有值会被判为低吞吐。
-- **D-M4-5 耗时口径**：吞吐耗时按“单次候选尝试”（client.Do 到响应体复制完成）计算，而非整个请求（含回退）。
+- **D-M4-4 吞吐范围（M4.4 修订）**：仅 usage 可解析（非流式响应体 ≤4 MiB；流式取 SSE 中最近一次 usage）且满足样本门槛（>100 token 且生成时长 >2s）时判定；`min_tokens_per_second=0` 时完全不判定；`completion_tokens=0` 因样本不足被跳过，不会误判低吞吐。
+- **D-M4-5 耗时口径（M4.4 修订）**：生成时长只计生成窗口——流式为「末个数据块 − 首个数据块」，非流式为「响应体读完 − 响应头到达」；建连/TTFT/回退耗时不计入，由 `timeout`/`first_token_timeout` 管。
 - **D-M4-6 reload 清空回退状态**：reload 重建 handler，计数与回退期随之清零（状态仅内存）。
 - **D-M4-7 参数来源（M4-config 修订）**：阈值 / 回退时长 / 吞吐阈值默认 3 / 5m / 30，可由顶层 `fallback` 覆盖（`min_tokens_per_second=0` 禁用吞吐判定）；`NewWithOptions` 仍可注入测试时钟与参数。
 - **D-M4-8 基础实例选择**：沿用 §9.2 的逐实例 R4a→R4c 与全局 `*` 第二轮；因此靠前实例的角色命中会先于靠后实例的精确命中（与 M3 一致）。
@@ -432,8 +435,8 @@ OpenAI：`{"error":{"message","type","code"}}`；Anthropic：`{"type":"error","e
 ### 20.3 流式吞吐（低速）
 
 - SSE 转发时解析每个 `data:` JSON 中的 `usage.completion_tokens`（OpenAI）或 `usage.output_tokens`（Anthropic），取最近值。
-- 流正常结束后按“本次候选尝试耗时”计算 `tokens/s`；低于 `min_tokens_per_second` 仅 `recordFailure`，不打断、不回退本次请求（§13.5）。
-- `min_tokens_per_second=0` 或未见到 usage 时跳过判定。
+- 流正常结束后按“首块→末块”的生成时长计算 `tokens/s`；仅在满足样本门槛（>100 token 且 >2s，§23.3）时判定，低于 `min_tokens_per_second` 仅 `recordFailure`，不打断、不回退本次请求（§13.5）。
+- `min_tokens_per_second=0`、未见到 usage 或样本不足时跳过判定。
 
 ### 20.4 配置与页面
 
@@ -466,6 +469,7 @@ OpenAI：`{"error":{"message","type","code"}}`；Anthropic：`{"type":"error","e
 - 两阶段：`golang:1.27-alpine AS build` → `gcr.io/distroless/static-debian12:nonroot`。
 - build 阶段接收 `TARGETOS`/`TARGETARCH`（buildx 自动注入）与可选 `VERSION`；未传 `VERSION` 时读取 `internal/version/version.txt`，保证版本单一来源。
 - `CGO_ENABLED=0` 静态编译；运行阶段只拷二进制，`USER nonroot:nonroot`、`EXPOSE 18080`、`ENV MODEL_ROUTER_LISTEN=0.0.0.0:18080`；入口固定 `-config /home/nonroot/config/config.json`。
+- **容器时区（M4.4，§17.7）**：build 阶段 `apk add --no-cache tzdata`，运行阶段从 build 阶段 COPY `zoneinfo/Asia/Shanghai` 到同名路径并覆盖 `/etc/localtime`，`ENV TZ=Asia/Shanghai`；distroless 不自带 tzdata，容器日志时间戳为北京时间（UTC+8）。
 - 镜像不内置配置；运行时挂载或通过 `MODEL_ROUTER_*` 覆盖。
 
 ### 21.3 docker-compose.yml
@@ -488,3 +492,123 @@ OpenAI：`{"error":{"message","type","code"}}`；Anthropic：`{"type":"error","e
 - **D-M5-6 distroless 调试能力**：运行镜像无 shell，只能通过日志/端口排查；这是非 root 最小镜像的取舍。
 - **D-M5-7 本地端口冲突**：compose 示例固定 18080；若宿主机已有进程监听该端口，需要改端口映射；不属于镜像行为。
 - **D-M5-8 不做**：代码签名、macOS 公证、系统包、K8s/Helm、CI 真实 E2E（§14.6）。
+
+## 22. 请求日志：客户端识别与来源 IP（M4.3，§16）
+
+### 22.1 客户端标识 `client=`
+
+按 §16.2 的十一级规则逐条匹配请求头，命中即止（全部大小写不敏感，纯字符串匹配，不引依赖、不做 UA 库解析）：
+
+| 优先级 | 判据 | 标识 |
+|---|---|---|
+| 1 | `User-Agent` 以 `claude-cli/` 开头 | `claude-code/<version>`（取 `/` 后、首个空格前的版本号） |
+| 2 | 存在 `X-Claude-Code-Session-Id` | `claude-code` |
+| 3 | `anthropic-beta` 含 `claude-code` | `claude-code` |
+| 4 | `User-Agent` 含 `openai-python` / `OpenAI/Python` | `openai-python` |
+| 5 | `User-Agent` 含 `openai-node` / `OpenAI/Node` | `openai-node` |
+| 6 | `User-Agent` 含 `anthropic-sdk-typescript` / `Anthropic/JS` | `anthropic-js` |
+| 7 | `User-Agent` 含 `anthropic-sdk-python` / `Anthropic/Python` | `anthropic-python` |
+| 8 | `User-Agent` 含 `dsh` | `dsh` |
+| 9 | `User-Agent` 以 `curl/` 开头 | `curl` |
+| 10 | 其他且 UA 非空 | UA 前 32 字符（遇空格截断） |
+| 11 | UA 为空 | `unknown` |
+
+实测样本（Claude Code 2.1.323）：`User-Agent: claude-cli/2.1.323 (external, sdk-cli, agent-sdk/0.3.322)` + `X-Claude-Code-Session-Id: ...` → `client=claude-code/2.1.323`。
+
+### 22.2 来源 IP `ip=`
+
+- 先取 `X-Forwarded-For` 首段（按 `,` 切分、trim；为空或 `unknown` 视为缺失）；
+- 否则取 `r.RemoteAddr` 的 host 部分（去掉端口）；
+- 不采信 `X-Real-IP`，不做 GeoIP / 反向 DNS。
+- **容器限制**：docker bridge 网络下容器看到的来源是 docker 网关地址（如 `172.18.0.1`），不是真实客户端 IP；需要真实 IP 时用 `network_mode: host` 或前置反代透传 `X-Forwarded-For`（README 同步写明）。
+
+### 22.3 日志行
+
+格式与字段顺序见 §23.4（M4.4 在 §16.4 基础上增加 `req_model`）。认证失败（401）同样打印一行，`client`/`ip` 照常带出，便于排查撞密钥来源；该行 `req_model`/`model` 为 `n/a`、不含任何 token 数值。
+
+## 23. M4.4：双认证、`[1m]` 变体、吞吐门槛、日志与容器时区（§17）
+
+### 23.1 Anthropic 入口双认证（修订 §6/FR-4）
+
+- `/v1/messages`：先取 `x-api-key`，匹配 `auth_token` 即通过；否则回退 `Authorization: Bearer <token>`，匹配即通过；两者缺失或不匹配 → 401。
+- OpenAI 入口不变：仅 `Authorization: Bearer`（`x-api-key` 不参与）。
+- 两入口共用同一 `auth_token`；上游转发认证不变（OpenAI `Bearer api_key`、Anthropic `x-api-key api_key`），两层分离、客户端 token 永不外传。
+- 常量时间比较不变：两个候选头分别 `subtle.ConstantTimeCompare`，任一命中即通过。
+- 401 文案：`x-api-key` 为空且 `Authorization` 不以 `Bearer ` 开头（大小写不敏感）→ `missing x-api-key or Authorization header`；否则 → `invalid service access token`（均为 Anthropic `authentication_error`）。
+
+### 23.2 `[1m]` 变体识别（修订 §5.2 与 R4c）
+
+- 角色判定前置：剥除 `model` 尾部一个 `[1m]`（大小写不敏感），再按 R4c 判定（精确等于角色名，或以 `claude-<role>-` 开头）。
+- 改写逻辑不变：`opus[1m]` → 角色 `opus` → 改写为 `roles["opus"]`；`claude-opus-4-5[1m]` 剥除后按前缀命中 `opus`。
+- 仅 Anthropic 角色路由生效；OpenAI 入口无角色概念，不受影响。剥除后仍未命中 → 按 R4d `*` 托底 / R5 回退，行为不变。
+- 剥离只针对尾部标记：`opus[1x]`、`opus [1m]`（带空格）不视为变体。
+
+### 23.3 吞吐判定最终口径（修订 §18.3/§20.3）
+
+- 生成时长：流式 `末个数据块 − 首个数据块`；非流式 `响应体读完 − 响应头到达`。**从响应开始计算**，建连/排队/TTFT 不计入（由 `timeout`/`first_token_timeout` 管）。
+- 输出 token：OpenAI `usage.completion_tokens` / Anthropic `usage.output_tokens`。
+- 样本门槛 `minThroughputSampleTokens=100`、`minThroughputSampleDuration=2s`：仅当「输出 >100 token」且「生成时长 >2s」且能拿到 usage 时才计算 `token/s`；不满足任一条 → 跳过并视为健康（`recordSuccess`，不记失败）。
+- 满足门槛时：`tokens/生成时长 < min_tokens_per_second` → `recordFailure`，否则成功。
+- 低速一律不打断：两协议都完整转发到结束，仅响应后记一次失败；`pause_turn` 收尾只用于 `idle_timeout`。
+
+### 23.4 请求日志最终格式（修订 §22.3）
+
+每请求结束打印一行，字段顺序固定：
+
+```
+POST /v1/messages -> req_model="opus[1m]" model="mti-flash" (anthropic) client=claude-code/2.1.323 ip=172.18.0.1 total=2.82s ttft=0.71s in=31 out=300 gen=142 t/s
+```
+
+| 字段 | 说明 |
+|---|---|
+| `req_model` | 客户端请求的原始 `model`（未改写）；拿不到写 `n/a` |
+| `model` | 实际转发给上游的 `model`（改写后） |
+| 协议 | `openai` / `anthropic` |
+| `client` | 客户端标识（§22.1） |
+| `ip` | 来源 IP（§22.2） |
+| `total` | 总耗时 |
+| `ttft` | 首 token 耗时（未知 `n/a`） |
+| `in` / `out` | 输入/输出 token 数（未知 `n/a`） |
+| `gen` | 生成速度 `t/s`；**仅满足 §23.3 样本门槛时显示数值**，否则 `n/a` |
+
+- 生成速度未过样本门槛时 `gen` 写 `n/a`，避免小样本噪声。
+- 401 行：`req_model`/`model` 写 `n/a`，`client`/`ip` 带出，不含密钥。
+- 保留既有 `slow` / `slow stream` / `idle` 告警日志。
+
+### 23.5 容器时区（§17.7）
+
+- 见 §21.2：`tzdata` + `zoneinfo/Asia/Shanghai` + `/etc/localtime` + `ENV TZ=Asia/Shanghai`，`docker logs` 时间戳为北京时间。
+- 仅影响日志时间戳与 `TZ` 环境，不影响任何业务语义。
+
+### 23.6 决策与未覆盖
+
+- **D-M4.4-1 双认证优先级**：`x-api-key` 先于 `Authorization`；两者都带且只有一个正确时按“任一命中即通过”处理（不做“两者必须同时匹配”的更严判定）。
+- **D-M4.4-2 `[1m]` 只影响角色路由**：OpenAI 入口与 R4a 精确匹配不改写/不剥除；请求仍是 `opus[1m]`，日志 `req_model` 保留原值，`model` 展示改写后的值。
+- **D-M4.4-3 门槛与 `min_tokens_per_second` 的关系**：样本门槛无条件生效；`min_tokens_per_second=0` 仍完全禁用吞吐判定（连 `gen` 数值也不在日志显示）。
+- **D-M4.4-4 生成时长取不到**：流式只有一个块（`firstBlock == lastBlock`）或非流式拿不到 usage → 视为样本不足，按成功处理。
+- **D-M4.4-5 401 日志不含 token**：只打印 `client`/`ip`/耗时/`n/a` 占位，绝不打印 `Authorization`/`x-api-key` 值。
+- **D-M4.4-6 明确不做**：不改 OpenAI 入口认证；不改上游认证；不引入滑动窗口/历史采样；不因低速中断已 committed 的流；不持久化请求日志、不做 GeoIP/反向 DNS；不采信 `X-Real-IP`。
+
+## 24. gzip 压缩响应体（M4.6，§20）
+
+### 24.1 问题
+
+客户端（Claude Code、deepseek-harness 等）带 `Accept-Encoding: gzip` 时，proxy 曾把该头透传给上游；上游返回 `Content-Encoding: gzip` 的压缩 SSE 体，proxy 原样转发所以客户端正常，但内部解析全部看到压缩字节：
+
+- `sseState.feed` 解析不到 `usage` → 日志 `↑n/a ↓n/a`；
+- §19 实时低速窗口按压缩后的字节数计算速率（小 5~10 倍）→ 误判低速 → Anthropic 错误中断流并补 `pause_turn`；
+- 非流式 `capture` + `parseUsage` 同样失败。
+
+### 24.2 修复
+
+- 构造上游请求并复制客户端头后 `outReq.Header.Del("Accept-Encoding")`：由 Go `http.Transport` 自行协商 gzip 并透明解压，同时移除响应 `Content-Encoding` / `Content-Length`。客户端头不再决定上游编码。
+- 双保险：响应仍带 `Content-Encoding` 时，`gzip`（含 `x-gzip`）用 `gzip.Reader` 包一层，转发解压后的字节，并在写响应头前删除 `Content-Encoding` / `Content-Length`；`br` / `zstd` 等保持透传，打一条含实例名与编码的 warn，说明该编码下 usage 与字节速率不可用。
+- 解压发生在 `copySSE` / `copyBodyTee` / `parseUsage` 之前：SSE 状态机与 §19 字节窗口看到的都是解压后字节。客户端始终收到明文，不重新压缩；`isEventStream` 仍看 `Content-Type`。
+- 流式 gzip 使用惰性 `gzip.NewReader`（首个数据块读取时初始化），上游静默时仍由 `first_token_timeout` 关闭连接；非流式立即初始化，坏 gzip 在提交响应前失败。
+- gzip 解压失败按上游错误处理：`recordFailure`，响应未提交时沿候选链回退，全部失败返回 502。
+
+### 24.3 决策与未覆盖
+
+- **D-M4.6-1 编码选择权归代理**：客户端 `Accept-Encoding` 不再透传；即使客户端要求 `identity`，上游仍按 Transport 协商返回 gzip，由代理解压后明文下发。
+- **D-M4.6-2 不可解码编码**：`br` / `zstd` 等只记 warn，不解压、不解析；客户端收到的响应不变。
+- **D-M4.6-3 不回填 Content-Length**：解压后流式走 chunked；非流式由 Go server 按实际写出字节处理。

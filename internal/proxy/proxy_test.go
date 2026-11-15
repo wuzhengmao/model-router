@@ -1,8 +1,12 @@
 package proxy_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -401,7 +405,7 @@ func TestMissingAuthorizationReturns401(t *testing.T) {
 				if apiErr.Error.Type != "authentication_error" {
 					t.Errorf("error.type = %q, want %q", apiErr.Error.Type, "authentication_error")
 				}
-				if want := "missing x-api-key header"; apiErr.Error.Message != want {
+				if want := "missing x-api-key or Authorization header"; apiErr.Error.Message != want {
 					t.Errorf("error.message = %q, want %q", apiErr.Error.Message, want)
 				}
 			} else {
@@ -452,20 +456,83 @@ func TestWrongTokenReturns401(t *testing.T) {
 	}
 }
 
-func TestAnthropicRejectsAuthorizationBearer(t *testing.T) {
-	proxyServer := newProxy(t, serviceToken, anthropicInstance("https://anthropic.example", anthropicKey, map[string]string{"sonnet": "m"}))
+func TestAnthropicDoubleAuth(t *testing.T) {
+	t.Run("x-api-key only is accepted", func(t *testing.T) {
+		backend, captured, _ := newBackend(t, http.StatusOK, nil, `{"ok":true}`)
+		proxyServer := newProxy(t, serviceToken, anthropicInstance(backend.URL, anthropicKey, map[string]string{"sonnet": "m"}))
 
-	resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages", `{"model":"test-model"}`, map[string]string{
-		"Authorization": "Bearer " + serviceToken,
+		resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages", `{"model":"sonnet"}`,
+			map[string]string{"x-api-key": serviceToken})
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("proxy status = %d, want 200", resp.StatusCode)
+		}
+		if got := captured().header.Get("x-api-key"); got != anthropicKey {
+			t.Errorf("upstream x-api-key = %q, want the instance key %q", got, anthropicKey)
+		}
 	})
 
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("proxy status = %d, want %d", resp.StatusCode, http.StatusUnauthorized)
-	}
-	apiErr := decodeAnthropicError(t, resp)
-	if apiErr.Error.Type != "authentication_error" {
-		t.Errorf("error.type = %q, want %q", apiErr.Error.Type, "authentication_error")
-	}
+	t.Run("Authorization Bearer only is accepted", func(t *testing.T) {
+		backend, captured, _ := newBackend(t, http.StatusOK, nil, `{"ok":true}`)
+		proxyServer := newProxy(t, serviceToken, anthropicInstance(backend.URL, anthropicKey, map[string]string{"sonnet": "m"}))
+
+		resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages", `{"model":"sonnet"}`,
+			map[string]string{"Authorization": "Bearer " + serviceToken})
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("proxy status = %d, want 200", resp.StatusCode)
+		}
+		upstream := captured()
+		if got := upstream.header.Get("x-api-key"); got != anthropicKey {
+			t.Errorf("upstream x-api-key = %q, want the instance key %q", got, anthropicKey)
+		}
+		if got := upstream.header.Get("Authorization"); got != "" {
+			t.Errorf("client Authorization leaked upstream: %q", got)
+		}
+	})
+
+	t.Run("bearer prefix is case-insensitive", func(t *testing.T) {
+		backend, _, _ := newBackend(t, http.StatusOK, nil, `{"ok":true}`)
+		proxyServer := newProxy(t, serviceToken, anthropicInstance(backend.URL, anthropicKey, map[string]string{"sonnet": "m"}))
+
+		resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages", `{"model":"sonnet"}`,
+			map[string]string{"Authorization": "bearer " + serviceToken})
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("proxy status = %d, want 200 (lowercase bearer prefix accepted)", resp.StatusCode)
+		}
+	})
+
+	t.Run("no credential reports the missing-header message", func(t *testing.T) {
+		proxyServer := newProxy(t, serviceToken, anthropicInstance("https://anthropic.example", anthropicKey, map[string]string{"sonnet": "m"}))
+
+		resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages", `{"model":"sonnet"}`, nil)
+
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("proxy status = %d, want 401", resp.StatusCode)
+		}
+		if got, want := decodeAnthropicError(t, resp).Error.Message, "missing x-api-key or Authorization header"; got != want {
+			t.Errorf("error.message = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("present but wrong credentials report invalid message", func(t *testing.T) {
+		cases := []map[string]string{
+			{"x-api-key": "wrong-token"},
+			{"Authorization": "Bearer wrong-token"},
+			{"x-api-key": "wrong-token", "Authorization": "Bearer wrong-token"},
+		}
+		for _, headers := range cases {
+			proxyServer := newProxy(t, serviceToken, anthropicInstance("https://anthropic.example", anthropicKey, map[string]string{"sonnet": "m"}))
+			resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages", `{"model":"sonnet"}`, headers)
+			if resp.StatusCode != http.StatusUnauthorized {
+				t.Fatalf("headers %v: status = %d, want 401", headers, resp.StatusCode)
+			}
+			if got, want := decodeAnthropicError(t, resp).Error.Message, "invalid service access token"; got != want {
+				t.Errorf("headers %v: error.message = %q, want %q", headers, got, want)
+			}
+		}
+	})
 }
 
 func TestOpenAIRejectsXAPIKeyOnly(t *testing.T) {
@@ -619,6 +686,12 @@ func TestRouteByRoles(t *testing.T) {
 			{"opus", "deepseek-v4-pro", false},
 			{"fable", "deepseek-v4-pro", false},
 			{"claude-opus-4-1-20250805", "deepseek-v4-pro", false},
+			// §17.3: the long-context marker is stripped before role matching.
+			{"opus[1m]", "deepseek-v4-pro", false},
+			{"sonnet[1m]", "deepseek-v4-flash", true},
+			{"opus[1M]", "deepseek-v4-pro", false},
+			{"claude-opus-4-5[1m]", "deepseek-v4-pro", false},
+			{"claude-sonnet-4-5-20250929[1m]", "deepseek-v4-flash", true},
 		}
 		for _, tc := range cases {
 			t.Run(tc.model, func(t *testing.T) {
@@ -690,7 +763,7 @@ func TestRouteByRoles(t *testing.T) {
 	})
 
 	t.Run("unhandled model values fall back without rewrite", func(t *testing.T) {
-		for _, model := range []string{"best", "sonnet[1m]", "opus[1m]", "opusplan", "Sonnet"} {
+		for _, model := range []string{"best", "opusplan", "Sonnet", "opus[1x]", "opus [1m]"} {
 			t.Run(model, func(t *testing.T) {
 				proxyServer, flashCaptured, flashCalls, _, proCalls := newRoleProxy(t)
 				body := `{"model":"` + model + `","messages":[]}`
@@ -1811,4 +1884,500 @@ func TestProbeModels(t *testing.T) {
 			t.Errorf("status = %d, want 401", resp.StatusCode)
 		}
 	})
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// captureLogs redirects the standard logger for this test and returns a
+// function yielding everything logged so far.
+func captureLogs(t *testing.T) func() string {
+	t.Helper()
+
+	var (
+		mu  sync.Mutex
+		buf strings.Builder
+	)
+	previous := log.Writer()
+	log.SetOutput(writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.Write(p)
+	}))
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	return func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.String()
+	}
+}
+
+// requestLogLine returns the §18.3 request log line among other log output.
+func requestLogLine(t *testing.T, logs string) string {
+	t.Helper()
+
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, " -> ") && strings.Contains(line, " from ") {
+			return line
+		}
+	}
+	t.Fatalf("no request log line found in:\n%s", logs)
+	return ""
+}
+
+// waitForLog polls logs until it contains the given substring or a 2s
+// deadline passes. The handler logs a request only after the response body
+// has been fully streamed back, so reading logs right after the client
+// finishes can race the log write.
+func waitForLog(t *testing.T, logs func() string, contains string) string {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := logs()
+		if strings.Contains(got, contains) {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for log line containing %q; got: %q", contains, got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func assertInOrder(t *testing.T, line string, fields []string) {
+	t.Helper()
+
+	previous := -1
+	for _, field := range fields {
+		idx := strings.Index(line, field)
+		if idx < 0 {
+			t.Errorf("log line missing %q: %s", field, line)
+			continue
+		}
+		if idx < previous {
+			t.Errorf("log field %q is out of order: %s", field, line)
+		}
+		previous = idx
+	}
+}
+
+func TestRequestLogFormat(t *testing.T) {
+	backend, _, _ := newBackend(t, http.StatusOK, nil,
+		`{"id":"msg_1","usage":{"input_tokens":31,"output_tokens":300},"content":[]}`)
+	instance := anthropicInstance(backend.URL, anthropicKey, map[string]string{"opus": "deepseek-v4-pro"})
+	instance.Name = "MTI"
+	proxyServer := newProxy(t, serviceToken, instance)
+	logs := captureLogs(t)
+
+	resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages", `{"model":"opus[1m]"}`, map[string]string{
+		"x-api-key":       serviceToken,
+		"User-Agent":      "claude-cli/2.1.323 (external, sdk-cli, agent-sdk/0.3.322)",
+		"X-Forwarded-For": "203.0.113.9, 10.0.0.1",
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200", resp.StatusCode)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	line := requestLogLine(t, waitForLog(t, logs, " -> "))
+	for _, want := range []string{
+		"POST /v1/messages -> MTI/deepseek-v4-pro (opus[1m])",
+		" in ", "s ↑31 ↓300", " from 203.0.113.9 claude-code/2.1.323",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("log line missing %q: %s", want, line)
+		}
+	}
+	if strings.Contains(line, "t/s") {
+		t.Errorf("gen segment must be omitted below the §17.4 sample threshold: %s", line)
+	}
+	assertInOrder(t, line, []string{
+		" -> ", "/deepseek-v4-pro (opus[1m])", " in ", "↑31", "↓300", "from ",
+	})
+}
+
+func TestClientIdentification(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    string
+	}{
+		{"claude-cli user agent", map[string]string{
+			"User-Agent": "claude-cli/2.1.323 (external, sdk-cli, agent-sdk/0.3.322)",
+		}, "claude-code/2.1.323"},
+		{"session header only", map[string]string{
+			"User-Agent":               "curl/8.1.2",
+			"X-Claude-Code-Session-Id": "b9333a2e-0164-4149-bede-78341d4ec2fd",
+		}, "claude-code"},
+		{"anthropic-beta marker", map[string]string{
+			"User-Agent":     "curl/8.1.2",
+			"anthropic-beta": "claude-code-20250219,context-1m-2025-08-07",
+		}, "claude-code"},
+		{"openai python", map[string]string{"User-Agent": "OpenAI/Python 1.40.0"}, "openai-python"},
+		{"openai node", map[string]string{"User-Agent": "OpenAI/NodeJS/4.52.0"}, "openai-node"},
+		{"anthropic js", map[string]string{"User-Agent": "Anthropic/JS 0.32.1"}, "anthropic-js"},
+		{"anthropic python", map[string]string{"User-Agent": "Anthropic/Python 0.34.0"}, "anthropic-python"},
+		{"dsh", map[string]string{"User-Agent": "dsh/0.1.2"}, "dsh"},
+		{"curl", map[string]string{"User-Agent": "curl/8.1.2"}, "curl"},
+		{"other user agent truncated at space", map[string]string{
+			"User-Agent": "MyTool/1.0 trailing-detail-that-must-not-be-logged",
+		}, "MyTool/1.0"},
+		{"no user agent", map[string]string{"User-Agent": ""}, "unknown"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			backend, _, _ := newBackend(t, http.StatusOK, nil, `{"ok":true}`)
+			proxyServer := newProxy(t, serviceToken, openAIInstance(backend.URL, openAIKey, "gpt-x"))
+			logs := captureLogs(t)
+
+			resp := send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions", `{"model":"gpt-x"}`,
+				withAuth(config.ProtocolOpenAI, tc.headers))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("proxy status = %d, want 200", resp.StatusCode)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+
+			// §18.3 puts the client identifier last, after "from <ip> ".
+			if line := requestLogLine(t, waitForLog(t, logs, " from ")); !strings.HasSuffix(line, " "+tc.want) {
+				t.Errorf("log line missing client %q: %s", tc.want, line)
+			}
+		})
+	}
+}
+
+func TestClientIP(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    string
+	}{
+		{"forwarded-for first segment", map[string]string{
+			"X-Forwarded-For": "203.0.113.9, 10.0.0.1",
+		}, "203.0.113.9"},
+		{"unknown forwarded-for falls back to remote addr", map[string]string{
+			"X-Forwarded-For": "unknown",
+		}, "127.0.0.1"},
+		{"remote addr without port", nil, "127.0.0.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			backend, _, _ := newBackend(t, http.StatusOK, nil, `{"ok":true}`)
+			proxyServer := newProxy(t, serviceToken, openAIInstance(backend.URL, openAIKey, "gpt-x"))
+			logs := captureLogs(t)
+
+			resp := send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions", `{"model":"gpt-x"}`,
+				withAuth(config.ProtocolOpenAI, tc.headers))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("proxy status = %d, want 200", resp.StatusCode)
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+
+			if line := requestLogLine(t, waitForLog(t, logs, " from ")); !strings.Contains(line, "from "+tc.want+" ") {
+				t.Errorf("log line missing ip %q: %s", tc.want, line)
+			}
+		})
+	}
+}
+
+func TestAuthFailureIsLoggedWithoutSecrets(t *testing.T) {
+	backend, _, _ := newBackend(t, http.StatusOK, nil, `{"ok":true}`)
+	proxyServer := newProxy(t, serviceToken, openAIInstance(backend.URL, openAIKey, "gpt-x"))
+	logs := captureLogs(t)
+
+	resp := send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions", `{"model":"gpt-x"}`, map[string]string{
+		"User-Agent":      "claude-cli/2.1.323 (external, cli)",
+		"X-Forwarded-For": "203.0.113.9",
+	})
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("proxy status = %d, want 401", resp.StatusCode)
+	}
+
+	line := requestLogLine(t, waitForLog(t, logs, " -> "))
+	for _, want := range []string{
+		" -> n/a/n/a (n/a) in ", "↑n/a ↓n/a from 203.0.113.9 claude-code/2.1.323",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("401 log line missing %q: %s", want, line)
+		}
+	}
+	if strings.Contains(line, serviceToken) || strings.Contains(line, openAIKey) {
+		t.Errorf("401 log line leaks a credential: %s", line)
+	}
+}
+
+// gzipped compresses payload for a mock upstream.
+func gzipped(t *testing.T, payload string) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := io.WriteString(zw, payload); err != nil {
+		t.Fatalf("gzip payload: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close gzip writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// newGzipUpstream replies with a gzip body when the request accepts gzip, and
+// alwaysCompress forces that even when it does not (an upstream ignoring the
+// header, §20.2). It records the Accept-Encoding the proxy sent upstream.
+func newGzipUpstream(t *testing.T, contentType, payload string, alwaysCompress bool) (*httptest.Server, func() string) {
+	t.Helper()
+
+	compressed := gzipped(t, payload)
+	var (
+		mu     sync.Mutex
+		accept string
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		accept = r.Header.Get("Accept-Encoding")
+		mu.Unlock()
+		_, _ = io.ReadAll(r.Body)
+
+		w.Header().Set("Content-Type", contentType)
+		if alwaysCompress || strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(compressed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, payload)
+	}))
+	t.Cleanup(server.Close)
+
+	return server, func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return accept
+	}
+}
+
+// TestGzipStreamingUsageParsed covers §20.4: the client's Accept-Encoding must
+// not dictate the upstream encoding, and usage must be parsed from the
+// decompressed SSE stream. The identity case is the sharp one: before the fix
+// the proxy forwarded "identity" and the transport never negotiated gzip.
+func TestGzipStreamingUsageParsed(t *testing.T) {
+	const events = `event: message_start
+data: {"type":"message_start","message":{"usage":{"input_tokens":31,"output_tokens":1}}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":31,"output_tokens":300}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	for _, tc := range []struct{ name, clientEncoding string }{
+		{"client requests gzip", "gzip"},
+		{"client requests identity", "identity"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream, upstreamAccept := newGzipUpstream(t, "text/event-stream", events, false)
+			proxyServer := newProxy(t, serviceToken,
+				anthropicInstance(upstream.URL, anthropicKey, map[string]string{"sonnet": "model-a"}))
+			logs := captureLogs(t)
+
+			resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages",
+				`{"model":"sonnet","messages":[]}`,
+				withAuth(config.ProtocolAnthropic, map[string]string{"Accept-Encoding": tc.clientEncoding}))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("proxy status = %d, want 200", resp.StatusCode)
+			}
+			body := readBody(t, resp)
+			if !strings.Contains(body, `"output_tokens":300`) || !strings.Contains(body, "message_stop") {
+				t.Errorf("client body is not the plaintext stream:\n%q", body)
+			}
+			if got := upstreamAccept(); !strings.Contains(got, "gzip") {
+				t.Errorf("upstream Accept-Encoding = %q, want the transport-negotiated gzip", got)
+			}
+			line := requestLogLine(t, waitForLog(t, logs, " -> "))
+			if !strings.Contains(line, "↑31 ↓300") {
+				t.Errorf("log line does not carry the usage parsed through gzip: %s", line)
+			}
+		})
+	}
+}
+
+// TestForcedGzipUpstreamStreaming covers the double-insurance branch: the
+// upstream compresses regardless of the request. Range disables Go's transport
+// negotiation so the proxy's own gzip.Reader is the path under test.
+func TestForcedGzipUpstreamStreaming(t *testing.T) {
+	const events = `event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":31,"output_tokens":300}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+	upstream, _ := newGzipUpstream(t, "text/event-stream", events, true)
+	proxyServer := newProxy(t, serviceToken,
+		anthropicInstance(upstream.URL, anthropicKey, map[string]string{"sonnet": "model-a"}))
+	logs := captureLogs(t)
+
+	resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages",
+		`{"model":"sonnet","messages":[]}`,
+		withAuth(config.ProtocolAnthropic, map[string]string{
+			"Accept-Encoding": "gzip",
+			"Range":           "bytes=0-",
+		}))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Errorf("client Content-Encoding = %q, want plaintext", got)
+	}
+	if got := resp.Header.Get("Content-Length"); got != "" {
+		t.Errorf("client Content-Length = %q, want none after decompression", got)
+	}
+	body := readBody(t, resp)
+	if !strings.Contains(body, `"output_tokens":300`) || !strings.Contains(body, "message_stop") {
+		t.Errorf("client body is not the plaintext stream:\n%q", body)
+	}
+	line := requestLogLine(t, waitForLog(t, logs, " -> "))
+	if !strings.Contains(line, "↑31 ↓300") {
+		t.Errorf("log line does not carry the usage parsed through gzip: %s", line)
+	}
+}
+
+// TestForcedGzipUpstreamNonStreaming checks the capture/parseUsage path behind
+// a forced Content-Encoding (non-streaming has no SSE state machine).
+func TestForcedGzipUpstreamNonStreaming(t *testing.T) {
+	const payload = `{"id":"msg_1","usage":{"prompt_tokens":31,"completion_tokens":300}}`
+	upstream, _ := newGzipUpstream(t, "application/json", payload, true)
+	proxyServer := newProxy(t, serviceToken, openAIInstance(upstream.URL, openAIKey, "gpt-x"))
+	logs := captureLogs(t)
+
+	resp := send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions",
+		`{"model":"gpt-x"}`,
+		withAuth(config.ProtocolOpenAI, map[string]string{
+			"Accept-Encoding": "gzip",
+			"Range":           "bytes=0-",
+		}))
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("proxy status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Content-Encoding"); got != "" {
+		t.Errorf("client Content-Encoding = %q, want plaintext", got)
+	}
+	if body := readBody(t, resp); body != payload {
+		t.Errorf("client body = %q, want %q", body, payload)
+	}
+	line := requestLogLine(t, waitForLog(t, logs, " -> "))
+	if !strings.Contains(line, "↑31 ↓300") {
+		t.Errorf("log line does not carry the usage parsed through gzip: %s", line)
+	}
+}
+
+// TestForcedGzipUpstreamCorruptReturns502 covers §20.3: undecodable gzip is an
+// upstream error, not a partial response.
+func TestForcedGzipUpstreamCorruptReturns502(t *testing.T) {
+	for _, tc := range []struct{ name, contentType string }{
+		{"non-streaming", "application/json"},
+		{"streaming", "text/event-stream"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", tc.contentType)
+				w.Header().Set("Content-Encoding", "gzip")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, "this is not a gzip stream")
+			}))
+			t.Cleanup(upstream.Close)
+			proxyServer := newProxy(t, serviceToken, openAIInstance(upstream.URL, openAIKey, "gpt-x"))
+
+			resp := send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions",
+				`{"model":"gpt-x"}`,
+				withAuth(config.ProtocolOpenAI, map[string]string{"Range": "bytes=0-"}))
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("proxy status = %d, want 502", resp.StatusCode)
+			}
+		})
+	}
+}
+
+// newPacedGzipSSEBackend emits sizeable delta chunks at a fixed pace and
+// compresses them when the request accepts gzip. The plaintext rate stays well
+// above §19's threshold while the compressed rate is far below it, so a window
+// fed compressed bytes would wrongly report slow.
+func newPacedGzipSSEBackend(t *testing.T, chunks int, interval time.Duration) *httptest.Server {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		compress := strings.Contains(r.Header.Get("Accept-Encoding"), "gzip")
+		w.Header().Set("Content-Type", "text/event-stream")
+		if compress {
+			w.Header().Set("Content-Encoding", "gzip")
+		}
+		w.WriteHeader(http.StatusOK)
+
+		flusher, _ := w.(http.Flusher)
+		var out io.Writer = w
+		var zw *gzip.Writer
+		if compress {
+			zw = gzip.NewWriter(w)
+			out = zw
+		}
+		text := strings.Repeat("x", 1024)
+		for i := 0; i < chunks; i++ {
+			_, _ = fmt.Fprintf(out,
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":%q}}\n\n",
+				text)
+			if zw != nil {
+				_ = zw.Flush()
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(interval)
+		}
+		if zw != nil {
+			_ = zw.Close()
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// TestRealtimeSlowVerdictUnaffectedByGzip covers §20.4: the same stream must get
+// the same §19 verdict whether or not the client sends Accept-Encoding: gzip.
+func TestRealtimeSlowVerdictUnaffectedByGzip(t *testing.T) {
+	const (
+		chunks   = 46
+		interval = 250 * time.Millisecond
+	)
+	for _, tc := range []struct{ name, clientEncoding string }{
+		{"client without gzip", "identity"},
+		{"client with gzip", "gzip"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			upstream := newPacedGzipSSEBackend(t, chunks, interval)
+			proxyServer := newProxyWithOptions(t, proxy.Options{},
+				anthropicInstance(upstream.URL, "key", map[string]string{"sonnet": "model-a"}))
+
+			resp := send(t, http.MethodPost, proxyServer.URL+"/v1/messages",
+				`{"model":"sonnet","messages":[]}`,
+				withAuth(config.ProtocolAnthropic, map[string]string{"Accept-Encoding": tc.clientEncoding}))
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("proxy status = %d, want 200", resp.StatusCode)
+			}
+			body := readBody(t, resp)
+			if strings.Contains(body, "pause_turn") {
+				t.Errorf("decompressed stream was judged slow; §19 must see plaintext bytes")
+			}
+			if !strings.Contains(body, `"type":"content_block_delta"`) {
+				t.Errorf("client body is missing the streamed deltas:\n%q", body)
+			}
+		})
+	}
 }

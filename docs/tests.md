@@ -1,4 +1,4 @@
-# model-router 测试用例（M1 ～ M3.1）
+# model-router 测试用例（M1 ～ M4.4）
 
 > 对应需求：[requirements.md](requirements.md)（FR-4、§7、§8、§9）；设计：[design.md](design.md)。
 
@@ -78,7 +78,7 @@
 - JSON 流程：修改 JSON → 校验（失败时保存禁用）→ 保存 → 重载生效。
 - 配置迁移：`config.local.json` / `config.example.json` 迁移为 `instances` 后路由行为与迁移前一致。
 - 无 `admin_password` 时 `/admin`、`/api/*` 404；Basic Auth 失败 401。
-- `-version` 输出 `0.0.1-rc`，产物位于 `dist/`。
+- `-version` 输出 `0.1.0`，产物位于 `dist/`。
 
 ## 7. 执行方式
 
@@ -144,7 +144,7 @@ bash build.sh
 | UT-406 | 成功恢复清零 | `TestFallbackSuccessResets` | 回退期后主实例成功 | 计数/回退清零，之后失败重新按 3 次累计 |
 | UT-407 | 全降级强制链头 | `TestFallbackAllDegradedForcesHead` | 阈值 1、两实例均失败后全部降级 | 后续请求只强制尝试链头一次，其余不试，返回 502 |
 | UT-408 | 并发安全 | `TestFallbackConcurrent`（`go test -race`） | 20 并发请求 + 失败实例 | 全部 200，调用次数一致，无 data race |
-| UT-409 | 吞吐判定 | `TestThroughputFailure` | OpenAI `completion_tokens`、Anthropic `output_tokens`、无 usage；慢响应 | 低吞吐响应仍透传但记录失败（下次跳过）；无 usage 不判失败 |
+| UT-409 | 吞吐判定与样本门槛 | `TestThroughputFailure` | OpenAI `completion_tokens`、Anthropic `output_tokens`、无 usage；输出 ≤100 或生成时长 ≤2s；慢响应 | 低吞吐响应仍透传；满足门槛才记失败（下次跳过），样本不足/无 usage 不判失败 |
 | UT-413 | Anthropic 空闲超时收尾 | `TestIdleTimeoutAnthropicPauseTurn` | mock 上游发首块后静默；`idle_timeout=50ms` | 客户端收到 `content_block_stop`、`message_delta(stop_reason=pause_turn)`、`message_stop` |
 | UT-414 | OpenAI 空闲超时截断 | `TestIdleTimeoutOpenAITruncates` | mock 上游发首块后静默 | 客户端读取报流截断错误、无 `[DONE]`；实例记失败（后续走备用实例） |
 | UT-415 | OpenAI 慢速流不打断 | `TestSlowStreamIsNotInterrupted` | mock 持续慢速输出、低 usage | 流完整结束（含 `[DONE]`），仅记失败，下次请求跳过 |
@@ -261,3 +261,61 @@ go test -race ./internal/proxy
 | docker compose config 通过 | ET-1604 |
 | build-all.sh 生成 6 个产物 | ET-1603 |
 | 文档同步 / `-version` 0.0.1-rc | ET-1607；README/CHANGELOG/design/tests 已更新 |
+
+## 17. 请求日志：客户端与来源 IP（M4.3，§16）
+
+| 编号 | 用例 | 入口 | 覆盖点 | 预期 |
+|---|---|---|---|---|
+| UT-501 | 日志字段与顺序 | `TestRequestLogFormat` | `req_model="opus[1m]"` / `model="deepseek-v4-pro"` / `(anthropic)` / `client=claude-code/2.1.323` / `ip=203.0.113.9` / `total` / `ttft` / `in=31` / `out=300` / `gen=n/a` | 字段齐全且顺序固定（`req_model` → `model` → 协议 → `client` → `ip` → `total` → `ttft` → `in` → `out` → `gen`） |
+| UT-502 | 客户端识别十一级规则 | `TestClientIdentification` | `claude-cli/2.1.323 ...`、仅 `X-Claude-Code-Session-Id`、`anthropic-beta` 含 `claude-code`、`OpenAI/Python`、`OpenAI/NodeJS`、`Anthropic/JS`、`Anthropic/Python`、`dsh`、`curl/`、其他 UA 截断、无 UA | 分别得到 `claude-code/2.1.323`、`claude-code`（×2）、`openai-python`、`openai-node`、`anthropic-js`、`anthropic-python`、`dsh`、`curl`、UA 前缀、`unknown` |
+| UT-503 | 来源 IP | `TestClientIP` | `X-Forwarded-For: 203.0.113.9, 10.0.0.1`；`X-Forwarded-For: unknown`；无 XFF | 取首段；回退 `RemoteAddr` 去端口（`127.0.0.1`） |
+| UT-504 | 401 也打日志且不含密钥 | `TestAuthFailureIsLoggedWithoutSecrets` | 无凭据请求 + UA + XFF | 401；日志含 `req_model="n/a"`、`model="n/a"`、`client`、`ip`，不含 service token / api_key |
+| ET-1701 | 端到端客户端识别（手工） | `curl -A "claude-cli/2.1.323 (external, cli)"` 打代理 | 日志出现 `client=claude-code/2.1.323`；仅带 `X-Claude-Code-Session-Id` 时出现 `client=claude-code` |
+| ET-1702 | 容器来源 IP 限制（手工） | docker bridge 下从宿主机调用 | `ip` 为网关地址（如 `172.18.0.1`）；仅 `network_mode: host` 或反代透传 `X-Forwarded-For` 才能拿到真实 IP（README 已写明） |
+
+## 18. M4.4 验收对照（§17）
+
+| 编号 | 用例 | 入口 | 覆盖点 | 预期 |
+|---|---|---|---|---|
+| UT-505 | 双认证（Anthropic） | `TestAnthropicDoubleAuth` | 仅 `x-api-key`；仅 `Authorization: Bearer`；小写 `bearer`；无凭据；有头但错（单独/同时） | 前三种 200 且上游用实例 key；无凭据 401 `missing x-api-key or Authorization header`；有头但错 401 `invalid service access token` |
+| UT-506 | 双认证不外传 | `TestAnthropicDoubleAuth`（Bearer 子用例） | 客户端 `Authorization` 与上游头 | 上游 `x-api-key` 为实例 key，客户端 `Authorization` 不出现在上游请求 |
+| UT-105 | OpenAI 仍只认 Bearer | `TestOpenAIRejectsXAPIKeyOnly` | 仅 `x-api-key` | 401 `missing_api_key`（OpenAI 认证未改） |
+| UT-507 | `[1m]` 变体命中角色 | `TestRouteByRoles`（`opus[1m]`/`sonnet[1m]`/`opus[1M]`/`claude-opus-4-5[1m]`/`claude-sonnet-4-5-20250929[1m]` 子用例） | 剥除尾部 `[1m]`（大小写不敏感）后按角色/前缀命中 | 正确落到 `opus`/`sonnet` 实例并改写为 `roles[role]` |
+| UT-508 | `[1m]` 非变体不误判 | `TestRouteWildcardFallback`（`opus[1x]`、`opus [1m]` 子用例） | 非法/带空格标记 | 按未命中处理（`*` 托底 / R5），不误命中角色 |
+| UT-509 | 双认证回归 | `TestMissingAuthorizationReturns401`、`TestWrongTokenReturns401` | 两入口 | 401 按协议错误体，文案与 §17.2 一致 |
+| UT-409 | 吞吐样本门槛 | `TestThroughputFailure` | 输出 ≤100（OpenAI `completion_tokens=1` / Anthropic `output_tokens=1`）、无 usage、慢响应 | 样本不足或无 usage → 不记失败、实例仍被使用（慢后端调用 2 次）；达标且低于阈值 → 记失败，响应已提交不受影响 |
+| UT-415 | 低速流不打断 | `TestSlowStreamIsNotInterrupted` | 低 usage 慢速 SSE | 流完整结束（含 `[DONE]`），仅记失败 |
+| UT-502～504 | 日志 `req_model`/`client`/`ip` | 见 §17 | 同 §16.4/§17.6 | 字段齐全、顺序固定、401 行不含密钥 |
+| ET-1703 | 容器时区（手工） | `docker build` + `docker run` 后 `docker logs` | 日志时间戳 | 为北京时间（UTC+8），容器内 `TZ=Asia/Shanghai` |
+| ET-1704 | `gen` 数值分支（手工） | 长输出（>100 token 且 >2s）请求 | 日志 `gen=` | 显示数值（如 `142 t/s`）；短请求显示 `gen=n/a` |
+| ET-1705 | `go build` / `go vet` / `go test`（含 `-race`） | 命令行 | 全量 | 退出码 0 |
+| ET-1706 | 文档同步 / 版本 | README/CHANGELOG/design/tests；`-version` | 同步与版本号 | 四文档含 §16/§17 内容；`-version` 仍 `0.0.1-rc` |
+
+执行：
+
+```bash
+go build ./...
+go vet ./...
+go test ./...
+go test -race ./internal/proxy
+```
+
+## 19. gzip 压缩响应体（M4.6，§20）
+
+| 编号 | 用例 | 入口 | 覆盖点 | 预期 |
+|---|---|---|---|---|
+| UT-601 | 客户端 gzip 不决定上游编码 | `TestGzipStreamingUsageParsed`（`client requests gzip` / `client requests identity`） | 客户端 `Accept-Encoding` 是否透传；上游看到的值；流式 usage | 上游收到 Transport 协商的 gzip；客户端收到明文 SSE；日志 `↑31 ↓300` |
+| UT-602 | 上游强制 gzip（流式） | `TestForcedGzipUpstreamStreaming` | `Range` 关闭 Transport 协商，走代理自身 `gzip.Reader` 分支；响应头 | 客户端收到明文；无 `Content-Encoding` / `Content-Length`；日志 `↑31 ↓300` |
+| UT-603 | 上游强制 gzip（非流式） | `TestForcedGzipUpstreamNonStreaming` | `capture` + `parseUsage` 位于解压之后 | 客户端 body 为明文 JSON；日志 `↑31 ↓300` |
+| UT-604 | gzip 损坏 | `TestForcedGzipUpstreamCorruptReturns502`（流式/非流式） | 解压失败（立即与首个数据块读取时） | 502 且 `recordFailure` |
+| UT-605 | §19 判定与 gzip 无关 | `TestRealtimeSlowVerdictUnaffectedByGzip`（客户端带/不带 gzip，并行） | 明文速率达标、压缩后字节速率远低于阈值 | 两用例均无 `pause_turn`（窗口按解压后字节计算） |
+| ET-1801 | 真实 DeepSeek Anthropic 入口（手工） | `curl -H "Accept-Encoding: gzip"` 流式请求 | 生产上游会压缩 | 客户端响应完整可解析；日志 `↑<in> ↓<out>` 有值 |
+
+执行：
+
+```bash
+go build ./...
+go vet ./...
+go test ./...
+go test -race ./internal/proxy
+```

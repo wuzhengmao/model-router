@@ -330,6 +330,7 @@
   function newInstance(protocol) {
     return {
       protocol: protocol,
+      name: '',
       base_url: '',
       api_key: '',
       provider: '',
@@ -344,6 +345,7 @@
 
   function normalizeInstance(raw, protocol) {
     var inst = newInstance(protocol);
+    inst.name = raw.name || '';
     inst.base_url = raw.base_url || '';
     inst.api_key = raw.api_key || '';
     inst.provider = String(raw.provider || '').toLowerCase();
@@ -643,12 +645,14 @@
 
     var grid = document.createElement('div');
     grid.className = 'grid';
+    var name = field('名称（可选，仅日志显示）', inst.name, '如 DeepSeek');
     var baseURL = field('base_url', inst.base_url, 'https://api.deepseek.com');
     var apiKey = field('api_key', inst.api_key, 'sk-...', 'password');
     var timeout = field('timeout（可选）', inst.timeout, '15s');
-    [baseURL.label, apiKey.label, timeout.label].forEach(function (node) { grid.appendChild(node); });
+    [name.label, baseURL.label, apiKey.label, timeout.label].forEach(function (node) { grid.appendChild(node); });
     card.appendChild(grid);
 
+    name.input.addEventListener('input', function () { inst.name = name.input.value; });
     baseURL.input.addEventListener('input', function () { inst.base_url = baseURL.input.value; });
     apiKey.input.addEventListener('input', function () { inst.api_key = apiKey.input.value; });
     timeout.input.addEventListener('input', function () { inst.timeout = timeout.input.value; });
@@ -894,6 +898,9 @@
       };
       if (inst.provider) {
         item.provider = inst.provider;
+      }
+      if (inst.name.trim() !== '') {
+        item.name = inst.name.trim();
       }
       var timeout = inst.timeout.trim();
       if (timeout !== '') {
