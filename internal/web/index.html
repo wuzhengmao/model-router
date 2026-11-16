@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>model-router 配置</title>
+<title>模型智能路由 · 配置</title>
+<link rel="icon" href="/favicon.ico" type="image/x-icon">
 <style>
   :root {
     color-scheme: dark;
@@ -17,6 +18,10 @@
     --ok: #4ade80;
     --warn: #fbbf24;
     --border: #2d374d;
+    /* 时间轴轨道与统一块高：所有条固定为轨道高的 40%（§24.8 Y5）。 */
+    --tl-track-h: 16px;
+    --tl-base-h: 40%;
+    --tl-swatch-size: calc(var(--tl-track-h) * .4);
   }
   * { box-sizing: border-box; }
   body {
@@ -29,13 +34,29 @@
   main { max-width: 1180px; margin: 0 auto; display: grid; gap: 16px; }
   header { max-width: 1180px; margin: 0 auto 20px; display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
   h1 { font-size: 20px; margin: 0; }
+  /* §24.13 K4：Logo 与中文展示名垂直居中，窄屏不额外换行。 */
+  .brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .brand img { width: 24px; height: 24px; flex: none; display: block; }
+  .brand span { white-space: nowrap; }
   h2 { font-size: 15px; margin: 0 0 14px; }
-  #status { color: var(--muted); }
+  #status { color: var(--muted); margin-left: auto; white-space: nowrap; }
   #status.ok { color: var(--ok); }
   #status.error { color: var(--danger); }
-  .mode-switch { margin-left: auto; display: flex; gap: 8px; }
-  .mode-switch button { background: var(--panel-2); border: 1px solid var(--border); }
-  .mode-switch button.active { background: var(--accent); border-color: var(--accent); }
+  .top-nav { display: flex; gap: 6px; flex-wrap: wrap; }
+  .top-nav a {
+    color: var(--muted);
+    text-decoration: none;
+    padding: 5px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel-2);
+    font-size: 13px;
+  }
+  .top-nav a:hover { color: var(--text); }
+  .top-nav a.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+  .page-status { font-size: 12px; color: var(--muted); min-height: 16px; margin: 0 0 8px; }
+  .page-status.ok { color: var(--ok); }
+  .page-status.error { color: var(--danger); }
   .card {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -169,21 +190,415 @@
     color: var(--muted);
   }
   .modal-error { color: var(--danger); font-size: 12px; min-height: 18px; margin: 8px 0; }
+  /* 统计首页（§24.7 D7）：紧凑卡片网格 + 实例表 + 近期错误表 */
+  #stats-pane { display: grid; gap: 12px; min-width: 0; }
+  .stat-block {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    min-width: 0;
+  }
+  .stat-block h2 { font-size: 13px; margin: 0 0 8px; font-weight: 600; }
+  .stat-block .hint { margin: 0 0 8px; }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 6px; }
+  .stat-tile {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 6px 9px;
+    min-width: 0;
+  }
+  .stat-tile span {
+    display: block;
+    font-size: 10px;
+    line-height: 1.25;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .stat-tile b {
+    display: block;
+    font-size: 14px;
+    line-height: 1.3;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat-table-wrap { min-width: 0; overflow-x: auto; }
+  .stat-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-size: 12px;
+    line-height: 1.3;
+  }
+  .stat-table th, .stat-table td {
+    text-align: left;
+    padding: 3px 6px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+  }
+  .stat-table th { color: var(--muted); font-weight: 500; font-size: 11px; }
+  .stat-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .stat-table tbody tr:hover { background: var(--panel-2); }
+  .stat-table td.stat-err-summary { color: var(--muted); }
+  .stat-degraded { color: var(--danger); font-weight: 600; }
+  .stat-removed { color: var(--muted); font-weight: 600; }
+  .stat-ok { color: var(--ok); }
+  /* §24.12 J1：JSON 高级页编辑框弹性填满 header 以下剩余高度。 */
+  body.json-mode {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  body.json-mode header { flex: 0 0 auto; width: 100%; }
+  body.json-mode main {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    width: 100%;
+  }
+  #json-pane { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  #json-pane > .card { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  #json-pane > .card > h2,
+  #json-pane > .card > .hint,
+  #json-pane > .card > .result,
+  #json-pane > .card > .actions { flex: 0 0 auto; }
+  #json-editor { flex: 1 1 auto; min-height: 240px; resize: none; }
+  /* 实时请求监控（§24）：单表格 + 每行 trunk 时间轴 + 共享量程 */
+  /* §24.9 Z2：监控页 body/main/卡片改为纵向 flex，.req-list 弹性填满剩余高度。 */
+  body.monitor-mode {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  body.monitor-mode header,
+  body.monitor-mode main { max-width: 1480px; width: 100%; }
+  body.monitor-mode header { flex: 0 0 auto; }
+  body.monitor-mode main {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+  /* 表格有 1100px 最小宽度；允许 section/卡片收缩，横滚只发生在 .req-list 内部。 */
+  #monitor-pane,
+  #monitor-pane > .card { min-width: 0; }
+  #monitor-pane { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  #monitor-pane > .card { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  #monitor-pane > .card { padding: 14px; }
+  #monitor-pane .monitor-head { flex: 0 0 auto; }
+  .monitor-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+  .monitor-head h2 { margin: 0; font-size: 14px; }
+  .monitor-head .spacer { margin-left: auto; }
+  .monitor-head .hint { margin: 0; }
+  .monitor-head button { padding: 4px 10px; }
+  .monitor-state { font-size: 12px; color: var(--muted); }
+  .monitor-state.ok { color: var(--ok); }
+  .monitor-state.err, .monitor-state.error { color: var(--danger); }
+  .req-list { flex: 1 1 auto; min-height: 200px; min-width: 0; overflow: auto; }
+  .req-table {
+    width: 100%;
+    min-width: 1100px;
+    border-collapse: collapse;
+    table-layout: fixed;
+    font-size: 12px;
+    line-height: 1.2;
+  }
+  .req-table th, .req-table td {
+    text-align: left;
+    padding: 0 6px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+  }
+  .req-table th {
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 11px;
+    line-height: 1.2;
+    padding-top: 2px;
+    padding-bottom: 2px;
+    position: sticky;
+    top: 0;
+    background: var(--panel);
+    z-index: 2;
+  }
+  .req-table tbody tr { height: 33px; }
+  .req-table tbody tr:hover { background: var(--panel-2); }
+  .req-table .num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  /* 固定列宽（table-layout:fixed），时间轴列自动占满剩余宽度。 */
+  .req-table .col-idx { width: 40px; }
+  .req-table .col-status { width: 52px; }
+  .req-table .col-path { width: 162px; }
+  .req-table .col-client { width: 138px; }
+  .req-table .col-route { width: 184px; }
+  .req-table .col-in, .req-table .col-out { width: 60px; }
+  .req-table .col-chunks { width: 40px; }
+  .req-table .col-duration, .req-table .col-ttft { width: 60px; }
+  .req-table .col-tps { width: 52px; }
+  .req-table td.req-idx { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+  /* 两行文本必须完整落在单元格内：32px 行高 + 宽松行高，且不靠 overflow:hidden 裁切。 */
+  .req-table td.req-path, .req-table td.req-route {
+    white-space: normal;
+    line-height: 1.2;
+    overflow: visible;
+  }
+  .req-method, .req-url, .req-model, .req-target {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .req-method { font-size: 11px; line-height: 1.2; color: var(--muted); }
+  .req-url { font-size: 12px; line-height: 1.3; color: var(--text); }
+  .req-model { font-size: 12px; line-height: 1.3; color: var(--text); }
+  .req-target { font-size: 11px; line-height: 1.2; color: var(--muted); }
+  .req-table td.req-client { white-space: normal; line-height: 1.2; overflow: visible; }
+  .req-client-ip {
+    display: block;
+    font-size: 12px;
+    line-height: 1.3;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .req-client-id {
+    display: block;
+    font-size: 11px;
+    line-height: 1.2;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .req-status { font-weight: 600; }
+  .req-status.run { color: var(--warn); }
+  .req-status.ok { color: var(--ok); }
+  .req-status.err { color: var(--danger); }
+  .req-table td.req-timeline { padding: 0 6px; white-space: nowrap; overflow: visible; }
+  .monitor-row-timeline {
+    position: relative;
+    height: var(--tl-track-h);
+    width: 100%;
+    background: var(--panel-2);
+    border-radius: 3px;
+    box-shadow: inset 0 0 0 1px var(--border);
+    overflow: hidden;
+  }
+  /* §24.8 Y5：等待段与所有 trunk 块共用「居中 + 固定 40% 轨道高」定位，
+     JS 不再写 height；横向位置/宽度仍按时间比例计算。 */
+  .monitor-row-timeline .tl-wait,
+  .monitor-row-timeline .tl-block {
+    position: absolute;
+    top: 50%;
+    height: var(--tl-base-h);
+    transform: translateY(-50%);
+    border-radius: 1px;
+  }
+  .monitor-row-timeline .tl-wait {
+    left: 0;
+    width: 0;
+    background: var(--warn);
+    opacity: .35;
+    border-radius: 2px 0 0 2px;
+    z-index: 0;
+  }
+  .monitor-row-timeline .tl-block {
+    min-width: 1px;
+    background: var(--accent);
+    z-index: 1;
+  }
+  .monitor-row-timeline .tl-block.tok { background: var(--ok); }
+  .monitor-row-timeline .tl-retry {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    border-left: 1px dashed var(--warn);
+    z-index: 2;
+  }
+  .monitor-row-timeline .tl-cursor {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    border-left: 1px solid var(--text);
+    opacity: .7;
+    z-index: 3;
+  }
+  /* §24.7 D2：刻度与图例移入第 12 列表头（原 tfoot 已删除）。 */
+  .req-table th.req-axis-head {
+    padding: 1px 6px;
+    overflow: visible;
+    text-overflow: clip;
+  }
+  .axis-head-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 12px;
+    line-height: 12px;
+    min-width: 0;
+  }
+  .tl-legend {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .tl-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    line-height: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .tl-swatch {
+    display: inline-block;
+    width: var(--tl-swatch-size);
+    height: var(--tl-swatch-size);
+    flex: none;
+    border-radius: 1px;
+  }
+  .tl-swatch-wait { background: var(--warn); opacity: .35; }
+  .tl-swatch-trunk { background: var(--accent); }
+  .tl-swatch-tok { background: var(--ok); }
+  .tl-retry-sample {
+    display: inline-block;
+    width: 0;
+    height: var(--tl-swatch-size);
+    flex: none;
+    border-left: 1px dashed var(--warn);
+  }
+  #monitor-axis-title { color: var(--muted); font-size: 10px; white-space: nowrap; flex: none; margin-left: auto; }
+  .row-axis {
+    position: relative;
+    height: 12px;
+    line-height: 12px;
+    font-size: 10px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .row-axis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+  .row-axis span:first-child { transform: none; }
+  .row-axis span:last-child { transform: translateX(-100%); }
   [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 <header>
-  <h1>model-router 配置</h1>
-  <span id="status">加载中…</span>
-  <div class="mode-switch">
-    <button type="button" id="mode-visual" class="active">可视化配置</button>
-    <button type="button" id="mode-json">JSON 高级</button>
-  </div>
+  <h1 class="brand"><img src="/admin/logo.svg" alt="" width="24" height="24"><span>模型智能路由</span></h1>
+  <nav class="top-nav" aria-label="管理页导航">
+    <a href="/admin/" data-page="stats">统计</a>
+    <a href="/admin/monitor" data-page="monitor">实时监控</a>
+    <a href="/admin/config" data-page="config">配置</a>
+    <a href="/admin/json" data-page="json">JSON 高级</a>
+  </nav>
+  <span id="status">连接中…</span>
 </header>
 
 <main>
+  <section id="stats-pane" hidden>
+    <div class="stat-block">
+      <h2>运行与连接</h2>
+      <div class="stat-grid">
+        <div class="stat-tile"><span>运行时长</span><b id="stat-uptime">–</b></div>
+        <div class="stat-tile"><span>版本</span><b id="stat-version">–</b></div>
+        <div class="stat-tile"><span>活跃 WS 连接</span><b id="stat-ws">–</b></div>
+        <div class="stat-tile"><span>活跃请求</span><b id="stat-active">–</b></div>
+        <div class="stat-tile"><span>当前 QPS</span><b id="stat-qps">–</b></div>
+      </div>
+    </div>
+    <div class="stat-block">
+      <h2>请求统计</h2>
+      <div class="stat-grid">
+        <div class="stat-tile"><span>累计请求</span><b id="stat-total">–</b></div>
+        <div class="stat-tile"><span>成功 / 失败</span><b id="stat-okfail">–</b></div>
+        <div class="stat-tile"><span>成功率</span><b id="stat-success-rate">–</b></div>
+        <div class="stat-tile"><span>OpenAI / Anthropic</span><b id="stat-protocols">–</b></div>
+        <div class="stat-tile"><span>首包延迟 P50 / P95</span><b id="stat-ttft">–</b></div>
+        <div class="stat-tile"><span>总耗时 P50 / P95</span><b id="stat-duration">–</b></div>
+        <div class="stat-tile"><span>输入 tokens</span><b id="stat-in-tokens">–</b></div>
+        <div class="stat-tile"><span>输出 tokens</span><b id="stat-out-tokens">–</b></div>
+        <div class="stat-tile"><span>平均生成速率</span><b id="stat-tps">–</b></div>
+        <div class="stat-tile"><span>重试次数</span><b id="stat-retries">–</b></div>
+      </div>
+    </div>
+    <div class="stat-block">
+      <h2>实例统计</h2>
+      <div class="stat-table-wrap">
+        <table class="stat-table" id="stat-instances-table">
+          <colgroup>
+            <col style="width:26%">
+            <col style="width:10%">
+            <col style="width:9%">
+            <col style="width:9%">
+            <col style="width:9%">
+            <col style="width:13%">
+            <col style="width:12%">
+            <col style="width:12%">
+          </colgroup>
+          <thead>
+            <tr>
+              <th>实例</th>
+              <th class="num">请求</th>
+              <th class="num">占比</th>
+              <th class="num">成功</th>
+              <th class="num">失败</th>
+              <th class="num">平均 TTFT</th>
+              <th class="num">平均 t/s</th>
+              <th>状态</th>
+            </tr>
+          </thead>
+          <tbody id="stat-instances"></tbody>
+        </table>
+      </div>
+      <div id="stat-instances-empty" class="empty" hidden>暂无实例数据。</div>
+    </div>
+    <div class="stat-block">
+      <h2>近期错误</h2>
+      <div class="stat-table-wrap">
+        <table class="stat-table" id="stat-errors-table">
+          <colgroup>
+            <col style="width:15%">
+            <col style="width:9%">
+            <col style="width:24%">
+            <col style="width:18%">
+            <col style="width:34%">
+          </colgroup>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>状态码</th>
+              <th>实例 / 上游</th>
+              <th>模型</th>
+              <th>错误摘要</th>
+            </tr>
+          </thead>
+          <tbody id="stat-errors"></tbody>
+        </table>
+      </div>
+      <div id="stat-errors-empty" class="empty" hidden>暂无错误。</div>
+    </div>
+  </section>
+
   <section id="visual-pane">
+    <p id="config-status" class="page-status"></p>
     <div class="card">
       <h2>基础配置</h2>
       <div class="grid">
@@ -244,6 +659,7 @@
   </section>
 
   <section id="json-pane" hidden>
+    <p id="json-status" class="page-status"></p>
     <div class="card">
       <h2>JSON 高级编辑</h2>
       <p class="hint">编辑完整配置 JSON（含 fallback 与分组 instances）。先点「校验」，通过后「保存」才会启用；保存只写文件，需再点「重载生效」。</p>
@@ -254,6 +670,65 @@
         <button type="button" id="save-json" disabled>保存到文件</button>
         <button type="button" id="reload-json" class="secondary">重载生效</button>
         <button type="button" id="refresh-json" class="secondary">重新读取</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="monitor-pane" hidden>
+    <div class="card">
+      <div class="monitor-head">
+        <h2>实时请求监控</h2>
+        <span id="monitor-state" class="monitor-state">连接中…</span>
+        <button type="button" id="monitor-clear" class="secondary">清空</button>
+        <span class="spacer"></span>
+        <span class="hint">登录后自动接收；切换页面不影响统计。刷新后从服务端最近 100 条恢复。</span>
+      </div>
+      <div class="req-list">
+        <table class="req-table" id="monitor-table" hidden>
+          <colgroup>
+            <col class="col-idx">
+            <col class="col-status">
+            <col class="col-path">
+            <col class="col-client">
+            <col class="col-route">
+            <col class="col-in">
+            <col class="col-out">
+            <col class="col-chunks">
+            <col class="col-duration">
+            <col class="col-ttft">
+            <col class="col-tps">
+            <col class="col-timeline">
+          </colgroup>
+          <thead>
+            <tr>
+              <th class="num">#</th>
+              <th>状态</th>
+              <th>方法/路径</th>
+              <th>客户端</th>
+              <th>请求模型 / 实例·上游</th>
+              <th class="num">入</th>
+              <th class="num">出</th>
+              <th class="num">块</th>
+              <th class="num">耗时</th>
+              <th class="num">TTFT</th>
+              <th class="num">t/s</th>
+              <th class="req-axis-head">
+                <div class="axis-head-top">
+                  <span class="tl-legend" id="monitor-legend">
+                    <span class="tl-legend-item"><i class="tl-swatch tl-swatch-wait"></i>等待首包</span>
+                    <span class="tl-legend-item"><i class="tl-swatch tl-swatch-trunk"></i>trunk</span>
+                    <span class="tl-legend-item"><i class="tl-swatch tl-swatch-tok"></i>含内容块</span>
+                    <span class="tl-legend-item"><i class="tl-retry-sample"></i>重试</span>
+                  </span>
+                  <span id="monitor-axis-title">0s – 1s</span>
+                </div>
+                <div id="monitor-axis" class="row-axis"></div>
+              </th>
+            </tr>
+          </thead>
+          <tbody id="monitor-rows"></tbody>
+        </table>
+        <div id="monitor-empty" class="empty">暂无请求。发起 AI 请求即可看到。</div>
       </div>
     </div>
   </section>
@@ -276,6 +751,70 @@
 (function () {
   'use strict';
 
+  // §24.7 D6：真实路由。服务端把四个路径都指向本页，前端按 location.pathname
+  // 只保留当前区块的 DOM，并高亮对应导航项。
+  var PAGE_PANES = {
+    stats: 'stats-pane',
+    monitor: 'monitor-pane',
+    config: 'visual-pane',
+    json: 'json-pane',
+  };
+  var PAGE_TITLES = {
+    stats: '模型智能路由 · 统计',
+    monitor: '模型智能路由 · 实时监控',
+    config: '模型智能路由 · 配置',
+    json: '模型智能路由 · JSON 高级',
+  };
+
+  function resolvePage() {
+    var path = location.pathname.replace(/\/+$/, '');
+    if (path === '/admin' || path === '') {
+      return 'stats';
+    }
+    if (path === '/admin/monitor') {
+      return 'monitor';
+    }
+    if (path === '/admin/config') {
+      return 'config';
+    }
+    if (path === '/admin/json') {
+      return 'json';
+    }
+    return 'stats';
+  }
+
+  var PAGE = resolvePage();
+  Object.keys(PAGE_PANES).forEach(function (key) {
+    if (key === PAGE) {
+      return;
+    }
+    var pane = document.getElementById(PAGE_PANES[key]);
+    if (pane && pane.parentNode) {
+      pane.parentNode.removeChild(pane);
+    }
+  });
+  var activePane = document.getElementById(PAGE_PANES[PAGE]);
+  if (activePane) {
+    activePane.hidden = false;
+  }
+  if (PAGE !== 'config') {
+    var providerModalEl = document.getElementById('provider-modal');
+    if (providerModalEl && providerModalEl.parentNode) {
+      providerModalEl.parentNode.removeChild(providerModalEl);
+    }
+  }
+  document.body.setAttribute('data-page', PAGE);
+  document.body.classList.toggle('monitor-mode', PAGE === 'monitor');
+  document.body.classList.toggle('json-mode', PAGE === 'json');
+  document.title = PAGE_TITLES[PAGE] || '模型智能路由';
+  Array.prototype.forEach.call(document.querySelectorAll('.top-nav a'), function (link) {
+    var active = link.getAttribute('data-page') === PAGE;
+    link.className = active ? 'active' : '';
+    if (active) {
+      link.setAttribute('aria-current', 'page');
+    }
+  });
+
   var ROLE_KEYS = ['sonnet', 'opus', 'fable', 'haiku', '*'];
   var ROLE_LABELS = {
     sonnet: 'sonnet（中端）',
@@ -294,8 +833,18 @@
   var CAPABILITY_BOOL_KEYS = ['image_input', 'pdf_input', 'thinking', 'structured_outputs'];
 
   var statusEl = document.getElementById('status');
+  var pageStatusEl = document.getElementById(PAGE === 'json' ? 'json-status' : 'config-status');
   var visualPane = document.getElementById('visual-pane');
   var jsonPane = document.getElementById('json-pane');
+  var statsPane = document.getElementById('stats-pane');
+  var monitorPane = document.getElementById('monitor-pane');
+  var monitorRows = document.getElementById('monitor-rows');
+  var monitorEmpty = document.getElementById('monitor-empty');
+  var monitorTable = document.getElementById('monitor-table');
+  var monitorAxis = document.getElementById('monitor-axis');
+  var monitorAxisTitle = document.getElementById('monitor-axis-title');
+  var monitorClearButton = document.getElementById('monitor-clear');
+  var monitorStateEl = document.getElementById('monitor-state');
   var instancesEl = document.getElementById('instances');
   var noInstancesEl = document.getElementById('no-instances');
   var jsonEditor = document.getElementById('json-editor');
@@ -327,9 +876,23 @@
   var providerPresets = [];
   var draggedInstance = null;
 
-  function setStatus(message, kind) {
+  function setStatus(message, kind, title) {
+    if (!pageStatusEl) {
+      return;
+    }
+    pageStatusEl.textContent = message;
+    pageStatusEl.className = 'page-status' + (kind ? ' ' + kind : '');
+    pageStatusEl.title = title || '';
+  }
+
+  // 顶栏 #status 由全局 WS 管理器独占；配置页的保存/加载结果走页内状态行。
+  function setLiveStatus(message, kind) {
     statusEl.textContent = message;
     statusEl.className = kind || '';
+    if (monitorStateEl) {
+      monitorStateEl.textContent = message;
+      monitorStateEl.className = 'monitor-state' + (kind ? ' ' + kind : '');
+    }
   }
 
   function setResult(el, message, kind) {
@@ -337,11 +900,28 @@
     el.className = 'result' + (kind ? ' ' + kind : '');
   }
 
+  function isCredentialURLError(err) {
+    return !!(err && err.name === 'TypeError' && /credentials/i.test(String(err.message || '')));
+  }
+
+  function pageHasEmbeddedCredentials() {
+    return /\/\/[^\/?#]*@/.test(location.href);
+  }
+
   async function api(path, options) {
     var opts = options || {};
     var headers = { 'Content-Type': 'application/json' };
     Object.assign(headers, opts.headers || {});
-    var res = await fetch(path, { method: opts.method || 'GET', headers: headers, body: opts.body });
+    var res;
+    try {
+      res = await fetch(path, { method: opts.method || 'GET', headers: headers, body: opts.body });
+    } catch (err) {
+      // URL 内嵌凭据时 fetch 会抛 credentials 类 TypeError；打标记供 load() 静默降级。
+      if (isCredentialURLError(err) && err && typeof err === 'object') {
+        err.credentialURL = true;
+      }
+      throw err;
+    }
     var text = await res.text();
     var data = null;
     if (text) {
@@ -1370,9 +1950,20 @@
     try {
       setStatus('加载中…');
       var data = await api('/api/config');
-      renderVisual(data);
+      if (PAGE === 'json') {
+        jsonEditor.value = JSON.stringify(data, null, 2);
+        setJSONSaveEnabled(false);
+        setResult(jsonResult, '', '');
+      } else {
+        renderVisual(data);
+      }
       setStatus('已加载当前生效配置。', 'ok');
     } catch (err) {
+      if ((err && err.credentialURL) || pageHasEmbeddedCredentials()) {
+        setStatus('配置读取受限（URL 凭据）', '',
+          '页面以 URL 内嵌凭据打开，配置读取受限；请通过登录页登录后访问。');
+        return;
+      }
       setStatus('加载失败：' + err.message, 'error');
     }
   }
@@ -1412,38 +2003,1401 @@
     }
   }
 
-  function switchMode(mode) {
-    var jsonMode = mode === 'json';
-    if (jsonMode) {
-      var built;
-      try {
-        built = buildConfigFromVisual();
-      } catch (err) {
-        setFallbackError(err.message);
-        setStatus('回退参数有误，JSON 中沿用已加载的回退参数：' + err.message, 'error');
-        built = buildConfigWithoutFallback();
-        if (config && config.fallback) {
-          built.fallback = config.fallback;
-        }
+  // §24 实时请求监控：单表格 + 每行 trunk 时间轴 + 共享量程。
+  var MONITOR_MAX_REQUESTS = 500;
+  var MONITOR_MIN_AXIS_MS = 100;
+  var MONITOR_MIN_DISPLAY_SPAN_MS = 1000;
+  var MONITOR_AXIS_STEPS = [1, 2, 5, 10, 15, 20, 30, 60, 120, 300];
+  var WS_BACKOFF_MS = [1000, 2000, 4000, 8000, 15000];
+  var monitor = {
+    open: PAGE === 'monitor',
+    connected: false,
+    ws: null,
+    reqs: [],
+    byId: {},
+    axisSpan: MONITOR_MIN_DISPLAY_SPAN_MS,
+    timer: null,
+    nextSeq: 1,
+    snapshotLoaded: false,
+  };
+  // §24.7 D9：全局单连接；监控与统计共用，切换页面不重建。
+  var live = {
+    ws: null,
+    connected: false,
+    attempt: 0,
+    retryTimer: null,
+    snapshotLoaded: false,
+    statsRaw: null,
+    statsAt: 0,
+    statsUptimeMs: null,
+    statsUptimeText: '',
+  };
+  // 验收/调试钩子：读取全局连接与监控状态。
+  window.__modelRouterMonitor = monitor;
+  window.__modelRouterLive = live;
+
+  function formatMs(ms) {
+    if (!isFinite(ms) || ms < 0) {
+      return '–';
+    }
+    if (ms < 1000) {
+      return Math.round(ms) + 'ms';
+    }
+    return (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + 's';
+  }
+
+  function formatNumber(value) {
+    return value === undefined || value === null || value === 0 ? '–' : String(value);
+  }
+
+  // §24.9 Z1：请求开始时间（本地时区、24 小时制、毫秒固定 3 位）。
+  function formatClock(ts) {
+    var date = new Date(Number(ts));
+    if (!isFinite(date.getTime())) {
+      return '';
+    }
+    function pad(value, width) {
+      var text = String(value);
+      while (text.length < width) {
+        text = '0' + text;
       }
-      jsonEditor.value = JSON.stringify(built, null, 2);
-      setJSONSaveEnabled(false);
-      setResult(jsonResult, '', '');
-    } else {
-      var parsed = null;
-      try {
-        parsed = JSON.parse(jsonEditor.value);
-      } catch (err) {
-        setStatus('JSON 当前无法解析，保留可视化状态。', 'error');
-      }
-      if (parsed && parsed.instances) {
-        renderVisual(parsed);
+      return text;
+    }
+    return pad(date.getHours(), 2) + ':' + pad(date.getMinutes(), 2) + ':' +
+      pad(date.getSeconds(), 2) + '.' + pad(date.getMilliseconds(), 3);
+  }
+
+  function startTimeSuffix(ts) {
+    return ' · 开始 ' + formatClock(ts);
+  }
+
+  function reasonLabel(reason) {
+    switch (reason) {
+      case 'error': return '上游错误';
+      case 'first_token_timeout': return '首 token 超时';
+      case 'idle_timeout': return '空闲超时';
+      case 'slow': return '低速';
+      default: return reason || '未知';
+    }
+  }
+
+  function monitorStatus(req) {
+    if (!req.ended) {
+      return { label: '进行中', cls: 'run' };
+    }
+    if (req.error || req.status >= 400) {
+      return { label: '失败', cls: 'err' };
+    }
+    return { label: '成功', cls: 'ok' };
+  }
+
+  function monitorRoute(req) {
+    var target = req.instName || '…';
+    if (req.upstreamModel) {
+      target += '/' + req.upstreamModel;
+    }
+    return (req.reqModel || 'n/a') + ' → ' + target;
+  }
+
+  function monitorCell(text, className) {
+    var cell = document.createElement('td');
+    cell.textContent = text;
+    if (className) {
+      cell.className = className;
+    }
+    return cell;
+  }
+
+  function monitorStackCell(className, topClass, bottomClass) {
+    var cell = document.createElement('td');
+    cell.className = className;
+    var top = document.createElement('span');
+    top.className = topClass;
+    var bottom = document.createElement('span');
+    bottom.className = bottomClass;
+    cell.appendChild(top);
+    cell.appendChild(bottom);
+    return { cell: cell, top: top, bottom: bottom };
+  }
+
+  function setMonitorCellText(cell, text) {
+    cell.textContent = text;
+    cell.title = text;
+  }
+
+  function monitorTTFT(req) {
+    if (req.ttftMs) {
+      return req.ttftMs;
+    }
+    if (req.chunksList.length > 0) {
+      return Math.max(0, req.chunksList[0].e - req.ts);
+    }
+    return 0;
+  }
+
+  // §24.7 D3：UA → 「名称/主.次」。规则表首个匹配生效。
+  function uaVersion(ua, marker) {
+    var index = ua.indexOf(marker);
+    if (index < 0) {
+      return '';
+    }
+    var match = /^[0-9][0-9A-Za-z.+-]*/.exec(ua.slice(index + marker.length));
+    return match ? match[0] : '';
+  }
+
+  function uaTwoPart(ua, marker) {
+    var version = uaVersion(ua, marker);
+    return version ? version.split('.').slice(0, 2).join('.') : '';
+  }
+
+  function uaMajor(ua, marker) {
+    var version = uaVersion(ua, marker);
+    return version ? version.split('.')[0] : '';
+  }
+
+  function truncateClientLabel(text) {
+    return text.length > 18 ? text.slice(0, 18) + '…' : text;
+  }
+
+  function userAgentLabel(ua) {
+    var raw = String(ua || '').trim();
+    if (raw === '') {
+      return '–';
+    }
+    var version;
+    if (raw.indexOf('deepseek-harness/') >= 0) {
+      // 规则表要求 0.2.2-rc.1 → 0.2.2：去掉 -rc/+build 后保留完整核心版本。
+      version = uaVersion(raw, 'deepseek-harness/').split('-')[0].split('+')[0];
+      if (version) {
+        return 'deepseek-harness/' + version;
       }
     }
-    visualPane.hidden = jsonMode;
-    jsonPane.hidden = !jsonMode;
-    document.getElementById('mode-visual').className = jsonMode ? '' : 'active';
-    document.getElementById('mode-json').className = jsonMode ? 'active' : '';
+    if (raw.indexOf('claude-code/') >= 0) {
+      version = uaTwoPart(raw, 'claude-code/');
+      if (version) {
+        return 'claude-code/' + version;
+      }
+    }
+    if (raw.indexOf('Go-http-client/') >= 0) {
+      version = uaTwoPart(raw, 'Go-http-client/');
+      if (version) {
+        return 'Go-http-client/' + version;
+      }
+    }
+    if (raw.indexOf('curl/') === 0) {
+      version = uaTwoPart(raw, 'curl/');
+      if (version) {
+        return 'curl/' + version;
+      }
+    }
+    if (raw.indexOf('Mozilla/5.0') >= 0 && raw.indexOf('Chrome/') >= 0) {
+      version = uaMajor(raw, 'Chrome/');
+      if (version) {
+        return 'Chrome/' + version;
+      }
+    }
+    if (raw.indexOf('Mozilla/5.0') >= 0 && raw.indexOf('Firefox/') >= 0) {
+      version = uaMajor(raw, 'Firefox/');
+      if (version) {
+        return 'Firefox/' + version;
+      }
+    }
+    if (raw.indexOf('Mozilla/5.0') >= 0 && raw.indexOf('Safari/') >= 0 &&
+        raw.indexOf('Chrome/') < 0) {
+      version = uaMajor(raw, 'Safari/');
+      if (version) {
+        return 'Safari/' + version;
+      }
+    }
+    if (raw.indexOf('python-requests/') >= 0) {
+      version = uaTwoPart(raw, 'python-requests/');
+      if (version) {
+        return 'python-requests/' + version;
+      }
+    }
+    if (raw.indexOf('python-httpx/') >= 0) {
+      version = uaTwoPart(raw, 'python-httpx/');
+      if (version) {
+        return 'python-httpx/' + version;
+      }
+    }
+    var token = (raw.split(/\s+/)[0] || '').slice(0, 24);
+    return truncateClientLabel(token);
+  }
+
+  function refreshMonitorRow(req) {
+    if (!req || !req.cells) {
+      return;
+    }
+    var status = monitorStatus(req);
+    req.cells.index.textContent = String(req.seq);
+    req.cells.status.textContent = status.label;
+    req.cells.status.className = 'req-status ' + status.cls;
+
+    var method = req.method || '–';
+    var path = req.path || '–';
+    var pathTitle = (method + ' ' + path).trim();
+    req.cells.methodText.textContent = method;
+    req.cells.url.textContent = path;
+    req.cells.method.title = pathTitle;
+    req.cells.methodText.title = pathTitle;
+    req.cells.url.title = path;
+
+    var ip = req.clientIP || '–';
+    var rawUA = req.userAgent || '';
+    req.cells.clientIp.textContent = ip;
+    req.cells.clientIp.title = ip;
+    req.cells.clientUa.textContent = userAgentLabel(rawUA);
+    req.cells.clientUa.title = rawUA || '–';
+    req.cells.client.title = ip + ' ' + (rawUA || '–');
+
+    var model = req.reqModel || 'n/a';
+    var target = (req.instName || '…') + (req.upstreamModel ? '/' + req.upstreamModel : '');
+    req.cells.model.textContent = model;
+    req.cells.target.textContent = target;
+    req.cells.route.title = monitorRoute(req);
+    req.cells.model.title = model;
+    req.cells.target.title = target;
+
+    setMonitorCellText(req.cells.inTokens, formatNumber(req.inTokens));
+    setMonitorCellText(req.cells.outTokens, formatNumber(req.ended ? req.outTokens : req.cumTokens));
+    setMonitorCellText(req.cells.chunks, formatNumber(req.chunks));
+    // §24.11 H1：快照恢复的进行中行从服务端已耗时继续增长。
+    setMonitorCellText(req.cells.duration,
+      formatMs(req.ended ? req.durationMs : (req.baseDurationMs || 0) + (Date.now() - req.recvAt)));
+    setMonitorCellText(req.cells.ttft, monitorTTFT(req) ? formatMs(monitorTTFT(req)) : '–');
+    setMonitorCellText(req.cells.tps, req.tps ? req.tps.toFixed(1) : '–');
+  }
+
+  function addMonitorRow(req, append) {
+    var row = document.createElement('tr');
+    var pathCell = monitorStackCell('req-path', 'req-method', 'req-url');
+    var clientCell = monitorStackCell('req-client', 'req-client-ip', 'req-client-id');
+    var routeCell = monitorStackCell('req-route', 'req-model', 'req-target');
+    var timelineCell = document.createElement('td');
+    timelineCell.className = 'req-timeline';
+    var timelineEl = document.createElement('div');
+    timelineEl.className = 'monitor-row-timeline';
+    var waitEl = document.createElement('div');
+    waitEl.className = 'tl-wait';
+    timelineEl.appendChild(waitEl);
+    timelineCell.appendChild(timelineEl);
+
+    var cells = {
+      index: monitorCell('', 'num req-idx'),
+      status: monitorCell('', 'req-status'),
+      method: pathCell.cell,
+      methodText: pathCell.top,
+      url: pathCell.bottom,
+      client: clientCell.cell,
+      clientIp: clientCell.top,
+      clientUa: clientCell.bottom,
+      route: routeCell.cell,
+      model: routeCell.top,
+      target: routeCell.bottom,
+      inTokens: monitorCell('–', 'num'),
+      outTokens: monitorCell('–', 'num'),
+      chunks: monitorCell('–', 'num'),
+      duration: monitorCell('–', 'num'),
+      ttft: monitorCell('–', 'num'),
+      tps: monitorCell('–', 'num'),
+    };
+    [cells.index, cells.status, cells.method, cells.client, cells.route, cells.inTokens,
+      cells.outTokens, cells.chunks, cells.duration, cells.ttft, cells.tps, timelineCell]
+      .forEach(function (cell) {
+        row.appendChild(cell);
+      });
+
+    req.row = row;
+    req.cells = cells;
+    req.timelineEl = timelineEl;
+    req.timelineWait = { el: waitEl };
+    req.timelineBlocks = [];
+    req.timelineRetries = [];
+    req.timelineCursor = null;
+    if (append) {
+      monitorRows.appendChild(row);
+    } else {
+      monitorRows.insertBefore(row, monitorRows.firstChild);
+    }
+    refreshMonitorRow(req);
+    updateRowTimeline(req);
+  }
+
+  // §24.9 Z3：序号列按行在列表中的位置显示（1-based）。
+  function refreshMonitorIndexes() {
+    monitor.reqs.forEach(function (req, index) {
+      req.seq = index + 1;
+      if (req.cells) {
+        req.cells.index.textContent = String(req.seq);
+      }
+    });
+  }
+
+  // §24.9 Z3：快照合并后按 ts 降序重排数组与 DOM，保证最新在最上面。
+  function sortMonitorRequests() {
+    monitor.reqs.sort(function (a, b) {
+      return (Number(b.ts) || 0) - (Number(a.ts) || 0);
+    });
+    monitor.reqs.forEach(function (req) {
+      if (req.row) {
+        monitorRows.appendChild(req.row);
+      }
+    });
+    refreshMonitorIndexes();
+  }
+
+  function requestTimelineSpan(req) {
+    if (req.ended) {
+      return Math.max(0, req.durationMs);
+    }
+    return Math.max(0, Date.now() - req.ts);
+  }
+
+  function computeAxisSpan() {
+    var span = MONITOR_MIN_AXIS_MS;
+    monitor.reqs.forEach(function (req) {
+      span = Math.max(span, requestTimelineSpan(req));
+      req.chunksList.forEach(function (chunk) {
+        span = Math.max(span, chunk.e - req.ts);
+      });
+      req.retries.forEach(function (retry) {
+        span = Math.max(span, retry.at);
+      });
+    });
+    return span;
+  }
+
+  function axisTickValues(seconds, step) {
+    var values = [];
+    for (var value = 0; value <= seconds; value += step) {
+      values.push(value);
+    }
+    if (values[values.length - 1] !== seconds) {
+      values.push(seconds);
+    }
+    return values;
+  }
+
+  function axisTicksOverlap() {
+    var previous = null;
+    for (var i = 0; i < monitorAxis.children.length; i += 1) {
+      var rect = monitorAxis.children[i].getBoundingClientRect();
+      if (previous && rect.left < previous.right - 0.5) {
+        return true;
+      }
+      previous = rect;
+    }
+    return false;
+  }
+
+  function renderAxisTicks() {
+    var seconds = Math.max(1, Math.round(monitor.axisSpan / 1000));
+    var startIndex = -1;
+    for (var i = 0; i < MONITOR_AXIS_STEPS.length; i += 1) {
+      if (seconds / MONITOR_AXIS_STEPS[i] <= 4) {
+        startIndex = i;
+        break;
+      }
+    }
+    var candidates = [];
+    if (startIndex === -1) {
+      // X4 的步长表最大 300s；更长的请求退化为约 4 格（见报告 undefined_cases）。
+      candidates.push(Math.ceil(seconds / 4));
+    } else {
+      for (var j = startIndex; j < MONITOR_AXIS_STEPS.length; j += 1) {
+        candidates.push(MONITOR_AXIS_STEPS[j]);
+      }
+    }
+    for (var c = 0; c < candidates.length; c += 1) {
+      var step = candidates[c];
+      monitorAxis.textContent = '';
+      axisTickValues(seconds, step).forEach(function (value) {
+        var tick = document.createElement('span');
+        tick.style.left = (value / seconds * 100) + '%';
+        tick.textContent = value + 's';
+        monitorAxis.appendChild(tick);
+      });
+      if (!axisTicksOverlap()) {
+        break;
+      }
+    }
+    if (monitorAxis.children.length === 0) {
+      var tick = document.createElement('span');
+      tick.style.left = '0%';
+      tick.textContent = '0s';
+      monitorAxis.appendChild(tick);
+    }
+    monitorAxisTitle.textContent = '0s – ' + seconds + 's';
+  }
+
+  function refreshMonitorAxis(force) {
+    var raw = computeAxisSpan();
+    var next = Math.max(MONITOR_MIN_DISPLAY_SPAN_MS, Math.ceil(raw / 1000) * 1000);
+    var changed = force || next !== monitor.axisSpan;
+    if (changed) {
+      monitor.axisSpan = next;
+      renderAxisTicks();
+    }
+    return changed;
+  }
+
+  function rowWaitMs(req) {
+    if (req.chunksList.length > 0) {
+      return Math.max(0, req.chunksList[0].s - req.ts);
+    }
+    if (req.ended) {
+      return Math.max(0, req.durationMs);
+    }
+    return Math.max(0, Date.now() - req.ts);
+  }
+
+  function positionRowTimeline(req) {
+    var span = monitor.axisSpan || MONITOR_MIN_DISPLAY_SPAN_MS;
+    if (req.timelineWait) {
+      var waitMs = rowWaitMs(req);
+      var waitWidth = Math.max(0, Math.min(100, waitMs / span * 100));
+      req.timelineWait.el.style.width = waitWidth + '%';
+      req.timelineWait.el.title = '等待首包 ' + Math.round(waitMs) + ' ms' + startTimeSuffix(req.ts);
+    }
+    req.timelineBlocks.forEach(function (block) {
+      var start = block.start;
+      var end = block.end;
+      var left = Math.max(0, Math.min(100, start / span * 100));
+      var width = Math.max(0.15, Math.min(100 - left, (end - start) / span * 100));
+      block.el.style.left = left + '%';
+      block.el.style.width = width + '%';
+    });
+    req.timelineRetries.forEach(function (mark) {
+      mark.el.style.left = Math.max(0, Math.min(100, mark.at / span * 100)) + '%';
+    });
+    if (req.timelineCursor) {
+      var elapsed = Math.max(0, Date.now() - req.ts);
+      req.timelineCursor.el.style.left = Math.max(0, Math.min(100, elapsed / span * 100)) + '%';
+    }
+  }
+
+  function positionAllTimelines() {
+    monitor.reqs.forEach(positionRowTimeline);
+  }
+
+  function updateRowTimeline(req) {
+    if (!req.timelineEl) {
+      return;
+    }
+    if (!req.ended && !req.timelineCursor) {
+      var cursor = document.createElement('div');
+      cursor.className = 'tl-cursor';
+      cursor.title = '当前时刻' + startTimeSuffix(req.ts);
+      req.timelineEl.appendChild(cursor);
+      req.timelineCursor = { el: cursor };
+    }
+    if (req.ended && req.timelineCursor) {
+      if (req.timelineCursor.el.parentNode) {
+        req.timelineCursor.el.parentNode.removeChild(req.timelineCursor.el);
+      }
+      req.timelineCursor = null;
+    }
+    positionRowTimeline(req);
+  }
+
+  // §24.8 Y5/Y6：所有条共用 CSS 的固定高度（40% 轨道），块高不再随
+  // token 缩放；颜色改由本块是否含 content_block_delta 决定。
+  function appendTimelineChunk(req, chunk) {
+    if (!req.timelineEl) {
+      return;
+    }
+    var block = document.createElement('div');
+    block.className = 'tl-block' + (chunk.content > 0 ? ' tok' : '');
+    block.title = '#' + chunk.seq + ' · ' + chunk.bytes + ' B · Δ' + chunk.delta +
+      ' tokens · 内容块 ' + chunk.content + ' · 累计 ' + chunk.cum +
+      ' · 距请求开始 ' + Math.round(chunk.s - req.ts) + ' ms' + startTimeSuffix(req.ts);
+    req.timelineEl.appendChild(block);
+    req.timelineBlocks.push({
+      el: block,
+      start: chunk.s - req.ts,
+      end: chunk.e - req.ts,
+    });
+  }
+
+  function appendTimelineRetry(req, retry) {
+    if (!req.timelineEl) {
+      return;
+    }
+    var mark = document.createElement('div');
+    mark.className = 'tl-retry retry';
+    mark.title = '重试 → ' + (retry.inst || '…') +
+      (retry.model ? '/' + retry.model : '') + '（' + reasonLabel(retry.reason) + '）' +
+      startTimeSuffix(req.ts);
+    req.timelineEl.appendChild(mark);
+    req.timelineRetries.push({ el: mark, at: retry.at });
+  }
+
+  function buildMonitorRequest(event) {
+    var req = {
+      id: event.id,
+      seq: monitor.nextSeq,
+      ts: event.ts || Date.now(),
+      recvAt: Date.now(),
+      method: event.method || '',
+      path: event.path || '',
+      protocol: event.protocol || '',
+      reqModel: event.reqModel || '',
+      clientIP: event.clientIP || '',
+      userAgent: event.userAgent || '',
+      instName: event.instName || '',
+      upstreamModel: event.upstreamModel || '',
+      chunks: 0,
+      chunksList: [],
+      baseDurationMs: 0,
+      retries: [],
+      cumTokens: 0,
+      inTokens: 0,
+      outTokens: 0,
+      durationMs: 0,
+      ttftMs: 0,
+      genMs: 0,
+      tps: 0,
+      status: 0,
+      error: '',
+      ended: false,
+    };
+    monitor.nextSeq += 1;
+    return req;
+  }
+
+  function monitorStart(event) {
+    if (monitor.byId[event.id]) {
+      return;
+    }
+    var req = buildMonitorRequest(event);
+    monitor.byId[req.id] = req;
+    monitor.reqs.unshift(req);
+    addMonitorRow(req, false);
+    refreshMonitorIndexes();
+    monitorTable.hidden = false;
+    monitorEmpty.hidden = true;
+    refreshMonitorAxis(true);
+    positionAllTimelines();
+  }
+
+  function monitorChunk(req, event) {
+    if (req.ended) {
+      return;
+    }
+    // §24.11 H1：快照可能与同一块的实时事件同时到达，按 seq 去重。
+    var duplicate = req.chunksList.some(function (existing) {
+      return existing.seq === event.seq;
+    });
+    if (duplicate) {
+      return;
+    }
+    req.chunks += 1;
+    var chunk = {
+      seq: event.seq,
+      s: event.tsStart,
+      e: event.tsEnd,
+      bytes: event.bytes,
+      delta: event.deltaTokens || 0,
+      content: event.contentDeltas || 0,
+      cum: event.cumTokens || 0,
+    };
+    req.chunksList.push(chunk);
+    req.cumTokens = event.cumTokens || 0;
+    appendTimelineChunk(req, chunk);
+    if (refreshMonitorAxis(false)) {
+      positionAllTimelines();
+    } else {
+      positionRowTimeline(req);
+    }
+    refreshMonitorRow(req);
+  }
+
+  function monitorRetry(req, event) {
+    if (req.ended) {
+      return;
+    }
+    var retry = {
+      at: Math.max(0, Date.now() - req.ts),
+      inst: event.instName || '',
+      model: event.upstreamModel || '',
+      reason: event.reason || '',
+    };
+    req.retries.push(retry);
+    req.instName = event.instName || req.instName;
+    req.upstreamModel = event.upstreamModel || req.upstreamModel;
+    appendTimelineRetry(req, retry);
+    if (refreshMonitorAxis(false)) {
+      positionAllTimelines();
+    } else {
+      positionRowTimeline(req);
+    }
+    refreshMonitorRow(req);
+  }
+
+  function applyMonitorEnd(req, event) {
+    req.ended = true;
+    req.status = event.status || 0;
+    req.durationMs = event.durationMs || 0;
+    req.inTokens = event.inTokens || 0;
+    req.outTokens = event.outTokens || 0;
+    req.chunks = event.chunks || req.chunks;
+    req.ttftMs = event.ttftMs || 0;
+    req.genMs = event.genMs || 0;
+    req.tps = event.tps || 0;
+    req.instName = event.instName || req.instName;
+    req.upstreamModel = event.upstreamModel || req.upstreamModel;
+    req.error = event.error || '';
+  }
+
+  function monitorEnd(req, event) {
+    if (req.ended) {
+      return;
+    }
+    applyMonitorEnd(req, event);
+    updateRowTimeline(req);
+    if (refreshMonitorAxis(false)) {
+      positionAllTimelines();
+    } else {
+      positionRowTimeline(req);
+    }
+    refreshMonitorRow(req);
+    trimMonitorRequests();
+  }
+
+  function handleMonitorEvent(event) {
+    if (!event || typeof event.id !== 'string') {
+      return;
+    }
+    if (event.type === 'start') {
+      monitorStart(event);
+      return;
+    }
+    var req = monitor.byId[event.id];
+    if (!req) {
+      return;
+    }
+    if (event.type === 'chunk') {
+      monitorChunk(req, event);
+    } else if (event.type === 'retry') {
+      monitorRetry(req, event);
+    } else if (event.type === 'end') {
+      monitorEnd(req, event);
+    }
+  }
+
+  // §24.7 D9：snapshot 与实时事件按 id 去重合并。
+  function snapshotValue(item, name) {
+    if (item[name] !== undefined && item[name] !== null) {
+      return item[name];
+    }
+    if (item.start && item.start[name] !== undefined && item.start[name] !== null) {
+      return item.start[name];
+    }
+    if (item.end && item.end[name] !== undefined && item.end[name] !== null) {
+      return item.end[name];
+    }
+    return undefined;
+  }
+
+  function snapshotNumber(item, name) {
+    var value = Number(snapshotValue(item, name));
+    return isFinite(value) ? value : 0;
+  }
+
+  function ingestSnapshotRequest(item) {
+    if (!item || typeof item.id !== 'string' || monitor.byId[item.id]) {
+      return;
+    }
+    var start = {
+      id: item.id,
+      ts: snapshotNumber(item, 'ts') || (Date.now() - snapshotNumber(item, 'durationMs')),
+      method: snapshotValue(item, 'method') || '',
+      path: snapshotValue(item, 'path') || '',
+      protocol: snapshotValue(item, 'protocol') || '',
+      reqModel: snapshotValue(item, 'reqModel') || snapshotValue(item, 'model') || '',
+      clientIP: snapshotValue(item, 'clientIP') || '',
+      userAgent: snapshotValue(item, 'userAgent') || '',
+      instName: snapshotValue(item, 'instName') || '',
+      upstreamModel: snapshotValue(item, 'upstreamModel') || '',
+    };
+    var req = buildMonitorRequest(start);
+    req.recvAt = Date.now();
+    if (item.ended === false) {
+      // §24.11 H1：进行中的快照行按进行中渲染，后续 chunk/end 事件续接。
+      req.ended = false;
+      req.status = snapshotNumber(item, 'status');
+      req.durationMs = snapshotNumber(item, 'durationMs');
+      req.baseDurationMs = req.durationMs;
+      req.ttftMs = snapshotNumber(item, 'ttftMs');
+      req.genMs = snapshotNumber(item, 'genMs');
+      req.inTokens = snapshotNumber(item, 'inTokens');
+      req.outTokens = snapshotNumber(item, 'outTokens');
+      req.cumTokens = req.outTokens;
+      req.chunks = snapshotNumber(item, 'chunks');
+      req.instName = snapshotValue(item, 'instName') || req.instName;
+      req.upstreamModel = snapshotValue(item, 'upstreamModel') || req.upstreamModel;
+    } else {
+      applyMonitorEnd(req, {
+        status: snapshotNumber(item, 'status'),
+        durationMs: snapshotNumber(item, 'durationMs'),
+        inTokens: snapshotNumber(item, 'inTokens'),
+        outTokens: snapshotNumber(item, 'outTokens'),
+        chunks: snapshotNumber(item, 'chunks'),
+        ttftMs: snapshotNumber(item, 'ttftMs'),
+        genMs: snapshotNumber(item, 'genMs'),
+        tps: snapshotNumber(item, 'tps'),
+        instName: start.instName,
+        upstreamModel: start.upstreamModel,
+        error: snapshotValue(item, 'error') || '',
+      });
+    }
+    monitor.byId[req.id] = req;
+    monitor.reqs.push(req);
+    addMonitorRow(req, true);
+
+    // §24.9 Z4：优先用后端快照的逐块明细恢复，缺失时才退回单个摘要块。
+    if (Array.isArray(item.chunksList)) {
+      item.chunksList.forEach(function (raw) {
+        var chunk = {
+          seq: typeof raw.seq === 'number' ? raw.seq : req.chunksList.length,
+          s: Number(raw.tsStart) || req.ts,
+          e: Number(raw.tsEnd) || Number(raw.tsStart) || req.ts,
+          bytes: raw.bytes || 0,
+          delta: raw.deltaTokens || 0,
+          content: raw.contentDeltas || 0,
+          cum: raw.cumTokens || 0,
+        };
+        req.chunksList.push(chunk);
+        req.cumTokens = chunk.cum;
+        appendTimelineChunk(req, chunk);
+      });
+    } else if (req.chunks > 0 && req.durationMs > 0) {
+      // 快照只带摘要时：等待段画到 TTFT，剩余部分用一个 trunk 摘要块表示。
+      var blockStart = Math.max(0, req.ttftMs || 0);
+      var blockEnd = Math.max(blockStart, req.durationMs);
+      if (blockEnd > blockStart) {
+        var summary = {
+          seq: 1,
+          s: req.ts + blockStart,
+          e: req.ts + blockEnd,
+          bytes: 0,
+          delta: 0,
+          content: 0,
+          cum: req.outTokens || 0,
+        };
+        req.chunksList.push(summary);
+        appendTimelineChunk(req, summary);
+      }
+    }
+    updateRowTimeline(req);
+  }
+
+  function applyMonitorSnapshot(items) {
+    if (!monitorTable) {
+      return;
+    }
+    var ordered = items.slice().sort(function (a, b) {
+      return (Number(snapshotValue(b, 'ts')) || 0) - (Number(snapshotValue(a, 'ts')) || 0);
+    });
+    ordered.forEach(ingestSnapshotRequest);
+    sortMonitorRequests();
+    monitor.snapshotLoaded = true;
+    updateMonitorEmptyState();
+    refreshMonitorAxis(true);
+    positionAllTimelines();
+  }
+
+  function updateMonitorEmptyState() {
+    var empty = monitor.reqs.length === 0;
+    monitorTable.hidden = empty;
+    monitorEmpty.hidden = !empty;
+  }
+
+  function removeMonitorRequest(index) {
+    var req = monitor.reqs[index];
+    if (!req) {
+      return;
+    }
+    monitor.reqs.splice(index, 1);
+    delete monitor.byId[req.id];
+    if (req.row && req.row.parentNode) {
+      req.row.parentNode.removeChild(req.row);
+    }
+    refreshMonitorIndexes();
+    refreshMonitorAxis(false);
+    positionAllTimelines();
+    updateMonitorEmptyState();
+  }
+
+  function trimMonitorRequests() {
+    while (monitor.reqs.length > MONITOR_MAX_REQUESTS) {
+      var index = -1;
+      for (var i = monitor.reqs.length - 1; i >= 0; i -= 1) {
+        if (monitor.reqs[i].ended) {
+          index = i;
+          break;
+        }
+      }
+      if (index === -1) {
+        break;
+      }
+      removeMonitorRequest(index);
+    }
+  }
+
+  function clearCompletedMonitorRequests() {
+    var kept = [];
+    monitor.reqs.forEach(function (req) {
+      if (req.ended) {
+        delete monitor.byId[req.id];
+        if (req.row && req.row.parentNode) {
+          req.row.parentNode.removeChild(req.row);
+        }
+      } else {
+        kept.push(req);
+      }
+    });
+    monitor.reqs = kept;
+    refreshMonitorIndexes();
+    refreshMonitorAxis(false);
+    positionAllTimelines();
+    updateMonitorEmptyState();
+  }
+
+  function tickMonitor() {
+    if (!monitor.open) {
+      return;
+    }
+    var axisChanged = refreshMonitorAxis(false);
+    monitor.reqs.forEach(function (req) {
+      if (!req.ended) {
+        refreshMonitorRow(req);
+      }
+    });
+    if (axisChanged) {
+      positionAllTimelines();
+    } else {
+      monitor.reqs.forEach(function (req) {
+        if (!req.ended) {
+          positionRowTimeline(req);
+        }
+      });
+    }
+  }
+
+  // §24.7 D9：全局单连接（登录后立即建立、断线指数退避重连）。
+  function scheduleLiveReconnect() {
+    if (live.retryTimer) {
+      return;
+    }
+    var index = Math.min(Math.max(live.attempt - 1, 0), WS_BACKOFF_MS.length - 1);
+    live.retryTimer = setTimeout(function () {
+      live.retryTimer = null;
+      connectLiveWS();
+    }, WS_BACKOFF_MS[index]);
+  }
+
+  function connectLiveWS() {
+    var scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var socket;
+    try {
+      socket = new WebSocket(scheme + '//' + location.host + '/api/ws');
+    } catch (err) {
+      live.attempt += 1;
+      setLiveStatus('重连中(第 ' + live.attempt + ' 次)', 'error');
+      scheduleLiveReconnect();
+      return;
+    }
+    live.ws = socket;
+    monitor.ws = socket;
+    socket.addEventListener('open', function () {
+      if (live.ws !== socket) {
+        return;
+      }
+      live.connected = true;
+      live.attempt = 0;
+      monitor.connected = true;
+      setLiveStatus('已连接', 'ok');
+    });
+    socket.addEventListener('message', function (event) {
+      if (live.ws !== socket) {
+        return;
+      }
+      handleLiveMessage(event.data);
+    });
+    socket.addEventListener('close', function () {
+      if (live.ws !== socket) {
+        return;
+      }
+      live.ws = null;
+      live.connected = false;
+      monitor.ws = null;
+      monitor.connected = false;
+      live.attempt += 1;
+      setLiveStatus('重连中(第 ' + live.attempt + ' 次)', 'error');
+      scheduleLiveReconnect();
+    });
+  }
+
+  function handleLiveMessage(raw) {
+    var message;
+    try {
+      message = JSON.parse(raw);
+    } catch (err) {
+      return;
+    }
+    if (!message || typeof message.type !== 'string') {
+      return;
+    }
+    if (message.type === 'stats') {
+      live.statsRaw = message.data || null;
+      if (PAGE === 'stats') {
+        renderStats(message.data);
+      }
+      return;
+    }
+    if (message.type === 'snapshot') {
+      live.snapshotLoaded = true;
+      if (message.stats) {
+        live.statsRaw = message.stats;
+        if (PAGE === 'stats') {
+          renderStats(message.stats);
+        }
+      }
+      if (PAGE === 'monitor' && Array.isArray(message.requests)) {
+        applyMonitorSnapshot(message.requests);
+      }
+      return;
+    }
+    if (message.type === 'start' || message.type === 'chunk' ||
+        message.type === 'retry' || message.type === 'end') {
+      if (PAGE === 'monitor') {
+        handleMonitorEvent(message);
+      }
+    }
+  }
+
+  // §24.7 D7：统计首页。字段结构见报告 assumptions；同时兼容常见的扁平/嵌套命名。
+  function statsValue(obj, keys) {
+    if (!obj || typeof obj !== 'object') {
+      return undefined;
+    }
+    for (var i = 0; i < keys.length; i += 1) {
+      var value = obj[keys[i]];
+      if (value !== undefined && value !== null) {
+        return value;
+      }
+    }
+    return undefined;
+  }
+
+  function statsNumber(obj, keys) {
+    var value = Number(statsValue(obj, keys));
+    return isFinite(value) ? value : null;
+  }
+
+  function normalizeStats(raw) {
+    var data = raw && typeof raw === 'object' ? raw : {};
+    var requests = data.requests || data.request || data.requestStats || {};
+    var protocols = data.protocols || data.byProtocol || data.protocolStats || {};
+    var ttft = data.ttftMs || data.ttft || data.ttftStats || {};
+    var duration = data.durationMs || data.duration || data.durationStats || {};
+    var tokens = data.tokens || data.token || data.tokenStats || {};
+    var startedAt = statsNumber(data, ['startedAt', 'started_at', 'startTs']);
+    var uptimeText = statsValue(data, ['uptimeText', 'uptimeFormatted']);
+    if (typeof uptimeText !== 'string') {
+      uptimeText = '';
+    }
+    var uptimeRaw = statsValue(data, ['uptime']);
+    if (uptimeText === '' && typeof uptimeRaw === 'string') {
+      uptimeText = uptimeRaw;
+    }
+    var uptimeMs = statsNumber(data, ['uptimeMs', 'uptime_ms']);
+    if (uptimeMs === null && typeof uptimeRaw === 'number') {
+      uptimeMs = uptimeRaw;
+    }
+    if (uptimeMs === null) {
+      var uptimeSeconds = statsNumber(data, ['uptimeSeconds', 'uptime_seconds']);
+      if (uptimeSeconds !== null) {
+        uptimeMs = uptimeSeconds * 1000;
+      }
+    }
+    if (uptimeMs === null && startedAt !== null) {
+      uptimeMs = Date.now() - startedAt;
+    }
+    var total = statsNumber(requests, ['total', 'requestsTotal', 'count']);
+    if (total === null) {
+      total = statsNumber(data, ['requestsTotal', 'totalRequests']);
+    }
+    var success = statsNumber(requests, ['success', 'succeeded', 'ok']);
+    if (success === null) {
+      success = statsNumber(data, ['requestsSuccess', 'successRequests']);
+    }
+    var failed = statsNumber(requests, ['failed', 'failure', 'errors']);
+    if (failed === null) {
+      failed = statsNumber(data, ['requestsFailed', 'failedRequests']);
+    }
+    success = success === null ? 0 : success;
+    failed = failed === null ? 0 : failed;
+    total = total === null ? success + failed : total;
+    var successRate = statsNumber(requests, ['successRate', 'success_rate']);
+    if (successRate === null) {
+      successRate = total > 0 ? success / total * 100 : null;
+    }
+    function pair(source, nestedKeys, flatKeys) {
+      var p50 = statsNumber(source, nestedKeys);
+      if (p50 === null) {
+        p50 = statsNumber(data, [flatKeys[0]]);
+      }
+      var p95 = statsNumber(source, ['p95', 'P95']);
+      if (p95 === null) {
+        p95 = statsNumber(data, [flatKeys[1]]);
+      }
+      return { p50: p50, p95: p95 };
+    }
+    var ttftPair = pair(ttft, ['p50', 'P50'], ['ttftP50', 'ttftP95']);
+    var durationPair = pair(duration, ['p50', 'P50'], ['durationP50', 'durationP95']);
+    var inTokens = statsNumber(tokens, ['in', 'input']);
+    if (inTokens === null) {
+      inTokens = statsNumber(data, ['inTokens', 'inputTokens']);
+    }
+    var outTokens = statsNumber(tokens, ['out', 'output']);
+    if (outTokens === null) {
+      outTokens = statsNumber(data, ['outTokens', 'outputTokens']);
+    }
+    var openai = statsNumber(protocols, ['openai']);
+    var anthropic = statsNumber(protocols, ['anthropic']);
+    var instances = Array.isArray(data.instances) ? data.instances :
+      (Array.isArray(data.instanceStats) ? data.instanceStats :
+        (Array.isArray(data.perInstance) ? data.perInstance : []));
+    var errors = Array.isArray(data.recentErrors) ? data.recentErrors :
+      (Array.isArray(data.recentErrorList) ? data.recentErrorList :
+        (Array.isArray(data.errors) ? data.errors : []));
+    return {
+      uptimeMs: uptimeMs,
+      uptimeText: uptimeText,
+      version: statsValue(data, ['version', 'appVersion']) || '',
+      wsClients: statsNumber(data, ['wsClients', 'activeWSClients', 'activeWsClients', 'ws_clients', 'activeClients']),
+      activeRequests: statsNumber(data, ['activeRequests', 'active_requests', 'inFlight', 'inflight', 'active']),
+      qps: statsNumber(data, ['qps', 'currentQps', 'currentQPS', 'qps60']),
+      total: total,
+      success: success,
+      failed: failed,
+      successRate: successRate,
+      openai: openai,
+      anthropic: anthropic,
+      ttftP50: ttftPair.p50,
+      ttftP95: ttftPair.p95,
+      durationP50: durationPair.p50,
+      durationP95: durationPair.p95,
+      inTokens: inTokens,
+      outTokens: outTokens,
+      avgTps: statsNumber(data, ['avgTps', 'averageTps', 'avgTPS', 'tokensPerSecond']),
+      retries: statsNumber(data, ['retries', 'retryCount', 'retryTotal']),
+      instances: instances,
+      errors: errors,
+    };
+  }
+
+  function formatUptime(ms) {
+    if (ms === null || ms === undefined || !isFinite(ms) || ms < 0) {
+      return '–';
+    }
+    var seconds = Math.floor(ms / 1000);
+    var days = Math.floor(seconds / 86400);
+    var hours = Math.floor(seconds % 86400 / 3600);
+    var minutes = Math.floor(seconds % 3600 / 60);
+    if (days > 0) {
+      return days + 'd ' + hours + 'h ' + minutes + 'm';
+    }
+    if (hours > 0) {
+      return hours + 'h ' + minutes + 'm';
+    }
+    if (minutes > 0) {
+      return minutes + 'm';
+    }
+    return seconds + 's';
+  }
+
+  // §24.10 C1：<1000ms 用整数毫秒；≥1000ms 用秒（2 位小数）；≥3600s 用小时（1 位小数）。
+  function formatStatDuration(ms) {
+    if (ms === null || ms === undefined) {
+      return null;
+    }
+    var value = Number(ms);
+    if (!isFinite(value) || value < 0) {
+      return null;
+    }
+    if (value < 1000) {
+      return Math.round(value) + 'ms';
+    }
+    var seconds = value / 1000;
+    if (seconds >= 3600) {
+      return (seconds / 3600).toFixed(1) + 'h';
+    }
+    return seconds.toFixed(2) + 's';
+  }
+
+  function formatExactNumber(value) {
+    return Math.round(Number(value)).toLocaleString('en-US');
+  }
+
+  // §24.10 C2：<1000 原样；≥1000 用 K（1 位）；≥1e6 用 M（2 位）。
+  // 先按原值选单位，舍入后若跨到下一单位（999.96K → 1.00M）重新取单位。
+  function formatStatCount(value) {
+    if (value === null || value === undefined) {
+      return { text: '–', exact: '' };
+    }
+    var number = Number(value);
+    if (!isFinite(number)) {
+      return { text: '–', exact: '' };
+    }
+    var rounded = Math.round(number);
+    var exact = formatExactNumber(rounded);
+    if (rounded < 1000) {
+      return { text: String(rounded), exact: exact };
+    }
+    if (rounded < 1e6) {
+      var kText = (rounded / 1000).toFixed(1);
+      if (Number(kText) >= 1000) {
+        return { text: (rounded / 1e6).toFixed(2) + 'M', exact: exact };
+      }
+      return { text: kText + 'K', exact: exact };
+    }
+    return { text: (rounded / 1e6).toFixed(2) + 'M', exact: exact };
+  }
+
+  function formatPercentilePair(p50, p95) {
+    var left = formatStatDuration(p50);
+    var right = formatStatDuration(p95);
+    if (left === null && right === null) {
+      return { text: '–', title: '' };
+    }
+    return {
+      text: (left === null ? '–' : left) + ' / ' + (right === null ? '–' : right),
+      title: 'P50 ' + (p50 === null || p50 === undefined ? '–' : formatExactNumber(p50) + 'ms') +
+        ' · P95 ' + (p95 === null || p95 === undefined ? '–' : formatExactNumber(p95) + 'ms'),
+    };
+  }
+
+  function setStat(id, text, title) {
+    var el = document.getElementById(id);
+    if (!el) {
+      return;
+    }
+    el.textContent = text;
+    el.title = title || '';
+  }
+
+  function formatErrorTime(value) {
+    var ts = Number(value);
+    if (!isFinite(ts) || ts <= 0) {
+      return '–';
+    }
+    if (ts < 1e12) {
+      ts *= 1000;
+    }
+    var date = new Date(ts);
+    if (isNaN(date.getTime())) {
+      return '–';
+    }
+    function pad(n) {
+      return n < 10 ? '0' + n : String(n);
+    }
+    return pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds());
+  }
+
+  function statCell(text, className, title) {
+    var cell = document.createElement('td');
+    cell.textContent = text;
+    if (className) {
+      cell.className = className;
+    }
+    if (title) {
+      cell.title = title;
+    }
+    return cell;
+  }
+
+  function renderStatInstances(instances) {
+    var tbody = document.getElementById('stat-instances');
+    var table = document.getElementById('stat-instances-table');
+    var empty = document.getElementById('stat-instances-empty');
+    if (!tbody || !table || !empty) {
+      return;
+    }
+    tbody.textContent = '';
+    var list = Array.isArray(instances) ? instances : [];
+    list.forEach(function (raw) {
+      var item = raw && typeof raw === 'object' ? raw : {};
+      var row = document.createElement('tr');
+      var requests = item.requests;
+      if (requests === undefined) {
+        requests = item.count;
+      }
+      if (requests === undefined) {
+        requests = item.total;
+      }
+      var share = item.share;
+      if (share === undefined) {
+        share = item.percent;
+      }
+      if (share === undefined && item.ratio !== undefined) {
+        share = Number(item.ratio) * 100;
+      }
+      var avgTtft = item.avgTtftMs;
+      if (avgTtft === undefined) {
+        avgTtft = item.avgTTFT;
+      }
+      if (avgTtft === undefined) {
+        avgTtft = item.ttftMs;
+      }
+      var avgTps = item.avgTps;
+      if (avgTps === undefined) {
+        avgTps = item.avgTPS;
+      }
+      var degraded = item.degraded === true || item.isDegraded === true ||
+        item.degraded === 'degraded' || item.status === 'degraded';
+      var removed = item.removed === true || item.status === 'removed';
+      var requestCount = formatStatCount(requests);
+      var successCount = formatStatCount(item.success);
+      var failedCount = formatStatCount(item.failed);
+      var ttftText = formatStatDuration(avgTtft) || '–';
+      row.appendChild(statCell(String(item.name || item.instName || item.instance || '–')));
+      row.appendChild(statCell(requestCount.text, 'num', requestCount.exact));
+      row.appendChild(statCell(share === undefined || share === null ? '–' : Number(share).toFixed(1) + '%', 'num'));
+      row.appendChild(statCell(successCount.text, 'num', successCount.exact));
+      row.appendChild(statCell(failedCount.text, 'num', failedCount.exact));
+      row.appendChild(statCell(ttftText, 'num',
+        avgTtft === undefined || avgTtft === null ? '' : formatExactNumber(avgTtft) + 'ms'));
+      row.appendChild(statCell(avgTps ? Number(avgTps).toFixed(1) : '–', 'num'));
+      if (removed) {
+        row.appendChild(statCell('已移除', 'stat-removed'));
+      } else {
+        row.appendChild(statCell(degraded ? '降级' : '正常', degraded ? 'stat-degraded' : 'stat-ok'));
+      }
+      tbody.appendChild(row);
+    });
+    table.hidden = list.length === 0;
+    empty.hidden = list.length > 0;
+  }
+
+  function renderStatErrors(errors) {
+    var tbody = document.getElementById('stat-errors');
+    var table = document.getElementById('stat-errors-table');
+    var empty = document.getElementById('stat-errors-empty');
+    if (!tbody || !table || !empty) {
+      return;
+    }
+    tbody.textContent = '';
+    var list = Array.isArray(errors) ? errors.slice() : [];
+    list.sort(function (a, b) {
+      return (Number(b && (b.ts || b.time || b.at)) || 0) -
+        (Number(a && (a.ts || a.time || a.at)) || 0);
+    });
+    list = list.slice(0, 20);
+    list.forEach(function (raw) {
+      var item = raw && typeof raw === 'object' ? raw : {};
+      var row = document.createElement('tr');
+      var inst = item.instName || item.instance || '';
+      var upstream = item.upstreamModel || item.upstream || '';
+      var target = inst + (upstream ? '/' + upstream : '');
+      var summary = String(item.error || item.message || item.summary || '–');
+      if (summary.length > 80) {
+        summary = summary.slice(0, 80) + '…';
+      }
+      row.appendChild(statCell(formatErrorTime(item.ts || item.time || item.at)));
+      row.appendChild(statCell(item.status ? String(item.status) : '–'));
+      row.appendChild(statCell(target || '–'));
+      row.appendChild(statCell(String(item.model || item.reqModel || '–')));
+      row.appendChild(statCell(summary, 'stat-err-summary'));
+      tbody.appendChild(row);
+    });
+    table.hidden = list.length === 0;
+    empty.hidden = list.length > 0;
+  }
+
+  function renderStats(raw) {
+    if (!statsPane) {
+      return;
+    }
+    var stats = normalizeStats(raw);
+    live.statsUptimeMs = stats.uptimeMs;
+    live.statsUptimeText = stats.uptimeText;
+    live.statsAt = Date.now();
+    var wsClients = formatStatCount(stats.wsClients);
+    var active = formatStatCount(stats.activeRequests);
+    var total = formatStatCount(stats.total);
+    var success = formatStatCount(stats.success);
+    var failed = formatStatCount(stats.failed);
+    var openai = formatStatCount(stats.openai);
+    var anthropic = formatStatCount(stats.anthropic);
+    var inTokens = formatStatCount(stats.inTokens);
+    var outTokens = formatStatCount(stats.outTokens);
+    var retries = formatStatCount(stats.retries);
+    var ttft = formatPercentilePair(stats.ttftP50, stats.ttftP95);
+    var duration = formatPercentilePair(stats.durationP50, stats.durationP95);
+    setStat('stat-uptime', stats.uptimeText || formatUptime(stats.uptimeMs));
+    setStat('stat-version', stats.version || '–');
+    setStat('stat-ws', wsClients.text, wsClients.exact);
+    setStat('stat-active', active.text, active.exact);
+    setStat('stat-qps', stats.qps === null ? '–' : stats.qps.toFixed(1));
+    setStat('stat-total', total.text, total.exact);
+    setStat('stat-okfail', success.text + ' / ' + failed.text,
+      (success.exact || '–') + ' / ' + (failed.exact || '–'));
+    setStat('stat-success-rate', stats.successRate === null ? '–' : stats.successRate.toFixed(1) + '%');
+    setStat('stat-protocols', openai.text + ' / ' + anthropic.text,
+      (openai.exact || '–') + ' / ' + (anthropic.exact || '–'));
+    setStat('stat-ttft', ttft.text, ttft.title);
+    setStat('stat-duration', duration.text, duration.title);
+    setStat('stat-in-tokens', inTokens.text, inTokens.exact);
+    setStat('stat-out-tokens', outTokens.text, outTokens.exact);
+    setStat('stat-tps', stats.avgTps === null ? '–' : stats.avgTps.toFixed(1) + ' t/s');
+    setStat('stat-retries', retries.text, retries.exact);
+    renderStatInstances(stats.instances);
+    renderStatErrors(stats.errors);
+  }
+  // 验收钩子：构造数据后直接渲染统计页（不改业务行为）。
+  window.__modelRouterStatsRender = renderStats;
+
+  function initStatsPage() {
+    if (!statsPane) {
+      return;
+    }
+    if (live.statsRaw) {
+      renderStats(live.statsRaw);
+    }
+    api('/api/stats').then(renderStats).catch(function () {
+      // 首屏兜底失败时保持占位，WS 的 stats 事件会补齐。
+    });
+    setInterval(function () {
+      if (live.statsUptimeText) {
+        setStat('stat-uptime', live.statsUptimeText);
+        return;
+      }
+      if (live.statsUptimeMs === null) {
+        return;
+      }
+      setStat('stat-uptime', formatUptime(live.statsUptimeMs + (Date.now() - live.statsAt)));
+    }, 1000);
+  }
+
+  function initMonitorPage() {
+    if (!monitorPane) {
+      return;
+    }
+    monitor.open = true;
+    monitor.timer = setInterval(tickMonitor, 250);
+    renderAxisTicks();
+    updateMonitorEmptyState();
+    if (monitorClearButton) {
+      monitorClearButton.addEventListener('click', function () {
+        clearCompletedMonitorRequests();
+        // §24.7 D10：同时清空后端最近 100 条环形缓冲。
+        api('/api/monitor/clear', { method: 'POST' }).catch(function () {});
+      });
+    }
   }
 
   function switchProtocol(protocol) {
@@ -1454,39 +3408,44 @@
     renderInstances();
   }
 
-  document.querySelectorAll('.proto-tabs button').forEach(function (button) {
-    button.addEventListener('click', function () { switchProtocol(button.dataset.protocol); });
-  });
+  function initConfigPage() {
+    if (PAGE === 'config') {
+      document.querySelectorAll('.proto-tabs button').forEach(function (button) {
+        button.addEventListener('click', function () { switchProtocol(button.dataset.protocol); });
+      });
+      document.getElementById('add-instance').addEventListener('click', openProviderModal);
+      Object.keys(fallbackFields).forEach(function (key) {
+        if (fallbackFields[key]) {
+          fallbackFields[key].addEventListener('input', function () { setFallbackError(''); });
+        }
+      });
+      document.getElementById('provider-cancel').addEventListener('click', closeProviderModal);
+      document.getElementById('provider-confirm').addEventListener('click', confirmProvider);
+      document.getElementById('save-visual').addEventListener('click', saveVisual);
+      document.getElementById('reload-visual').addEventListener('click', reloadConfig);
+      document.getElementById('refresh-visual').addEventListener('click', load);
+      loadProviders();
+    } else {
+      document.getElementById('validate-json').addEventListener('click', validateJSON);
+      document.getElementById('save-json').addEventListener('click', saveJSON);
+      document.getElementById('reload-json').addEventListener('click', reloadConfig);
+      document.getElementById('refresh-json').addEventListener('click', load);
+      jsonEditor.addEventListener('input', function () {
+        setJSONSaveEnabled(false);
+        setResult(jsonResult, '内容已修改，请重新校验。', '');
+      });
+    }
+    load();
+  }
 
-  document.getElementById('add-instance').addEventListener('click', openProviderModal);
-  Object.keys(fallbackFields).forEach(function (key) {
-    fallbackFields[key].addEventListener('input', function () { setFallbackError(''); });
-  });
-  document.getElementById('provider-cancel').addEventListener('click', closeProviderModal);
-  document.getElementById('provider-confirm').addEventListener('click', confirmProvider);
-  document.getElementById('save-visual').addEventListener('click', saveVisual);
-  document.getElementById('reload-visual').addEventListener('click', reloadConfig);
-  document.getElementById('refresh-visual').addEventListener('click', load);
-
-  document.getElementById('mode-visual').addEventListener('click', function () { switchMode('visual'); });
-  document.getElementById('mode-json').addEventListener('click', function () { switchMode('json'); });
-  document.getElementById('validate-json').addEventListener('click', validateJSON);
-  document.getElementById('save-json').addEventListener('click', saveJSON);
-  document.getElementById('reload-json').addEventListener('click', reloadConfig);
-  document.getElementById('refresh-json').addEventListener('click', function () {
-    load().then(function () {
-      jsonEditor.value = JSON.stringify(buildConfigFromVisual(), null, 2);
-      setJSONSaveEnabled(false);
-      setResult(jsonResult, '', '');
-    });
-  });
-  jsonEditor.addEventListener('input', function () {
-    setJSONSaveEnabled(false);
-    setResult(jsonResult, '内容已修改，请重新校验。', '');
-  });
-
-  loadProviders();
-  load();
+  if (PAGE === 'stats') {
+    initStatsPage();
+  } else if (PAGE === 'monitor') {
+    initMonitorPage();
+  } else {
+    initConfigPage();
+  }
+  connectLiveWS();
 })();
 </script>
 </body>

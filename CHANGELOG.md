@@ -4,6 +4,55 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-16
+
+### Added
+
+- 项目品牌化（§24.13 K1–K4）：中文展示名改为「模型智能路由」，管理页四个页面与登录页的 `<title>`、左上角标题统一使用中文名；新增矢量 Logo `internal/web/logo.svg` 与多尺寸 favicon `internal/web/favicon.ico`（16/32/48/64/128/256），以 `go:embed` 打包；新增匿名可访问的 `GET /favicon.ico`（`image/x-icon`，缓存 1 天）与需登录的 `GET /admin/logo.svg`（`image/svg+xml`）；英文标识（Go module、二进制名、镜像 tag、服务名、配置名、环境变量、日志、URL）保持不变。
+
+- 统计持久化（§24.10 B1，D11）：`stats.json` 落在配置文件同目录，保存累计计数、按协议、in/out tokens、重试、各实例累计与最近 20 条错误（带 `"schema":1`）；同目录临时文件 + `rename` 原子写、≥5 秒且有变化才写、`SIGINT`/`SIGTERM` 补写；文件损坏/未知 schema/负计数会改名为 `stats.json.bad` 并零值启动，不阻塞启动；实例从配置删除后历史行仍显示并标注「已移除」。新增需登录的 `POST /api/stats/clear`（清零并立即落盘，不影响 100 条请求快照）。
+- 镜像与卷（§24.10 B2）：`Dockerfile` 声明 `VOLUME ["/home/nonroot/config"]`，并复制 65532 属主的占位配置使具名卷可直接使用；新增 `docker-compose.named.yml`（具名卷 `model-router-config`）；README 增加统计持久化、卷与 distroless 非 root 写权限说明。
+- 新增测试 UT-775～UT-781：`owned_by` 实例名与模型并集、统计落盘/加载/损坏回退/节流、`/api/stats/clear`、真实容器与浏览器数值格式。
+
+- M10 管理界面第四轮后端（§24.7 D4/D6/D7/D9/D10）：`POST /api/login`、`POST /api/logout` 与 `GET /admin/login`；`mr_session` 会话 cookie（32 字节 CSPRNG base64url 不透明 token、`HttpOnly; SameSite=Lax; Path=/`、不加 `Secure`；记住我 30 天 / 默认 12 小时，均存进程内存不落盘），`next` 仅允许 `/admin` 开头的站内路径；`/admin` 302 `/admin/`，`/admin/`、`/admin/monitor`、`/admin/config`、`/admin/json` 四个页面路径可刷新停留，未登录统一 302 `/admin/login`。
+- M10 统计聚合（§24.7 D7）：`GET /api/stats` 与 WS `stats` 帧共用同一快照结构，含运行时长/版本/活跃 WS 与请求数/QPS/累计成功失败/成功率/按协议/最近 1000 样本的 TTFT 与总耗时分位数（<10 样本为 null）/输入输出 tokens/平均生成速率/重试数/实例分组（含降级状态）/最近 20 条错误；JSON 形状见 `docs/design.md` §28.3。
+- M10 统计首页（§24.7 D7 / §24.10 C）：`/admin/` 展示运行与连接、请求统计、实例统计、近期错误四块指标；时间按 ms/s/h、计数按 K/M 缩写，所有缩写值带千分位精确 `title`。
+- M10 全局 WS（§24.7 D9 / §24.11 H1）：`GET /api/ws` 是唯一 WebSocket 端点，新连接立即收到 `{"type":"snapshot","requests":[...],"stats":{...}}`（最近 100 条已结束请求 + 最多 200 条进行中请求，按 `ts` 降序，含逐块 `chunksList`）与 `{"type":"stats","ts":…,"data":{…}}`；统计变化后最快 2 秒、无变化每 10 秒推送一次。
+- M10 采集语义变更（§24.7 D9）：无 WS 客户端时仍累计统计并维护最近 100 条环形缓冲，`start`/`end` 始终记录；`chunk`/`retry` 与事件广播仍受客户端开关控制，无客户端时不产生任何 WS 写操作。
+- M10 清除接口（§24.7 D10）：`POST /api/monitor/clear`（需登录）清空后端最近 100 条环形缓冲，返回 200，不影响累计统计。
+- 新增后端测试 UT-750～UT-763（登录 cookie 三种行为、页面 302/200、next 防开放重定向、会话登出失效、统计键集合一致、120→100 快照、无客户端累计、清除、分位数/采样窗口/错误摘要单元测试）。
+
+- M9 管理页实时请求监控（§24）：管理页新增 WebSocket 实时事件流（最终端点为 `GET /api/ws`，旧 `/api/monitor` 已在 §24.11 删除）；认证复用管理面（会话 Cookie / Basic，脚本可用 `?user=&password=` 回退），`admin_password` 为空仍返回 404。
+- 监控事件四型 `start` / `chunk` / `retry` / `end`，字段按 §24.2 F3 推送；`chunk` 对应每次上游 trunk 读取，含 `tsStart` / `tsEnd` / `bytes` / `deltaTokens` / `cumTokens`，`end` 含状态码、总耗时、in/out token、chunk 数、TTFT、生成时长与速率。
+- 逐 trunk 事件的广播仅在至少一个 WS 客户端连接期间启用（原子计数判断）；无客户端时仍累计统计与快照，但不产生 WS 写操作。现有日志格式、`attemptMetrics` 语义与 §23 三档规则不变。
+- WS 使用标准库最小实现（`http.Hijacker` 握手、文本/ping/pong/close 帧），不引入新依赖；单连接积压超过 1024 条未发事件即断开该连接，不影响代理与其它客户端；每 30s ping、75s 读超时回收死连接。
+- 管理页新增四个独立路由页面（§24.7 D6）：统计首页 `/admin/`、实时监控 `/admin/monitor`、可视化配置 `/admin/config`、JSON 高级 `/admin/json`；登录后全局 WS 自动连接，不再需要监控页单独的认证栏或连接/断开按钮。实时监控主体是**单表格**（`#`、状态、方法/路径、客户端、请求模型/实例·上游、入、出、块、耗时、TTFT、t/s、时间轴）；每行独立时间轴，等待首包（琥珀）/ trunk（蓝）/ 含内容块（绿）三色、重试虚线、进行中当前游标，所有行共享按最长耗时动态更新的量程，刻度与图例在表头；「清空」只移除已完成行并同时清空后端最近 100 条环形缓冲，列表最多保留最近 500 条已完成请求。
+- M9 第二轮（§24.5 W1–W6）：删除左右分栏与选中详情，统计列与时间轴在同一 `<tr>`；每行按 `[tsStart, tsEnd]` 画 trunk 块、进行中行显示当前时刻游标；「清空」只移除已完成行、保留进行中与 WS 连接。（监控页内「记住密码」认证栏在 §24.7 被全局会话认证取代。）
+- 新增测试（UT-701～UT-709）：WS 认证拒绝与 query 回退、流式 chunk 序列计数、非 AI 请求零事件、候选全失败 retry 顺序与 502、首 token 超时的 retry 原因、慢客户端断开、reload 后监控继续可用、过期 Authorization 头与有效 query 凭据并存。（§24.7 起无客户端仍累计统计，历史改由 snapshot 提供。）
+- M9 第三轮（§24.6 X1–X9）：时间轴新增等待段 `.tl-wait`（`--warn` 35% 不透明度，画到首块时刻；零 trunk 的已结束行画满 `durationMs`，进行中随 250ms 刷新增长）；量程向上取整到整数秒，刻度取整秒步长（3–5 个，首格强制 `0s`、末格强制 `Ns`），量程小数位变化时不重绘刻度；`chunk` 事件的 `deltaTokens` 改为 `feed` 前后累计值差分并新增 `tokensKnown` 字段；块 `title` 增加「距请求开始 N ms」。（表尾刻度在 §24.7 D2 移入表头，块高缩放于 §24.8 Y5 取消。）
+
+### Changed
+
+- D12 收尾（§24.11 H1/H2）：`/api/ws` 的 snapshot 现在同时包含进行中请求（`ended:false`，带完整渲染字段与已产生的 `chunksList`，单独上限 200 条、不占已结束 100 条配额），整个数组按 `ts` 降序；前端快照行可与后续 `chunk`/`end` 无缝续接并按 250ms 定时器更新耗时/游标。旧 WebSocket 路径 `/api/monitor` 已删除，带正确凭据返回 404，只保留 `/api/ws`；相关测试改写为 `/api/ws` 且能力等效。
+- JSON 高级页自适应（§24.12 J）：`#json-pane` 改为纵向 flex，卡片撑满 header 以下空间，`#json-editor` 弹性填充（`min-height:240px`、`resize:none`）；全局 textarea 规则与配置页行为不变。
+- OpenAI 模型语义纠错（§24.10 A1/A2）：`/v1/models` 的 `owned_by` 改为首个声明该模型的实例名（未命名实例仍回退 `model-router`），模型集合为实例顺序并集去重、不混入 Anthropic 角色名；文档明确 OpenAI 入口 `model` 就是上游模型名（纯透传），`claude-*` 只适用于 Anthropic 角色入口。§24.9 Z5 的 OpenAI 验收样本改为从 `/v1/models` 取真实模型名。
+- 统计页数值可读化（§24.10 C）：TTFT/耗时 `<1000ms` 显示整数 ms、`≥1000ms` 显示 2 位小数秒、`≥3600s` 显示 1 位小数小时；累计/成功/失败/tokens/重试与实例表计数按 K/M 缩写（含进位跨单位重取，`979999 → 980.0K`、`999960 → 1.00M`），所有缩写单元格的 `title` 给出千分位精确值；运行时长、t/s、成功率、QPS 口径不变。
+- 监控页第六轮（§24.9 Z1–Z5）：时间轴所有元素（等待段/块/进行中游标/重试虚线）的 tooltip 末尾追加本地时间 `· 开始 HH:MM:SS.mmm`；监控页改为纵向 flex，`.req-list` 弹性填满 header 以下高度（删除 `calc(100vh - 330px)` 固定高度），1600×1019 与 1000×900 不再出现整页纵向滚动；快照恢复的行按 `ts` 降序排列、序号按行位置显示；`monitorRequestSnapshot` 新增 `chunksList`（每条最多 400 块，超过时保留前 200 + 后 199 + 1 个合成块），使切页/刷新后绿块不再退化为蓝色；`sseState` 为 OpenAI 流新增等价判据（`delta.content` / `delta.reasoning_content` / `tool_calls[].function.arguments` 非空，本块计 1 次内容），`deltaTokens` 与 §23 日志口径不变。
+- 时间轴逐行等高与内容块着色（§24.8 Y5/Y6）：删除按 `deltaTokens` 缩放块高的全部路径（`timelineTokenThreshold`、`blockHeightPercent`、`refreshRowTimelineHeights`、`rowBaseHeightPercent`、`syncWaitHeight`、`maxDelta`），`.tl-wait`/`.tl-block`/`.tl-block.tok` 统一为轨道高 40%（16px → 6.4px）居中；绿色判据由 `deltaTokens > 0` 改为本块含 `content_block_delta`。后端 `sseState` 新增按块计数的 `contentDeltas`，`chunk` 事件新增同名 int 字段（`deltaTokens`/`cumTokens`/`tokensKnown` 口径不变），tooltip 改为 `#seq · bytes B · Δn tokens · 内容块 k · 累计 c · 距请求开始 x ms`，图例文字改为「含内容块」。
+- 双协议内容判据（§24.8 Y6 / §24.9 Z5）：Anthropic 流按每条 `content_block_delta` 计数；OpenAI 流按 `delta.content`、`delta.reasoning_content` 或 `tool_calls[].function.arguments` 非空的块计数（三者同现仍只 +1），`role`/`finish_reason`/空 delta/`[DONE]` 不计；该判据只影响时间轴着色与 tooltip，不改 `deltaTokens` 与 §23 日志口径。
+- M10 管理面认证语义（§24.7 D4/D6）：浏览器访问 `/admin*` 未登录不再弹 HTTP Basic 401，而是 302 到 `/admin/login`；`/admin` 已登录时 302 到 `/admin/`。旧 `Authorization: Basic` 与 `/api/ws` 的 `?user=&password=` 继续可用，既有脚本与 §24 测试不受影响。`proxy_test.go` 的 `TestAdminAuth` 随规格更新为断言 302 + `Location`，其余既有断言未改动。
+- M10 采集开关（§24.7 D9）：由“无客户端完全不采集”改为“无客户端仍统计与保留最近 100 条，但不广播任何事件”；逐 trunk `chunk` 事件仍只在有客户端时发送。
+- `docs/design.md` 新增 §28（M10 后端：会话登录、页面路由、统计口径、全局 WS/快照、决策与未覆盖）；`docs/tests.md` 新增 §27（UT-750～UT-763 与 E6–E9/E12/E14–E16 对照）。
+
+- `docs/design.md` 新增 §27（端点/认证、采集开关、事件模型、最小 WS 实现、请求链埋点、reload 与并发、前端认证栏与视图、决策与未覆盖）；`docs/tests.md` 新增 §23（UT-701～UT-709、FT-901～FT-910 与 A1–A9/P1–P7 对照）；README 管理页章节补充实时监控与认证栏说明。
+- M9 第二轮前端结构调整（§24.5）：左右分栏改为单表格 + 每行时间轴；时间轴列使用 `table-layout:fixed` + colgroup 占满剩余宽度，表格 `min-width:1100px`，窄屏时仅在表格容器内部横滚；行高 33px（12px/11px 两行 + 上下 ≥1px 留白）；原 sessionStorage 会话凭据改为 localStorage「记住密码」持久化（默认不勾选，含明文安全提示）。`docs/design.md` §27.7/§27.8 与 `docs/tests.md` §24（UT-710～UT-722、B1–B10）同步更新。
+- `docs/design.md` §27.9 与 `docs/tests.md` §26（需求 §24.6，UT-730～UT-741、C1–C12）已同步第三轮时间轴细化及 D-M9-25～D-M9-29 决策记录。
+
+### Fixed
+
+- M9 监控表格「请求模型 / 实例·上游」两行文字被 26px 行高纵向裁切：行高增至 33px，两行单元格改用 `line-height 1.3/1.2`、次行字号 11px 与 `overflow:visible`，不再用 `overflow:hidden` 掩盖；真实 Chrome 实测每行文字上下留白 2.11px、`td.scrollHeight=clientHeight=32`，行高 33px（≤34px），长名 `deepseek-v4-pro`/`DeepSeek/deepseek-v4-pro`、`claude-sonnet-5`/`MTI/mti-flash` 完整显示；空态卡片高度 177px（≤200px）；重试标记补充 `.retry` 类。
+- M9 监控页认证断链：修复用 URL 内嵌凭据（`http://user:pass@host/admin`）打开时 `fetch('/api/config')` 抛 `TypeError`、监控反复 401 的问题（`api()` 捕获 credentials 类错误，`load()` 静默降级）。该页内认证栏与 localStorage 凭据机制已在 §24.7 被 Cookie 会话 + 全局 WS 取代。
+
 ## [0.1.1] - 2026-11-15
 
 ### Added

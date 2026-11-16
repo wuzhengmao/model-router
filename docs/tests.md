@@ -427,3 +427,436 @@ go test -race ./internal/proxy
 | `go build` / `go vet` / `go test`（含 `-race`）退出码 0 | §7 执行命令 |
 
 | UT-131 | 非 AI 请求与三档请求日志（M8，§23） | `TestNonAICallOmitsTokenSegment`、`TestAuthFailureIsLoggedWithoutSecrets`、`TestAnthropicMessagesPathAlias`、`TestAllCandidatesFailedLogsAttempt`、`TestRequestLogFormat` | favicon 与 401 走代理；已路由但无 usage 的 messages 请求；上游候选全部失败；有 usage 的正常请求 | D1：无模型段与 token 段；D2：保留模型段、无 `↑`/`↓`；D3：完整格式与顺序不变；候选全失败时 502 汇总行之前有一行带最后候选实例名/上游模型名的 D2 日志（R3） |
+
+## 23. M9 实时请求监控（§24）
+
+### 23.1 自动化用例
+
+| 编号 | 用例 | 入口 | 覆盖点 | 预期 |
+|---|---|---|---|---|
+| UT-701 | 无客户端不采集/不泄露 | `TestMonitorHubNoClientNoCollection`、`TestMonitorNoHistoryReplay` | 无 WS 客户端时 `newRequest` 返回 nil、广播为空操作；请求完成后才连接 | 不创建 tracker；连接后 300ms 内收不到任何历史事件；之后的实时事件正常 |
+| UT-702 | WS 认证 | `TestMonitorAuth` | `admin_password` 为空；无凭据；query 密码错误；query 正确；Basic header 正确 | 404；401；401；101；101；失败均不升级 |
+| UT-703 | 流式事件序列与 trunk 计数 | `TestMonitorStreamEvents` | 上游 4 次 SSE 写入（末次含 usage 与结束事件）；`/v1/messages` 流式请求 | 首事件 `start`、末事件 `end`；`chunk` 4 条且 `seq` 0–3；`bytes > 0`；`tsEnd ≥ tsStart`；Δtoken 合计 6；`end.chunks=4`、`inTokens=11`、`outTokens=6`、`status=200`、无 `error` |
+| UT-704 | 非 AI 请求零事件 | `TestMonitorNonAIRequestsSilent` | favicon（已认证但未知路径）、401 的 AI 请求、正常 AI 请求 | 只有 1 条 `start`（路径为 AI 请求）；所有事件 `id` 一致，非 AI 调用不产生事件 |
+| UT-705 | 候选全失败：retry 顺序与 502 | `TestMonitorRetryThen502` | 3 个不可达候选（openai） | `retry` 2 条，`instName` 依次为 B、C，`reason=error`；无 `chunk`；`end.status=502`、`end.error` 非空、`end.instName=C` |
+| UT-706 | 慢客户端断开 | `TestMonitorSlowClientDisconnected` | `net.Pipe` 对端不读；连续入队超过 1024 条 | 客户端 `done` 关闭、从 hub 移除；后续广播不 panic/不阻塞 |
+| UT-707 | reload 后监控继续可用 | `TestMonitorSurvivesReload` | 已连接 WS；PUT 新配置 + `POST /api/reload`；用新 token 发起请求 | 旧 WS 连接不中断；收到新请求的 `start`/`end`；新上游被调用 1 次；`end.status=200` |
+| UT-708 | 首 token 超时 retry 原因 | `TestMonitorFirstTokenTimeoutRetry` | 首候选返回 SSE 头后静默；`fallback.first_token_timeout=50ms`；次候选正常 | `retry.reason=first_token_timeout`、`retry.instName=FAST`；`end.status=200`、`end.instName=FAST`；两后端各 1 次调用 |
+| UT-709 | query 凭据优先于过期请求头 | `TestMonitorQueryCredentialFallback` | 同时携带错误的 `Authorization: Basic` 与正确的 `?user=&password=` | 握手 101（header 与 query 为“或”关系，前端缓存过期凭据时仍可连接） |
+
+### 23.2 手工端到端用例
+
+> 说明：以下第 1–9 条记录第一轮「左右分栏 + 选中详情」布局；第二轮（§24.5）已改为单表格 + 每行时间轴，布局类验证以 §24 为准。第 10–15 条已按第二轮「记住密码 → localStorage」更新。
+
+1. 正常加载 `/admin` → 点击「实时监控」：状态从「连接中…」变为「已连接」；表格为空。
+2. 发起一次流式 AI 请求：左侧出现「进行中」行，耗时与出 token 实时变化；结束后变为「成功」并填入总耗时、TTFT、t/s。
+3. 选中请求：右侧显示方法/路径/协议/IP/UA/开始时间/状态码/token/速率；trunk 时间轴出现色块，块间可见 TTFT 与卡顿空隙；悬停块显示 bytes 与 Δtoken。
+4. 构造上游失败/首 token 超时：时间轴出现虚线重试标注，悬停显示新实例/上游模型与原因。
+5. 关闭监控（切到其它模式）：WS 断开、列表与详情清空；重新打开后从空开始。
+6. 刷新页面：回到可视化配置模式（监控默认关闭），重新开启后无历史请求。
+7. 缩放窗口到 ≤980px：左右两栏堆叠，表格仍保持紧凑行高。
+8. 连续发起 500+ 请求：列表保留最近 500 条，优先裁剪最旧的已完成请求，进行中请求不被裁剪。
+9. URL 内嵌凭据：用 `http://admin:secret@127.0.0.1:18080/admin` 打开，配置读取显示中性提示，不出现 `Failed to execute 'fetch' … credentials` 的阻断；切到「实时监控」且认证栏为空时，状态为「未连接」+「请先输入管理员凭据」，不发起 WS。
+10. 认证栏连接（不勾选记住密码）：输入正确用户名/密码 → 点「连接」→ 状态「已连接」；发起流式请求可收到事件并渲染；`localStorage['model-router.monitor.cred']` **不存在**。
+11. 认证失败：输入错误密码 → 点「连接」→ 自动重试一次后状态「认证失败，请检查用户名/密码」，`localStorage` 键被删除、密码输入框清空。
+12. 记住密码：勾选「记住密码」后连接成功 → `localStorage['model-router.monitor.cred']` 存在且值只含 user/password；点「断开」或切到其它模式时键**保留**；取消勾选时键删除、密码框清空。
+13. 刷新页面：记住密码已勾选时，刷新后用户名/密码自动填入、复选框保持勾选；进入「实时监控」自动连接成功。
+14. 来源优先级：`localStorage` remembered → 认证栏输入 → 配置页管理员密码；只有显式点「连接」且勾选记住密码、握手成功才写入 localStorage。
+15. 安全检查：页面 URL/地址栏、`document.cookie`、`console.log`、可见文本中均不出现密码；localStorage 中的明文密码有页面安全提示；密码只出现在 `type="password"` 输入框、localStorage（勾选记住时）与本次 WS 握手的临时 query 中。
+
+### 23.3 验收对照（§24.3）
+
+| 验收项 | 对应用例 |
+|---|---|
+| A1 `WS /api/monitor` 无 admin 密码 404、认证失败 401 | UT-702 |
+| A2 无客户端连接时不影响响应体与日志（既有测试全绿） | UT-701；§7 全量回归 |
+| A3 `start → chunk… → end`，chunk 数等于上游 trunk 数 | UT-703 |
+| A4 非 AI 请求（favicon、401）零事件 | UT-704 |
+| A5 全候选失败时 retry 按候选顺序、`end.status=502` | UT-705、UT-708 |
+| A6 刷新/重连不补发历史 | UT-701 |
+| A7 build/vet/gofmt/test -race 全绿 | §7 执行命令 |
+| A8 覆盖未连接客户端、chunk 计数、慢客户端、认证拒绝 | UT-701、UT-703、UT-706、UT-702、UT-708 |
+| A9 既有 130+ 用例不改断言仍通过 | `go test ./... -race -count=1` 全量 |
+
+执行：
+
+```bash
+go build ./...
+go vet ./...
+go test ./...
+go test -race ./internal/proxy -run TestMonitor -v
+go test ./... -race -count=1
+```
+
+### 23.4 M9 认证断链修复（P1–P7）
+
+前端用最小 DOM 桩（Node `vm` + 假 `document`/`fetch`/`WebSocket`/`localStorage`）执行 `index.html` 内嵌脚本，覆盖以下行为；另用 `node --check` 校验脚本语法。
+
+| 编号 | 用例 | 覆盖点 | 预期 |
+|---|---|---|---|
+| FT-901 | P1 认证栏存在性 | `#monitor-auth-user`、`#monitor-auth-password`（`type=password`）、`#monitor-auth-connect`、`#monitor-auth-disconnect`、提示文案 | 全部存在，密码框为 `type="password"` |
+| FT-902 | P3 URL 内嵌凭据静默降级 | `location.href` 含 `user:pass@`，`fetch` 抛 `TypeError … credentials` | `load()` 显示中性提示、非错误态；不阻断打开监控 |
+| FT-903 | P4 无凭据 | 三个来源均为空 | 状态「未连接」、提示「请先输入管理员凭据」、不创建 WebSocket |
+| FT-904 | P4 来源③ 配置页密码 | 配置页 `admin_user`/`admin_password` 有值，认证栏为空 | 自动建立 WS，握手 query 携带该凭据；不写 localStorage |
+| FT-905 | P4 来源② 认证栏 | 认证栏填用户名/密码后点「连接」 | 建立 WS；P2 写入 `model-router.monitor.cred`，值只含 user/password |
+| FT-906 | P5 认证失败 | 握手未 open 即 `close code=1006`，首次失败后重试一次仍失败 | 状态「认证失败，请检查用户名/密码」；恰好 2 个连接（首次+重试）；删除 localStorage 凭据、清空密码框、提示重新输入 |
+| FT-907 | P5 普通断线 | 已 open 后 `close code=1006` | 状态「连接已断开」；不重试；不删除 localStorage 已记住的凭据 |
+| FT-908 | P6 断开/切离 | 点「断开」或切到其它模式 | WS 关闭、状态「未连接」；**不删除** localStorage 已记住的凭据（第二轮 W5 起） |
+| FT-909 | P6 页面卸载 | 触发 `pagehide` / `beforeunload` | localStorage 凭据保留以便下次自动连接；不追加删除动作 |
+| FT-910 | P2 禁止项 | 静态扫描 `index.html` | 不出现 `localStorage`、`document.cookie`；密码不出现在 `console.log` 或可见文本 |
+
+验收对照：
+
+| 验收项 | 对应验证 |
+|---|---|
+| `go build` / `go vet` / `go test ./... -race` | §7 执行命令；本次全量通过 |
+| URL 内嵌凭据打开后不输入密码 → 「未连接」+「请先输入管理员凭据」 | FT-902、FT-903 |
+| 认证栏输入正确凭据点「连接」→「已连接」，流式请求可渲染 | FT-905；UT-703 |
+| 输入错误密码 →「认证失败，请检查用户名/密码」 | FT-906 |
+| 关闭/切换后连接关闭且记住的凭据保留 | FT-908、FT-909 |
+| P1–P7 决策表 | FT-901～FT-910、UT-709、§27.7/§27.8 |
+
+> 注：§23.4 的 FT-901～FT-910 已按第二轮 W5 改写为「记住密码 → localStorage」的口径；更细的凭据生命周期断言见 §24 的 UT-715/UT-716/UT-722。
+
+## 24. M9 第二轮调整：单表格 / 每行时间轴 / 清空 / 记住密码（§24.5）
+
+### 24.1 用例
+
+| 编号 | 用例 | 入口/方法 | 覆盖点 | 预期 |
+|---|---|---|---|---|
+| UT-710 | 单表格结构（B1） | 真实 Chrome / `window.__modelRouterMonitor` | 不存在 `.monitor-wrap`、`.monitor-card-list`、`.monitor-card-detail`；`#monitor-table` 唯一；每行 11 个 `<td>`（统计列 10 + 时间轴） | 单表格；统计与时间轴同一 `<tr>` |
+| UT-711 | 行内对齐与每行 trunk（B2） | 真实 Chrome，8 个真实流式请求 | 每行统计单元格与时间轴单元格 `getBoundingClientRect().top` 差；每行 `.tl-block` 数量 | top 差 ≤1px；每行至少 1 个 trunk 块 |
+| UT-712 | 共享量程 4:1（B3） | 真实 Chrome，`slow4`（约 3.75s）与 `fast1`（约 0.95s） | 短请求最后一个块右端占时间轴宽度的比例；`axisSpan` | 约 25%（±3%），实测 25.54% |
+| UT-713 | 进行中时间轴增长（B4） | 真实 Chrome，先完成 `axis6`（约 5.81s），再启动 `run3` | 间隔 1s 读取进行中行 `.tl-cursor` 的 `getBoundingClientRect().left` | 第二次采样比第一次大（实测 +110.3px） |
+| UT-714 | 清空保留进行中与连接（B5） | 真实 Chrome，先有已完成 + 进行中行，点 `#monitor-clear` | 行数/状态、`window.__modelRouterMonitor.ws.readyState`、连接状态 | 只保留进行中行；`readyState=1`；状态「已连接」 |
+| UT-715 | 记住密码写入 / 刷新自动连接 / 取消删除（B6） | 真实 Chrome，勾选 `#monitor-remember` 后连接、刷新、进入监控、取消勾选 | `localStorage['model-router.monitor.cred']`；刷新后输入框/复选框；自动连接；取消后删除 | 连接成功后 localStorage 有凭据；刷新后自动填入并自动连接；取消勾选后键删除、密码框清空 |
+| UT-716 | 不勾选不落盘（B7） | 真实 Chrome，未勾选记住密码连接成功 | localStorage 键 | 不存在 |
+| UT-717 | 1600×1019 无截断/无横滚（B8） | 真实 Chrome，真实长模型名 `claude-sonnet-5`、`deepseek-v4-pro`、`deepseek-v4.1-flash`，数字 `524288`/`999` | 所有模型/数字单元格 `scrollWidth <= clientWidth`；`.req-list.scrollWidth <= clientWidth`；时间轴列宽 | 零截断；表格无横向滚动；时间轴列约 642px |
+| UT-718 | 1000×900 窄屏（B9） | 真实 Chrome | 页面 `documentElement.scrollWidth`；`.req-list` 内部 `scrollWidth/clientWidth` 与 `overflow-x` | 页面宽 1000；容器内部可横滚（1100 > 922） |
+| UT-719 | 构建/静态检查（B10） | 命令行 | `go build ./...`、`go vet ./...`、`gofmt -l`、`go test ./... -race -count=1` | 全绿；`internal/proxy`、`internal/web` 无 gofmt 输出 |
+| UT-720 | 清空后量程重算 | 真实 Chrome / `window.__modelRouterMonitor.axisSpan` | 清空已完成行后剩余进行中的量程 | 量程按剩余请求重算（截图中 5.81s → 1.89s） |
+| UT-721 | 断开保留 remembered 凭据 | 真实 Chrome，勾选记住密码后点「断开」 | localStorage 键 | 仍存在；仅取消勾选/认证失败删除 |
+| UT-722 | 凭据来源优先级 | 静态/真实 | localStorage → 认证栏 → 配置页；未勾选只在内存 | 优先使用 remembered；无 remembered 时可用输入框/配置页 |
+
+### 24.2 验收对照（§24.5 B1–B10）
+
+| 验收项 | 对应验证 |
+|---|---|
+| B1 无左右分栏、只有一张表格、统计与时间轴同一 `<tr>` | UT-710；真实 Chrome `hasWrap=0`、`tableCount=1`、`cellCounts=[11…]` |
+| B2 每行都有 trunk 条、统计与时间轴单元格 top 差 ≤1px | UT-711；`rowTopDiffs=[0…]`、`blocksPerRow` 均 >0 |
+| B3 共享量程，短请求块右端约 25%（±3%） | UT-712；实测 `fastRight=25.54%`、`axisSpan=3750ms` |
+| B4 进行中时间轴终点随 1s 增长 | UT-713；游标 918.8 → 1029.1（+110.3px） |
+| B5 清空只删除已完成、进行中保留、WS 未断 | UT-714；清空后 `count=1`、`statuses=['进行中']`、`readyState=1` |
+| B6 勾选记住密码 → localStorage、刷新自动填入/自动连接、取消勾选删除 | UT-715；`b7Stored=null`、`b6AfterReload={user:'admin',password:'secret',remember:true}`、`b6Unchecked={stored:null,password:'',remember:false}` |
+| B7 不勾选不落盘 | UT-716；`b7Stored=null` |
+| B8 1600×1019 模型/数字/时间轴无截断、无横向滚动 | UT-717；`truncations=[]`、`listScrollWidth=1450=clientWidth`、`timelineWidth=642` |
+| B9 1000×900 页面无横滚、表格容器内部可横滚 | UT-718；`documentWidth=1000`、`listScrollWidth=1100 > clientWidth=922` |
+| B10 build/vet/gofmt/test | UT-719；执行结果见报告 |
+
+真实浏览器脚本（不属于仓库测试）：
+
+```bash
+node .claude-runs/m9-monitor2/acceptance.js
+```
+
+截图与测量：`.claude-runs/m9-monitor2/monitor-1600x1019.png`、`monitor-1000x900.png`、`monitor-1600x1019-running.png`、`monitor-1600x1019-cleared.png`、`acceptance-measurements.json`。
+
+## 25. M9 表格两行文本裁切修复（C1–C7）
+
+### 25.1 修复内容
+
+- 行高：`tbody tr` 由 26px 增至 33px（C2 预算 ≤34px）。
+- 两行单元格：`td.req-path` / `td.req-route` 改为 `overflow:visible`，不再用 `overflow:hidden` 掩盖；`.req-model`/`.req-url` line-height 1.3，`.req-target`/`.req-method` line-height 1.2。
+- 重试标记补充 `.retry` 类（与 `.tl-retry` 并存），保持旧选择器可用。
+- 空态：无请求时保持表格隐藏 + 空提示，卡片高度 177px（≤200px）。
+
+### 25.2 用例
+
+| 编号 | 用例 | 入口/方法 | 覆盖点 | 预期 |
+|---|---|---|---|---|
+| UT-723 | C1 两行文本不裁切 | 真实 Chrome，`claude-sonnet-5`/`MTI/mti-flash`、`deepseek-v4-pro`/`DeepSeek/deepseek-v4-pro` | 每行 route/path 单元格两行 span 相对 td 的上下留白；td.scrollHeight/clientHeight；computed overflow | 上下各 ≥1px；scrollHeight ≤ clientHeight；overflow visible |
+| UT-724 | C2 行高预算 | 真实 Chrome | 每行 `getBoundingClientRect().height` | ≤34px（实测 33px） |
+| UT-725 | C3 无横向滚动/零截断 | 真实 Chrome 1600×1019、1000×900 | documentElement.scrollWidth；全部单元格 scrollWidth/clientWidth | 两视口页面不横滚；1600 下全部单元格零截断 |
+| UT-726 | C4 空态高度 | 真实 Chrome 1600×1019，清空后 | `#monitor-pane > .card` 高度 | ≤200px（实测 177px） |
+| UT-727 | C5 功能元素 | 真实 Chrome | `#monitor-clear`、`#monitor-remember`、localStorage 键、`window.__modelRouterMonitor`（ws/axisSpan）、`.tl-cursor`、`.retry`、`.tl-block`、共享刻度 | 全部存在且可用；清空后 WS 仍 `readyState=1` |
+| UT-728 | C6 静态检查 | 命令行 | `go build ./...`、`go vet ./...`、`go test ./... -race -count=1`、`gofmt -l internal/web internal/proxy` | 全绿；gofmt 无输出 |
+| UT-729 | C7 截图 | 真实 Chrome | 1600×1019 有请求、1600×1019 空态、1000×900 | 三张截图保存到 `.claude-runs/m9-monitor2c/` |
+
+### 25.3 验收对照（C1–C7）
+
+| 验收项 | 对应验证 |
+|---|---|
+| C1 文字不被裁切 | UT-723；route 上行 top=2.11px、下行 bottom=2.11px；td scrollHeight=32=clientHeight；overflow=visible；主行 12px/次行 11px |
+| C2 行高 ≤34px | UT-724；实测每行 33px |
+| C3 无横向滚动、零截断 | UT-725；1600 documentWidth=1600、全部 cell scrollWidth=clientWidth；1000 documentWidth=1000、容器 922/1100 |
+| C4 空态卡片 ≤200px | UT-726；实测 cardHeight=177px |
+| C5 功能零回归 | UT-727；clear/remember 存在、localStorage 有凭据、hook wsState=1/axisSpan=956、blocks=12、cursors=1、retries=2、5 个刻度 |
+| C6 静态检查 | UT-728；执行结果见报告 |
+| C7 截图 | UT-729；`monitor-1600x1019.png`、`monitor-1600x1019-empty.png`、`monitor-1000x900.png` |
+
+真实浏览器脚本（不属于仓库测试）：`node .claude-runs/m9-monitor2c/verify.js`；测量：`.claude-runs/m9-monitor2c/verify-measurements.json`。
+
+## 26. M9 时间轴第三轮细化（§24.6 C1–C12）
+
+### 26.1 用例
+
+| 编号 | 检查项 | 环境 | 测量方法 | 判定阈值 |
+|---|---|---|---|---|
+| UT-730 | C1 等待段宽度与 title | 真实 Chrome 1600×1019，容器内真实 MTI/Claude Code 流式请求（该行已收 ≥3 个 trunk） | 读取该行 `.tl-wait` 的 `getBoundingClientRect().width` 与轨道宽度，计算 `waitPct = width / trackWidth × 100`；对照 `firstRelMs / displaySpan × 100`；读取 `title` 文本 | `waitPct` 与理论值误差 ≤2%；`title` 含「等待」；实测首块 135ms / 3000ms → `waitPct 4.5 == waitExpectedPct 4.5`，`title="等待首包 135 ms"` |
+| UT-731 | C2 等待段配色 | 同上 | `getComputedStyle(.tl-wait).backgroundColor` 与同请求 `.tl-block` 的 `backgroundColor` 对比 | 两者不相等且肉眼可区分；实测 wait `rgb(251, 191, 36)`、block `rgb(91, 140, 255)` |
+| UT-732 | C3 零 trunk 失败行等待段覆盖 | 真实 Chrome：真实失败行（500，0 chunk）+ 注入受控 3000ms 零 trunk 行 | 失败行 `.tl-wait` 宽度百分比 vs `durationMs / displaySpan × 100`；受控 3000ms 行（量程 3s）的 `.tl-wait` 宽度百分比与 `title` | 真实失败行 `waitPct == durationPct`（实测 1.37 == 1.37）；受控行 `waitPct = 100%`（±2%），`title="等待首包 3000 ms"` |
+| UT-733 | C4 表头量程文本 | 真实 Chrome | 读取表头第 11 列 `#monitor-axis-title` 文本；检查该列是否出现「时间轴」「trunk」字样 | 文本匹配 `0s – <N>s` 且 N 为整数、`N ≥ ceil(表中最大耗时/1000)`；无「时间轴」「trunk」；实测 `"0s – 3s"`（最大耗时 2948ms） |
+| UT-734 | C5 首尾刻度 | 真实 Chrome | 读取全部刻度文本及其边界框；与 `#monitor-axis-title` 的 N 对比 | 最左刻度严格等于 `0s`，最右等于 `<N>s` 且 N 与表头一致；实测刻度 `0s/1s/2s/3s`，最左 left=877、最右 right=1519，右端按既有 CSS 右对齐 |
+| UT-735 | C6 量程向上取整到 4s | 真实 Chrome，注入受控最大耗时 3400ms 的请求 | 读取 `#monitor-axis-title`、刻度文本与数量、`axisSpan` | 量程显示 `0s – 4s`；刻度数 3–5 个且全部落在整数秒；实测标题 `"0s – 4s"`、刻度 `0s/1s/2s/3s/4s`、`axisSpan=4000` |
+| UT-736 | C7 小数抖动与跨秒重绘 | 真实 Chrome，注入受控时间戳 3020 / 3080 / 3990 / 4010ms | 逐点读取 `axisTitle`、刻度文本与 `axisSpan` | 3020/3080/3990ms 三点标题与刻度完全不变（不抖动）；4010ms 跨秒后标题变 `0s – 5s` 且刻度重绘；实测 3.99s 内均为 `0s – 4s`→`[0s,1s,2s,3s,4s]`，4.01s 变为 `0s – 5s`→`[0s,2s,4s,5s]` |
+| UT-737 | C8 两档视口无裁切、刻度不重叠 | 真实 Chrome 1600×1019 与 1000×900 | `documentElement.scrollWidth`；时间轴 td / 轨道的 `scrollWidth` 与 `clientWidth`；相邻刻度 `getBoundingClientRect()` 是否相交 | 两视口页面均不横向滚动（实测 docWidth=1600/1000）；时间轴列零裁切（1600 下 cell 654/654、1000 下 304/304、轨道 292/292）；`tickOverlap=false` |
+| UT-738 | C9 静态检查 | 命令行 | `go build ./...`、`go vet ./...`；`gofmt -l internal/web internal/proxy`；`go test ./... -race -count=1` | build/vet 退出码 0；gofmt 无输出；test 全绿 |
+| UT-739 | C10 Σ deltaTokens == outTokens | 真实 Chrome + WS 原始 `chunk`/`end` 事件（真实流式请求，21 个 chunk） | 对同一请求的 `chunk.deltaTokens` 求和，与末块 `cumTokens`、`end.outTokens` 对比；统计非零块数 | 三者精确相等（±0）；实测 `deltaSum 40 == cumTokens 40 == outTokens 40`，21 块中仅末块非零（40） |
+| UT-740 | C11 块高度随 Δ 缩放 | 真实 Chrome | 逐块读取 `.tl-block` 的 `getBoundingClientRect().height`，按 `deltaTokens` 分组；`deltaTokens ≥ 8` 的块与轨道高度对比 | Δ 不同的块高度不同；Δ 最小块 ≈ 轨道高 40%（实测 Δ0 → 6.39px / 16px）；`deltaTokens ≥ 8` 的块高度等于行高（实测 Δ40 → 16px） |
+| UT-741 | C12 title 含「距请求开始」 | 真实 Chrome | 遍历该请求全部 `.tl-block`，检查 `title` 是否含「距请求开始」与毫秒数 | 全部块命中（实测 `titlesHaveDistance=true`）；样例 `"#20 · 418 B · Δ40 tokens · 累计 40 · 距请求开始 901 ms"` |
+
+### 26.2 验收对照（C1–C12）
+
+证据统一引用 `.claude-runs/m9-monitor3/acceptance-measurements.json`（2026-11-16T01:04:39Z，`http://127.0.0.1:18080`）；C1/C2/C4/C5/C8/C10/C11/C12 与截图来自容器真实 MTI/Claude Code 流量，C3/C6/C7 在真实页面注入受控时长/时间戳，走同一套渲染代码。
+
+| 验收项 | 对应验证 |
+|---|---|
+| C1 等待段宽度 ≈ 首块时刻/量程，title 含「等待」 | UT-730；`waitPct 4.5 == waitExpectedPct 4.5`（135ms / 3000ms），`waitLeftPx=0`、`waitWidthPx=28.88`、`trackWidthPx=642`，`waitTitle="等待首包 135 ms"` |
+| C2 等待段颜色 ≠ trunk 块颜色 | UT-731；wait `rgb(251, 191, 36)` vs block `rgb(91, 140, 255)` |
+| C3 零 trunk 失败行等待段覆盖整行 | UT-732；真实失败行 `waitPct 1.37 == durationPct 1.37`；受控 3000ms 行 `waitPct=100`、`title="等待首包 3000 ms"`（量程对齐时 100%，见 D-M9-29） |
+| C4 表头显示 `0s – Ns`、无「时间轴/trunk」 | UT-733；`headerTimeline="0s – 3s"`、`axisTitle="0s – 3s"`，N=3 ≥ ceil(2948ms/1000) |
+| C5 首刻度 `0s`、末刻度 `<N>s` 且与标题一致 | UT-734；刻度 `0s/1s/2s/3s`，`axisTitle="0s – 3s"`，`tickOverlap=false` |
+| C6 3.4s 量程 → `4s`，3–5 个整秒刻度 | UT-735；`controlled.c6`：`axisTitle="0s – 4s"`、刻度 `0s/1s/2s/3s/4s`、`axisSpan=4000` |
+| C7 小数位变化不抖动、跨秒重绘 | UT-736；3020/3080/3990ms 均为 `0s – 4s` + `[0s,1s,2s,3s,4s]`；4010ms 变为 `0s – 5s` + `[0s,2s,4s,5s]`、`axisSpan=5000` |
+| C8 两档视口无裁切、刻度不重叠 | UT-737；1600×1019 `docWidth=1600`、timeline cell `654/654`；1000×900 `docWidth=1000`、cell `304/304`、track `292/292`，两档 `tickOverlap=false` |
+| C9 build/vet/gofmt/test | UT-738；本轮复跑 `go build`/`go vet` 退出码 0、`gofmt -l` 无输出、`go test ./... -race -count=1` 全绿（`internal/proxy` 45.2s） |
+| C10 Σ deltaTokens == outTokens | UT-739；`deltas` 为 20 个 0 + 末块 40，`deltaSum 40 == cumTokens 40 == outTokens 40`，`nonZeroDeltas=1`。真实 MTI 只在末尾 `message_delta` 上报 usage，非零仅出现在末块（D-M9-25），不出现「除首块外恒为 0」 |
+| C11 块高度随 Δ 缩放、≥8 的块顶满 | UT-740；`blockHeights` 最小 6.39px（Δ0，40% × 16px）、最大 16px（Δ40），`ge8BlockHeights=[{delta:40,height:16}]` |
+| C12 块 title 含「距请求开始」 | UT-741；`titlesHaveDistance=true`，样例 `"#0 · 359 B · Δ0 tokens · 累计 0 · 距请求开始 135 ms"`、`"#20 · 418 B · Δ40 tokens · 累计 40 · 距请求开始 901 ms"` |
+
+真实浏览器脚本（不属于仓库测试）：`node .claude-runs/m9-monitor3/real-acceptance.js`；测量：`.claude-runs/m9-monitor3/acceptance-measurements.json`；截图：`monitor-1600x1019.png`、`monitor-1000x900.png`、`monitor-1000x900-timeline.png`。
+
+## 27. M10 管理界面第四轮后端（§24.7 D4/D6/D7/D9/D10）
+
+本轮只覆盖后端契约（E6–E9、E12、E14–E16）；E1–E5、E10–E11、E13、E17、E19 属于下一轮前端。
+
+### 27.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-750 | E6 登录页公开、四个页面未登录 302、`/admin` 302 | `TestLoginAndPageRoutes` | `/admin/login` 200 + `text/html`，页面体含 `password`、`remember`、`/api/login`；`/admin/`、`/admin/monitor`、`/admin/config`、`/admin/json`、`/admin` 未登录均 302 且 `Location` 以 `/admin/login` 开头；Basic 登录后 `/admin` 302 到 `/admin/`，四个页面 200 |
+| UT-751 | E7 记住我 cookie | `TestLoginCookieBehavior/remember_true` | 200；`Set-Cookie` 含 `Max-Age=2592000`、`HttpOnly`、`SameSite=Lax`、`Path=/`，不含 `Secure`；token ≥ 43 个 base64url 字符且不含用户名/密码；`{"redirect":"/admin/"}` |
+| UT-752 | E7 会话 cookie | `TestLoginCookieBehavior/remember_false` | `Set-Cookie` 不含 `Max-Age`；解析出的 cookie `MaxAge=0` |
+| UT-753 | E7 错误凭据 | `TestLoginCookieBehavior/bad_credentials` | 401、无 `Set-Cookie`、响应体不含密码 |
+| UT-754 | `next` 开放重定向防护 | `TestLoginCookieBehavior/next_is_validated`、`TestSafeNext` | 仅 `/admin` 前缀通过；`//evil`、`https://evil`、`/\evil`、`/otherapp` 回落 `/admin/` |
+| UT-755 | E8 Cookie 登录 / 登出失效 | `TestSessionCookieAuth` | 带 cookie 访问 `/admin/monitor` 200 且页面体不含 token；logout 200 且 `Max-Age=0`；再用旧 cookie 访问 `/admin/monitor` 302、`/api/stats` 401 |
+| UT-756 | E9 旧认证继续可用 | `TestLegacyAuthStillWorks`、既有 `TestMonitorAuth`、`TestMonitorQueryCredentialFallback` | Basic 与 query 都能打开 `/api/stats`、`/api/ws`；§24.11 H2 后 `/api/monitor` 已删除（正确凭据 404） |
+| UT-757 | E12 `/api/stats` 与 WS `stats.data` 键集合一致 | `TestStatsAPIAndWSKeysMatch` | 递归收集键集合（含 `ttft`/`duration`/`instances[]`/`recentErrors[]`），两侧无缺失/多余 |
+| UT-758 | E14 120 条历史 → snapshot 100 条 | `TestSnapshotHoldsLastHundred` | 无客户端连发 120 个请求后连接 `/api/ws`，首帧 `snapshot`，`requests.length == 100`，`ts` 非递增、每条 `ended=true` |
+| UT-759 | E15 无客户端仍累计 | `TestStatsAccumulateWithoutClients` | 初始 `requests.total=0`；3 个请求后 `requests.total=3`、`requests.success=3`、`byProtocol.openai=3` |
+| UT-760 | E16 清除环形缓冲 | `TestMonitorClear` | `POST /api/monitor/clear` 200；重连后 `snapshot.requests=[]`；累计 `requests.total` 仍为 2 |
+| UT-761 | API 未登录行为 | `TestClearAndStatsRequireLogin` | `/api/stats`、`/api/monitor/clear`、`/api/logout` 未登录均 401（不 302） |
+| UT-762 | 统计口径单元测试 | `TestPercentilesNeedTenSamples`、`TestSampleRingKeepsLastWindow`、`TestTrackerRecordsStatsWithoutClients`、`TestStatsErrorSummaryTruncated`、`TestFormatUptime` | <10 样本 `p50/p95` 为 null；1000 样本环形窗口丢最旧；无客户端 tracker 仍记 total/success/failure/错误/环形缓冲；错误摘要 80 字符；uptime 格式 `2d 3h 14m` |
+| UT-763 | E18 静态检查 | 命令行 | `go build ./...`、`go vet ./...` 退出码 0；`gofmt -l internal/proxy internal/web` 无输出；`go test ./... -race -count=1` 全绿 |
+
+### 27.2 既有测试调整说明
+
+`proxy_test.go` 的 `TestAdminAuth` 原断言“无凭据 `GET /admin` → 401 + `WWW-Authenticate`”。§24.7 D4/D6 明确改为“页面请求 302 到 `/admin/login`”，故该用例改为断言 302 + `Location`；授权访问改为 Basic 打开 `/admin/` 返回 200。除此以外未改动任何既有断言，§24 的 10 个 monitor 测试（`TestMonitorAuth`、`TestMonitorQueryCredentialFallback`、`TestMonitorStreamEvents`、`TestMonitorNonAIRequestsSilent`、`TestMonitorRetryThen502`、`TestMonitorFirstTokenTimeoutRetry`、`TestMonitorNoHistoryReplay`、`TestMonitorSurvivesReload`、`TestMonitorHubNoClientNoCollection`、`TestMonitorSlowClientDisconnected`）全部保持原样通过。
+
+### 27.3 验收对照
+
+| 验收项 | 证据 |
+|---|---|
+| E6 | UT-750 |
+| E7 | UT-751～UT-753 |
+| E8 | UT-755 |
+| E9 | UT-756 + 既有 §24 测试 |
+| E12 | UT-757 |
+| E14 | UT-758 |
+| E15 | UT-759 |
+| E16 | UT-760 |
+| E18 | UT-763 |
+
+### 27.4 未覆盖（下一轮前端）
+
+E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主体区分与统计首页渲染）、E13（前端自动连接/重连）、E17（删除监控认证 UI）、E19（视口布局）不在本轮后端范围。
+
+## 28. 时间轴逐行等高与内容块着色（§24.8 Y1–Y6）
+
+### 28.1 用例
+
+| 编号 | 检查项 | 方法 | 判定 |
+|---|---|---|---|
+| UT-764 | Y6 后端计数 | `TestChunkContentDeltasCountsContentBlockDelta` | 逐块 `contentDeltas = [0,0,0,1,2,0,0,0,0]`；Σ = 3 = `content_block_delta` 行数；`message_start`/`content_block_start`/`ping`/`content_block_stop`/`message_delta`/`message_stop`/`[DONE]` 均为 0；`tokens/inTokens` 仍只取 usage |
+| UT-765 | Y4 chunk 事件字段 | `TestChunkEventContentDeltasOverWS` | 三个上游 trunk 的 `chunk.contentDeltas = 0/2/0`，Σ=2 等于事件行数；`Σ deltaTokens=2` 仍等于 `usage.output_tokens` |
+| UT-766 | Y1–Y3 真实浏览器 | headless Chrome + CDP，1600×1019 与 1000×900，真实 Anthropic 流式请求 | Y1 同行所有条 height/top 最大差 ≤0.5px 且 ≈6.4px；Y2 绿块数 >0 且 >50%；Y3 绿块 title 含「内容块」且 k>0，蓝块 k=0 |
+| UT-767 | Y5a 死代码 grep | `grep -nE 'timelineTokenThreshold|blockHeightPercent|refreshRowTimelineHeights|rowBaseHeightPercent|syncWaitHeight|maxDelta' internal/web/index.html` | 无匹配（函数名清单见 `design §29.2`） |
+| UT-768 | Y6 回归与静态检查 | `go build ./...`、`go vet ./...`、`gofmt -l internal/proxy internal/web`、`go test ./... -race -count=1` | 全部通过；既有 §24/§24.5/§24.6/§24.7 断言未放宽 |
+
+### 28.2 验收对照
+
+| 验收项 | 证据 |
+|---|---|
+| Y1 逐行等高 | UT-766；1600×1019 与 1000×900 下 173 条（1 等待段 + 172 块）`height` 全为 6.391px（差 0 ≤0.5），`top` 差 0；轨道 `height=16`。原始数据：`.claude-runs/m9-monitor5/measurements.json` |
+| Y2 绿块占比 | UT-766；同一真实流式请求（300 个 `content_block_delta`，37,817 B）共 172 块，绿块 169（98.3% > 50%），3 个蓝块分别为起始帧、心跳/块边界帧与末帧（`内容块 0`） |
+| Y3 tooltip | UT-766；绿块 title 形如 `#2 · 136 B · Δ0 tokens · 内容块 1 · 累计 0 · 距请求开始 320 ms`，解析出的 `内容块` 均 >0（首个 8 个为 1/1/1/1/4/2/2/4）；蓝块 title `内容块 0`（如 `#0 · 359 B · Δ0 tokens · 内容块 0 · 累计 0 · 距请求开始 319 ms`），末块 `累计 300` |
+| Y4 contentDeltas 求和 | UT-764 + UT-765；真实请求 `Σ chunk.contentDeltas = 300` 与 SSE `content_block_delta` 实际 300 条精确相等 |
+| Y5a 无 token 高度路径 | UT-767 |
+| Y6 回归/静态检查 | UT-768 |
+
+说明：本轮真实请求使用 `model: claude-sonnet-5` 走 `/anthropic/v1/messages`；按容器配置的实例顺序由 MTI（`mti-flash`）承接（首个 anthropic 实例），而非 DeepSeek。MTI 返回了 300 条 `content_block_delta`（含 141 条 `thinking_delta`、158 条 `text_delta`、1 条 `signature_delta`），满足“真实流式、输出 ≥100 tokens”的判定条件；若必须指定 DeepSeek，需要调整实例顺序或降级 MTI，属于环境选择而非实现差异。
+
+## 29. 第六轮：tooltip 开始时间、自适应高度、快照完整化、OpenAI 判据（§24.9 Z1–Z6）
+
+### 29.1 用例
+
+| 编号 | 检查项 | 测试/方法 | 判定 |
+|---|---|---|---|
+| UT-769 | Z5 OpenAI 判据 | `TestContentDeltasOpenAICriteria`、`TestChunkEventContentDeltasOpenAIOverWS` | 单测：`role`、空 content/reasoning、空 tool arguments、`finish_reason`、空 choices、`[DONE]`、`: keep-alive` 均为 0；content/reasoning/非空 arguments 各 +1；三者同现仍 +1；`usage.completion_tokens` 仍更新 tokens。WS 端到端：5 个 trunk 的 `contentDeltas = 0/1/1/0/0` |
+| UT-770 | Z4 chunksList 生成与 JSON 字段 | `TestSnapshotChunksListRecordsBlocks`、`TestSnapshotJSONCarriesChunksList` | 无客户端时 3 个 chunk 仍写入快照；JSON `chunksList` 每项恰好 7 键；非流式请求输出空数组而非 null |
+| UT-771 | Z4c 400 块截断与合成块 | `TestSnapshotChunksListCompaction` | 500 块 → 400 块；前 200 原样、后 199 从 seq 301 起；合成块 seq=250、时间跨度 [200ms,301ms]、cum=300；bytes/content/delta 总和与原始 500 块一致 |
+| UT-772 | Z1/Z2/Z3 真实浏览器 | headless Chrome + CDP | Z1a 任意条 title 末尾匹配 `· 开始 \d{2}:\d{2}:\d{2}\.\d{3}$` 且原字段仍在；Z1b 同一请求等待段与所有块时间戳一致；Z2a 两档视口 `scrollHeight <= innerHeight+1`；Z2b 视口 1400/900 的 `.req-list` clientHeight 差 >100；Z3a 刷新后 ts 严格降序、序号递增；Z3b 新请求插最上且序号重排 |
+| UT-773 | Z4/Z5 真实浏览器 | headless Chrome + CDP | Z4a 切到 `/admin/` 再回监控页绿块数不变；Z4b 完整刷新后仍见绿块且 `chunksList` 含 `contentDeltas>0`；Z5a OpenAI 真实流式绿块占比 >50%；Z5b role/finish_reason/[DONE] 块为 0 |
+| UT-774 | Z6 回归与静态检查 | `go build`/`go vet`/`gofmt`/`go test -race` | 全部通过；既有断言未放宽 |
+
+### 29.2 验收对照
+
+真实环境（2026-11-16 10:28 本地时间，headless Chrome + CDP，容器 `wuzm219/model-router:0.1.1` 重新构建并清空环形缓冲后；先 `POST /api/login` 再 `Network.setCookie` 注入 `mr_session`）：
+
+| 验收项 | 证据 |
+|---|---|
+| Z1a/Z1b | UT-772；真实 Anthropic 请求（38,500 B、300 个 `content_block_delta`）共 129 个时间轴元素（1 等待段 + 128 块），全部 title 匹配 `· 开始 \d{2}:\d{2}:\d{2}\.\d{3}$`；唯一时间戳 `10:28:28.137` 等于该请求 `ts` 的本地时钟；等待段保留「等待首包 147 ms」，块保留「内容块 k」「距请求开始 x ms」。原始数据 `.claude-runs/m9-monitor6/measurements.json` |
+| Z2a | UT-772；`scrollHeight == innerHeight`：1600×1019 → 1019/1019，1600×900 → 900/900，1000×900 → 900/900；`scrollWidth == innerWidth`：1600/1600、1000/1000 |
+| Z2b | UT-772；`.req-list.clientHeight`：视口高 1400 → 1232px，视口高 900 → 732px，差 500px（>100） |
+| Z3a/Z3b | UT-772；清空后完整刷新时 2 行 `ts` 严格降序、序号 1..2；新请求到达后其 `id` 位于第一行、`ts` 最大，序号重排为 1..N |
+| Z4a | UT-773；真实流式请求切到 `/admin/` 再回 `/admin/monitor`：绿块 125 → 125，块数 128 → 128，`chunksList` 存在 |
+| Z4b | UT-773；完整刷新后同一行绿块仍为 125，`chunksList` 的 `contentDeltas` 求和 300，等于该请求 SSE 的 `content_block_delta` 条数 300；至少一个块 `contentDeltas > 0` |
+| Z4c | UT-771；500 块 → 400 块，合成块 seq=250、时间跨度 [200ms,301ms]、bytes/content/delta 总和与原始一致 |
+| Z5a | UT-773；真实 OpenAI 协议流（`POST /v1/chat/completions`，模型 `mti-pro`，92,780 B）：174 块、绿块 173（99.4% > 50%） |
+| Z5b | UT-769 + UT-773；单测逐事件 `role/空 delta/finish_reason/[DONE]/keep-alive` 均 0；真实流 294 个内容事件、1 个 `finish_reason`、1 个 `[DONE]`、0 条解析失败，Σ 块 `contentDeltas` = 294 = 内容事件数（证明 finish/[DONE] 未计数），首 trunk 为 0；末 trunk 因上游把 3~5 个内容事件与 `finish_reason`/`[DONE]` 合并写出而为正（见 D-M10-29） |
+| Z6 | UT-774 |
+
+> §24.10 A3 修正：OpenAI 协议的验收样本模型必须取自 `GET /v1/models` 的真实上游模型名（本环境为 `mti-pro`）。原 §24.9 样本 `claude-sonnet-5` 只适用于 Anthropic 角色入口；传给 `/v1/chat/completions` 会被原样透传并得到上游 503 `model_not_found`，不能作为 OpenAI 验收样本。
+
+## 30. 第七轮：OpenAI 模型语义、统计落盘、数值可读化（§24.10 A/B/C）
+
+### 30.1 用例
+
+| 编号 | 检查项 | 测试/方法 | 判定 |
+|---|---|---|---|
+| UT-775 | A2 `owned_by` 与模型并集 | `TestModelsOwnedByInstance` | 模型集合 = 实例顺序并集去重；`owned_by` 为首个声明实例名；无 `claude-*`；未命名实例回退 `model-router`（既有测试） |
+| UT-776 | B1 落盘/加载/损坏回退 | `TestStatsPersistenceRoundTrip`、`TestStatsPersistenceCorruptFile` | 原子写 `stats.json`，`schema=1`，累计计数/实例/错误可恢复；分位数与请求快照不恢复；截断 JSON、未知 schema、负计数 → `.bad` + 零值启动 |
+| UT-777 | B1 节流与清空语义 | `TestStatsPersistenceThrottle`、`TestStatsClearCumulative` | 5 秒内第二次 flush 不改文件；超过窗口才写；clear 清零累计/实例/错误/分位数，保留 100 条请求环 |
+| UT-778 | B1 clear 接口 | `TestStatsClearEndpoint` | 未登录 401；登录 200；累计归零；`stats.json` 立即改写；snapshot 请求数不变 |
+| UT-779 | B3a–B3f 真实容器 | 容器 + curl + docker inspect | 见 30.2 |
+| UT-780 | C4a–C4g 真实浏览器 | headless Chrome + CDP 注入统计快照 | 见 30.3 |
+| UT-781 | G1–G6 回归 | `go build`/`go vet`/`gofmt`/`go test -race` + 端点 | 全部通过，既有断言未放宽 |
+
+> 既有断言调整：`TestModelsOpenAI`、`TestModelsOpenAICapabilities`、`TestModelsSchemaIsDecidedByPath` 原先断言 `owned_by == "model-router"`；按 §24.10 A2 改为断言首个声明实例名（实例未显式命名时后端以 `base_url` 作为实例名）。这是规格要求的语义变更，不是放宽。
+
+### 30.2 B3 验收对照（2026-11-16 10:51 实测）
+
+| 验收项 | 证据 |
+|---|---|
+| B3a | 3 个 Anthropic 请求均 200；等待 6.5s 后宿主 `./.docker/stats.json` 存在，`schema=1`，`requests.total=118`（含此前重启前累计值，≥3；同时验证重启恢复） |
+| B3b | `docker compose restart` 前 118 → 后 118，delta=0（±1 允许） |
+| B3c | 先 `stop`（避免退出补写覆盖）、写入 `{`、再 `start`：服务正常启动；日志含 `warning: invalid /home/nonroot/config/stats.json; moved to .../stats.json.bad and starting with zero statistics`；`.bad` 内容为 `{`；`/api/stats` total=0 |
+| B3d | `POST /api/stats/clear` 200；`requests.total=0`；`stats.json` 立即改写为 total=0；WS snapshot 请求数 3 → 3（清空不影响 100 条环） |
+| B3e | 100 个 OpenAI 请求在 20ms 内全部发出（并发），1.756s 内全部结束；`stats.json` mtime 变化 1 次（≤3），最终 total=100 |
+| B3f | `docker inspect` 镜像 `Config.Volumes = {"/home/nonroot/config":{}}`；`MODEL_ROUTER_PORT=18081 docker compose -p mr-named -f docker-compose.named.yml up -d` 成功，`/admin/login` 200，`/model-router -version` exec 0 |
+
+原始数据：`.claude-runs/m9-monitor7/measurements-b.json`。
+
+### 30.3 C4 验收对照（真实 Chrome 注入受控快照）
+
+| 验收项 | 实测 |
+|---|---|
+| C4a | `ttft.p50=999`、`p95=1234` → `999ms / 1.23s`，title `P50 999ms · P95 1,234ms` |
+| C4b | `outTokens=62147` → `62.1K`，title `62,147` |
+| C4c | `inTokens=1234567` → `1.23M`，title `1,234,567` |
+| C4d | `duration.p50=3600000` → 显示 `1.0h / 123.46s`（P95=123456ms） |
+| C4e | `requests.total=999` → `999`（不缩写） |
+| C4f | `retries=979999` → `980.0K`，title `979,999` |
+| C4g | 实例表：请求 `62.1K`/title `62,147`，成功 `1.23M`/title `1,234,567`，失败 `999`，平均 TTFT `1.23s`/title `1,234ms`；已移除实例行显示「已移除」；所有 K/M 缩写单元格均有 title（`abbreviatedWithoutTitle=[]`） |
+
+原始数据：`.claude-runs/m9-monitor7/measurements-c.json`；截图 `stats-1600x1019.png`。
+
+### 30.4 G 组对照
+
+| 验收项 | 证据 |
+|---|---|
+| G1 | `/v1/models` 返回 `mti-pro, mti-flash, deepseek-v4-pro, deepseek-v4.1-flash, qwen3.8-flash, deepseek-flash`，与配置并集顺序一致；`owned_by` 与首个声明实例名一致；无 `claude-*` |
+| G2 | `mti-pro` 请求 200；`claude-sonnet-5` 返回上游 503 `model_not_found ... No available channel for model claude-sonnet-5`，原样透传 |
+| G3 | 既有 Anthropic 路由/角色映射测试全绿 |
+| G4 | B3a–B3f 全过 |
+| G5 | C4a–C4g 全过 |
+| G6 | UT-781：build/vet/gofmt/test -race 全绿 |
+
+## 31. 第八/九轮：进行中快照、删除旧 WS 路径、JSON 页自适应（§24.11 H / §24.12 J）
+
+### 31.1 用例
+
+| 编号 | 检查项 | 测试/方法 | 判定 |
+|---|---|---|---|
+| UT-782 | H1 进行中行进快照 | `TestSnapshotIncludesInProgress` | 快照含 ended=false 行，chunksList 数量与已产生块一致，整体 ts 降序 |
+| UT-783 | H1 进行中 200 上限 | `TestSnapshotActiveLimit` | 205 个进行中 → 注册与快照均 200，最早 5 个被丢弃 |
+| UT-784 | H1 续接与结束转换 | `TestSnapshotInProgressContinuation`、`TestSnapshotPrefersEndedRecord` | 快照后继续 chunk，end 后只保留 ended 记录；同 id 出现时 ended 优先 |
+| UT-785 | H2 旧路径删除 | `TestRemovedMonitorRoute`、`TestLegacyAuthStillWorks` | `/api/monitor` 带正确 Basic 404、无凭据 401；`/api/ws` 101 |
+| UT-786 | H3a–H3e 真实浏览器 | headless Chrome + CDP | 进行中快照、续接、刷新结束态、降序、200 上限见 31.2 |
+| UT-787 | J2a–J2e 真实浏览器 | headless Chrome + CDP | 见 31.3 |
+| UT-788 | H3h 回归 | `go build`/`go vet`/`gofmt`/`go test -race` | 全绿，既有断言未放宽 |
+
+### 31.2 H3 验收对照（真实 Chrome + CDP，2026-11-16 11:10 前后）
+
+| 验收项 | 证据 |
+|---|---|
+| H3a | 长流进行中刷新页面：snapshot 行 `ended=false`、`chunks=17`、`chunksList` 长度 17（相等）、`cursor=true`、耗时显示 `870ms` |
+| H3b | 同一行块数在快照后 900ms 内从 17 增长到 85（不因来自快照而断流） |
+| H3c | 流结束后再次刷新：同 id `ended=true`；刷新前 blocks 239 / tok 236，刷新后 blocks 239 / tok 236，`chunksList` 239 |
+| H3d | 快照混排 13 条 ended + 1 条进行中，`ts` 严格降序 |
+| H3e | UT-783：205 个进行中 → 注册与快照均 200，最早 5 个被丢弃 |
+| H3f | `GET /api/monitor`（正确 Basic）=404；`/api/ws` 握手 101 |
+| H3g | `dialMonitor` 改为 `/api/ws`；`TestWSHistoryOnlyViaSnapshot` 替代旧无回放测试（历史仅在 snapshot 出现），`TestRemovedMonitorRoute` 覆盖 404/401/101，其余 monitor 断言未改 |
+| H3h | UT-788：build/vet/gofmt/test -race 全绿 |
+
+原始数据：`.claude-runs/m9-monitor8/measurements.json`；截图 `monitor-running-snapshot.png`。
+
+### 31.3 J2 验收对照
+
+| 验收项 | 实测 |
+|---|---|
+| J2a | 1600×1019：scrollHeight/innerHeight=1019/1019；1000×900：900/900；横向 1600/1600、1000/1000 |
+| J2b | `#json-editor` clientHeight：视口 1400 → 1095px，视口 900 → 595px，差 500px（>150） |
+| J2c | computed `resize` 在 1600 与 1000 均为 `none` |
+| J2d | 配置页无内置 textarea；注入临时 textarea 测得全局规则 `min-height:480px`、`resize:vertical`、clientHeight 478（border-box 减去 2px 边框），body 无 `json-mode` |
+| J2e | 300 行内容下 editor `scrollHeight=5905 > clientHeight=714` 可滚动；校验/保存/重载按钮均可见；点击「校验」返回错误提示（`400 parse config: json: unknown field "line"`），功能正常 |
+
+原始数据：`.claude-runs/m9-monitor8/measurements.json`；截图 `json-1600x1019.png`、`json-1000x900.png`。
+
+## 32. 第十轮：项目品牌化（§24.13 K6）
+
+### 32.1 用例
+
+| 编号 | 检查项 | 测试/方法 | 判定 |
+|---|---|---|---|
+| UT-789 | K6d 匿名 favicon | `TestFaviconAnonymous` | 无凭据 GET `/favicon.ico` → 200、`Content-Type: image/x-icon`、`Cache-Control` 含 `max-age=86400`；响应体以 `00 00 01 00` 开头；ICONDIR count ≥3；含 16/32/48 条目；`admin_password` 为空时同样 200 |
+| UT-790 | K6e Logo 鉴权 | `TestLogoSVGAuth` | 未登录 GET `/admin/logo.svg` → 302 `/admin/login`；带会话 Cookie → 200、`image/svg+xml`、体以 `<svg` 开头且含 `viewBox="0 0 256 256"`、缓存 1 天 |
+| UT-791 | K6a–K6c/K6f 页面品牌 | headless Chrome + CDP | 四页 `<title>` 与左上角文字为「模型智能路由」，登录页相同；可见文本无 `model-router` |
+| UT-792 | K6b 布局 | headless Chrome，1600×1019 与 1000×900 | 四页 Logo 24×24、与文字垂直居中、gap 8px；1000×900 header 不换行、无溢出 |
+| UT-793 | K6g 英文标识未误改 | `grep -rn "model-router" go.mod Dockerfile docker-compose.yml` | module/镜像 tag/服务名保持原值 |
+| UT-794 | K6h 回归 | `go build`/`go vet`/`gofmt -l internal`/`go test ./... -race` | 全绿 |
+
+### 32.2 K6 验收对照（2026-11-16 12:06 实测）
+
+| 验收项 | 证据 |
+|---|---|
+| K6a | `/admin/`、`/admin/monitor`、`/admin/config`、`/admin/json` 的 `<title>` 分别为「模型智能路由 · 统计 / 实时监控 / 配置 / JSON 高级」，左上角 `h1` 文本均为「模型智能路由」 |
+| K6b | 四页 Logo 渲染尺寸 24×24、`display:flex`、`gap:8px`、图标与文字中心差 0px；1000×900 下 header 高度 31.5px（与 1600 相同，未换行）、`scrollWidth<=clientWidth`、整页无横向滚动 |
+| K6c | `/admin/login` `<title>` 为「模型智能路由 · 登录」，卡片顶部 Logo 24×24 + 「模型智能路由」 |
+| K6d | 匿名 `curl -s -o /dev/null -w "%{http_code} %{content_type}"` → `200 image/x-icon`；响应体 `magic=00000100`、ICONDIR count=6（含 16/32/48） |
+| K6e | 未登录 `/admin/logo.svg` → 302 `/admin/login?next=%2Fadmin%2Flogo.svg`；带 Cookie → 200、`image/svg+xml`、体以 `<svg` 开头、含 `viewBox="0 0 256 256"` |
+| K6f | `grep -c model-router internal/web/index.html internal/web/login.html` 均为 0；浏览器逐页 `document.body.innerText` 不含 `model-router` |
+| K6g | `grep -rn model-router go.mod Dockerfile docker-compose.yml` 仍为 `module model-router`、`wuzm219/model-router:0.1.1`、服务名 `model-router` |
+| K6h | UT-794：`go build`/`go vet`/`gofmt -l internal main.go`/`go test ./... -race -count=1` 全绿 |
+
+原始数据：`.claude-runs/m9-brand/measurements.json`；截图：`stats-1600x1019.png`、`stats-1000x900.png`、`monitor-1600x1019.png`、`monitor-1000x900.png`、`login-1600x1019.png`。

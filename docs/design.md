@@ -11,6 +11,7 @@
 - **M4.x**：实例粒度回退降级、`fallback` 配置、流式空闲超时、请求日志（客户端/来源 IP）、双认证、`[1m]` 变体、吞吐样本门槛（§18～§23）。
 - **M5**：跨平台构建与容器化（§21）。
 - **M6/M7**：模型列表对齐官方 schema、协议路径分离与 OpenAI 入口能力字段（§21、§22）。
+- **M9**：管理页实时请求监控（WebSocket 推送 + F12 网络面板式视图，§24）。
 
 不做：协议转换（永不）。
 
@@ -20,8 +21,8 @@
 |---|---|---|
 | 入口 | `main.go` | 解析 `-config`/`-version`、加载配置、启动 HTTP 服务、优雅停止、启动日志 |
 | 配置 | `internal/config` | `instances` 解析/校验、旧字段迁移报错、原子保存、`Duration` JSON、环境变量覆盖 |
-| 代理 | `internal/proxy` | 双协议入口、认证、实例展开路由、`/v1/models`、管理 API（config/reload/probe/validate）、原子重载 |
-| Web | `internal/web` | `go:embed` 内嵌配置页（可视化 + JSON 高级），原生 HTML+JS，无 CDN |
+| 代理 | `internal/proxy` | 双协议入口、认证、实例展开路由、`/v1/models`、管理 API（config/reload/probe/validate）、实时监控 WS 与事件采集、原子重载 |
+| Web | `internal/web` | `go:embed` 内嵌配置页（可视化 + JSON 高级 + 实时监控），原生 HTML+JS，无 CDN |
 | 版本 | `internal/version` | 版本单一来源 + `-ldflags` 注入 |
 
 ## 3. 请求流程
@@ -240,7 +241,8 @@ JSON 对象不保留键顺序，因此 anthropic 条目按固定顺序展开：`
 - `POST /api/reload`：`config.Load` → `proxy.New` → `atomic.Pointer` 整体替换；失败保持旧状态。不重新绑定监听地址。
 - `GET /api/providers`：返回内置供应商清单（`providers.List()`），仅 GET。
 - `Server` 持有 `atomic.Pointer[serverState{cfg, handler}]`；每请求加载一次，在途请求使用旧 handler。
-- 管理页：可视化模式（双 tab、实例卡片、测试连接、查询模型、勾选/手填、角色对外名、模型能力、保存）+ JSON 模式（校验通过才启用保存）。页面为内嵌静态资源。
+- `Server` 另持有一个不随 reload 重建的 `monitorHub`；每次 `buildState` 把同一个 hub 注入新 handler，因此在途/后续请求与已有 WS 连接在 reload 后继续可用（§27.6）。
+- 管理页：可视化模式（双 tab、实例卡片、测试连接、查询模型、勾选/手填、角色对外名、模型能力、保存）+ JSON 模式（校验通过才启用保存）+ 实时监控模式（§27）。页面为内嵌静态资源。
 
 ## 11. Probe 与 Validate
 
@@ -755,3 +757,461 @@ POST /v1/messages -> req_model="opus[1m]" model="mti-flash" (anthropic) client=c
 - **D-M7-3 能力键不在 `models` 中**：需求未定义；配置校验不拒绝，配置页会把该键并入能力行并原样保存（与 Anthropic 侧“能力键 ∪ 角色值”一致），不静默删除用户数据。
 - **D-M7-4 未知路径的协议归属**：`/anthropic/v1/chat/completions` 等未列入矩阵的路径按“未知 → OpenAI 格式”处理，认证也按 OpenAI 规则（Bearer）。
 - **D-M7-5 查询参数**：`/v1/models` 继续忽略全部查询参数；分页/过滤仅属于 `/anthropic/v1/models`。
+
+## 27. 管理页实时请求监控（M9，§24）
+
+### 27.1 端点与认证
+
+- 新增 `GET /api/monitor`（`proxy.PathMonitor`），位于现有管理面路径前缀下，因此：
+  - `admin_password` 为空 → 404（管理面整体禁用）；
+  - 认证失败 → 401 + `WWW-Authenticate`，**不升级** WebSocket。
+- 认证凭据来源优先级：
+  1. HTTP `Authorization: Basic`（浏览器对同源 WS 握手可能自动携带；命令行客户端可显式设置）；
+  2. query 参数 `?user=<admin_user>&password=<admin_password>`（浏览器 `new WebSocket()` 无法自定义请求头时的回退，§24.2 F4）。
+- 两种来源都使用 `subtle.ConstantTimeCompare` 比较用户名与密码；凭据值不写入任何日志。
+- 认证通过后才做 WebSocket 握手；非 GET → 405，缺少升级头 → 400，`Sec-WebSocket-Version != 13` → 426，ResponseWriter 不支持 `http.Hijacker` → 500。
+
+### 27.2 采集开关与常态开销
+
+- `monitorHub` 用原子计数维护在线客户端数。每个 AI 请求进入 `serveChain` 时只读取一次该计数：
+  - 计数为 0 → `newRequest` 返回 `nil`，`copySSE`/`serveChain` 中所有监控调用都是空操作，不采集逐 trunk 明细；
+  - 计数 > 0 → 创建该请求的 `requestMonitor`。
+- 监控不改变响应体、日志、`attemptMetrics` 字段或语义；§23 三档日志格式原样保留。
+- 连接/断开发生在请求开始之后时，该请求保持开始时的采集决定（不会中途补采或丢弃已采数据）。
+
+### 27.3 事件模型（§24.2 F3）
+
+所有事件为 JSON 文本帧，字段名固定如下（`type` 区分四型）：
+
+| type | 字段 |
+|---|---|
+| `start` | `id`、`ts`、`method`、`path`、`protocol`（openai/anthropic）、`reqModel`、`clientIP`、`userAgent`、`instName`、`upstreamModel` |
+| `chunk` | `id`、`seq`、`tsStart`、`tsEnd`、`bytes`、`deltaTokens`、`cumTokens` |
+| `retry` | `id`、`instName`、`upstreamModel`、`reason`（`error`/`first_token_timeout`/`idle_timeout`/`slow`） |
+| `end` | `id`、`status`、`durationMs`、`inTokens`、`outTokens`、`chunks`、`ttftMs`、`genMs`、`tps`、`instName`、`upstreamModel`、`error`（仅失败时出现） |
+
+- `id` 为进程内唯一字符串；`ts`/`tsStart`/`tsEnd` 为 Unix 毫秒。
+- 采集范围：命中模型路由的 `POST /v1/chat/completions`、`POST /v1/messages`、`POST /anthropic/v1/messages`。认证失败（401）、未知路径（404）、`GET /v1/models`、favicon 等非 AI 请求不产生任何事件。
+- `start` 在第一次实际尝试候选前发出（若全部候选处于降级而强制链头，则以链头为候选）；若候选链为空，`start` 与 `end` 仍成对出现，实例/模型为空串。
+- `chunk` 与 `copySSE` 的每次 `body.Read` 成功返回一一对应：`bytes` 为该次读取字节数（gzip 时为解压后字节），`tsStart` 为阻塞读取前、`tsEnd` 为读取返回后的时间，因此首块前的空隙即 TTFT、块间空隙即卡顿。
+- `deltaTokens` = 本块 `sseState.tokens` 相对上一块的增长；`cumTokens` = 已见累计输出 token（Anthropic `usage.output_tokens` / OpenAI `usage.completion_tokens`）。没有 usage 的块 delta 为 0。
+- 非流式 AI 请求只产生 `start` 与 `end`（无上游 trunk）。
+- `retry` 仅在“当前候选响应前失败、链中还有下一个候选”时发出；`instName`/`upstreamModel` 为**下一个**候选，供前端在时间轴上标注切换点。与普通错误相比，首 token 超时通过内部 `attemptFailure` 类型携带 `first_token_timeout`，不解析错误文本。
+- `end` 在所有返回路径（成功、失败、客户端断开）最后发出一次；`status` 为已提交的上游状态码，全部候选失败时为 502；`durationMs` 从进入 `serveChain` 起算；`ttftMs = 首块到达 − 请求开始`；`genMs = 末块 − 首块`；`tps` 在 `genMs > 0` 且有输出 token 时按 `outTokens / genMs` 计算（保留 1 位小数），否则 0。未知的 token 数按 0 输出。
+- 事件按每个请求的产生顺序入队；每个客户端一个容量 1024 的队列，非阻塞投递。队列已满时立即断开该客户端，代理与其它客户端不受影响（§24.2 F3）。
+
+### 27.4 最小 WebSocket 实现
+
+- 纯标准库，不引入第三方依赖：握手用 `Sec-WebSocket-Key + RFC 6455 GUID` 的 SHA-1/Base64 计算 `Sec-WebSocket-Accept`，通过 `http.Hijacker` 取得连接后手写 101 响应。
+- 服务端只发送文本帧、ping 帧与 close 帧；客户端帧必须是 masked，支持读入 close/ping/pong 与忽略数据帧；不支持扩展与分片（浏览器端 `WebSocket` 文本消息通常单帧）。
+- 写路径由单一 writer goroutine 串行化（pong 由 `writeMu` 保护），每次写入设置 10s 写超时；每 30s 发 ping，读超时 75s，无 pong/close 的连接会被回收，避免 goroutine 泄漏。
+- 服务端不缓存、不回放事件：新连接只收到连接之后产生的事件（§24.2 A6）。
+
+### 27.5 请求链埋点
+
+- `serveChain` 创建 tracker 并 `defer tracker.end(...)`；`finalStatus`/`finalErr`/`finalMetrics` 由各返回路径写入。
+- `tryCandidate` 增加 `tracker` 参数与 `status` 返回值（内部签名，不改变对外行为）。
+- `copySSE` 增加 `tracker` 参数；在 `sseState.feed` 之后、写给客户端之前调用 `tracker.chunk(...)`。该方法只做 `json.Marshal` 与非阻塞入队，不做阻塞 IO，不进入客户端的写路径。
+- `attemptMetrics` 的字段与 `logRequest` 未改动；监控所需的 trunk 计数、首末块时间、token 增量都由独立的 `requestMonitor` 维护。
+
+### 27.6 reload 与并发
+
+- `monitorHub` 属于 `Server`，`buildState` 只注入引用；`POST /api/reload` 替换 handler 后，已有 WS 连接继续存在，新 handler 继续向同一 hub 推送；在途请求使用旧 handler，但其 tracker 指向同一 hub。
+- hub 的客户端集合由 `sync.Mutex` 保护，在线计数为原子值；广播先复制客户端快照再逐个非阻塞入队，避免持锁调用 `drop`。
+- `requestMonitor` 只由请求 goroutine 访问，无需加锁。
+
+### 27.7 前端视图与认证栏（§24.5 第二轮）
+
+- 管理页顶部「实时监控」模式（默认关闭）：
+  - 打开时按 ① `localStorage` 中记住的凭据 → ② 监控认证栏当前输入 → ③ 配置页 `admin_password` 输入框 的顺序取凭据；均不完整时不发起 WS，状态「未连接」并提示「请先输入管理员凭据」；
+  - 有凭据 → `new WebSocket(ws(s)://<host>/api/monitor?user=…&password=…)`；
+  - 切换到其它模式 → 断开 WS、清空表格，但**保留**记住的凭据；刷新页面重新开始、不补发历史（A6）。
+- 监控面板为**单表格**（原左右分栏已删除）：
+  - 固定列顺序：`#`、状态、方法/路径、请求模型/实例·上游、入、出、块、耗时、TTFT、t/s、**时间轴（表头显示量程，见 §27.9）**；
+  - `table-layout: fixed` + `<colgroup>`：前 10 列固定 px，时间轴列自动占满剩余宽度；表格 `min-width:1100px`，窄屏时只在 `.req-list` 内部横向滚动，页面本身不横滚；
+  - 行高 33px；方法/路径、模型/实例两行堆叠，主行 12px、次行 11px（line-height 1.3/1.2），两行单元格 `overflow:visible`、上下各留 ≥1px，不用 `overflow:hidden` 掩盖裁切；时间轴单元格不换行；
+  - 统计列与时间轴单元格在同一 `<tr>`，`getBoundingClientRect().top` 完全对齐。
+- 每行 trunk 时间轴：
+  - 横轴 0 = `start.ts`，终点 = `durationMs`（已结束）或 `Date.now() - start.ts`（进行中，250ms 更新）；
+  - **所有行共用** `axisSpan = max(已结束 durationMs, 进行中累计耗时, chunk 末端, retry 时刻, 100ms)`；块按百分比定位，量程变化时所有行整体缩放（已结束行也会缩放）；
+  - 每个 chunk 画 `[tsStart-ts, tsEnd-ts]`，含新 token 绿色、其余蓝色；retry 画虚线；进行中行右端有当前时刻游标；
+  - 表尾 `tfoot` 为共享刻度，按 §27.9 的整数秒步长生成（第三轮起不再是固定 5 个四分位点），随 `displaySpan` 重算并 sticky 在表格底部。
+- 「清空」按钮（`#monitor-clear`）：只移除 ended 行，进行中行与 WS 连接保持不变；清空后无行则恢复空提示；量程按剩余请求重算（无请求时回到 100ms）。
+- 列表最多保留最近 500 项：超出时从最旧的**已完成**请求开始裁剪；全部仍在进行时暂不裁剪（沿用 §24.2 F5/M10）。
+- 认证与记住密码：
+  - 认证栏提示明确写出「密码以明文保存在本机浏览器 localStorage，仅建议在可信设备使用」；
+  - `#monitor-remember` 默认不勾选；勾选后点「连接」**成功**才把 `{"user","password"}` 写入 `localStorage['model-router.monitor.cred']`；
+  - 未勾选时连接成功不落盘；页面加载时若有 localStorage 凭据，自动填入用户名/密码、勾选记住密码，进入监控时自动连接；
+  - 取消勾选或认证失败立即删除 localStorage 并清空密码框；「断开」只关 WS，不删除记住的凭据；
+  - 凭据仍只随 WS 握手 query 发送；页面地址栏/history 不写凭据，不写 `document.cookie`。
+- 认证失败识别保持不变：握手阶段 1006 重试一次，仍失败提示「认证失败，请检查用户名/密码」并清除本机凭据。
+- 兼容 V1–V8：长模型名/数字列不截断、紧凑行高、1600px 下无横向滚动、1000px 下页面不横滚（表格容器内部可横滚）。
+- 调试钩子：`window.__modelRouterMonitor` 暴露当前监控状态（含 `ws`、`axisSpan`），用于验收脚本读取 `ws.readyState`；不改变正常运行行为。
+
+### 27.8 决策与未覆盖
+
+- **D-M9-1 retry 的实例字段**：§24.2 F3 未说明取失败候选还是下一候选；按前端需求（显示“新的实例/上游模型”）取下一候选。
+- **D-M9-2 retry 原因取值**：协议枚举含 `idle_timeout`/`slow`，但这两类判定发生在响应已提交之后，不会再切换候选，因此后端实际只产生 `error` 与 `first_token_timeout`；前端仍识别全部四种。
+- **D-M9-3 chunk 粒度**：一个 `chunk` 对应一次上游 `body.Read` 返回，而非 SSE `data:` 行数；TCP 合并/拆分可能使计数与 data 行不同（与现有 `outcome.chunks` 口径一致）。
+- **D-M9-4 非流式 AI 请求**：只发 `start`/`end`，不发 `chunk`（F3 将 chunk 定义为上游 trunk）。
+- **D-M9-5 tps 口径**：监控的 `tps` 用于实时展示，`genMs > 0` 且有输出 token 即计算，不套用 §17.4 的 100 token / 2s 样本门槛；日志 `gen` 段仍严格按 §23 门槛，二者互不影响。
+- **D-M9-6 未知数值**：拿不到 usage/首末块时 `inTokens`/`outTokens`/`ttftMs`/`genMs`/`tps` 输出 0，而非 `null`（F3 未定义缺失表示）。
+- **D-M9-7 认证回退语义**：Header 与 query 为“或”关系；Header 存在但不匹配时仍尝试 query，以便浏览器缓存了过期凭据时页面仍能连接。
+- **D-M9-8 非 GET/非升级请求**：需求只规定 404/401；本实现分别返回 405/400/426/500，均不建立连接。
+- **D-M9-9 非 HTTP/1.1 环境**：`http.Hijacker` 不可用时返回 500；本项目的监听方式（明文 HTTP/1.1）不受影响。
+- **D-M9-10 连接期间的采集边界**：请求开始后才建立的连接收不到该请求的事件；已开始时采集的请求即使连接随后断开也继续在内存中累计（无客户端时广播为空操作）。
+- **D-M9-11 记住密码生命周期**：勾选「记住密码」并连接成功后，凭据写入 `localStorage['model-router.monitor.cred']`（明文，页面有安全提示）；刷新后自动填入并自动连接；取消勾选或认证失败立即删除；「断开」与切离监控不删除。未勾选时只在内存/输入框中使用，不落盘。
+- **D-M9-12 凭据来源与残缺组合**：按 localStorage → 监控认证栏 → 配置页 的顺序取“用户名+密码齐全”的第一组；只填了一侧的来源视为不可用并继续尝试下一来源，不把不同来源的用户名与密码拼接。
+- **D-M9-13 P2 的“URL”范围**：浏览器无法为 WebSocket 握手设置 `Authorization` 头，query 凭据是浏览器可用的认证通道之一；实现只把凭据放进**本次 WS 握手请求的临时 URL**，从不写入页面地址栏、`location`、history、链接或持久化存储。P2 的“禁止写入 URL”按“不得写入页面/导航 URL”解读；这一点在验收报告中作为已知解释列出。
+- **D-M9-14 401 识别方式**：浏览器只给出握手失败的 `close.code=1006`，无法读取 401；按 P5 重试一次，仍失败即提示认证失败。因此服务不可达、管理面返回 404 等同样表现为 1006 的失败在重试后也会显示“认证失败”，属于浏览器能力限制。
+- **D-M9-15 open 之后的 1006**：视为普通网络断线，显示「连接已断开」，不重试、不清除会话凭据（P6 未把网络断线列为清除时机），用户可重新点击「连接」。
+- **D-M9-16 URL 内嵌凭据的静默降级**：`api()` 捕获 `TypeError`（含 credentials）时打标记；`load()` 对该标记或页面 URL 含 userinfo 的失败只显示中性提示，不把页面置于错误态，监控认证栏仍可独立工作。不重写请求 URL，避免配置读取成功后配置页密码自动成为监控凭据来源，从而绕过“未输入密码应提示”的验收预期。
+- **D-M9-17 来源③ 不自动落盘**：只有用户显式点击「连接」且勾选「记住密码」、并且握手成功后才写 localStorage；自动使用配置页密码（来源③）或认证栏既有输入（来源②）连接时只把凭据留在内存，避免用户未授权的持久化。
+- **D-M9-18 断开/取消勾选的清空范围**：取消勾选或认证失败会删除 localStorage 并清空监控认证栏密码框；「断开」与切离监控不删除 remembered 凭据；未勾选时断开/切离会清空密码框（凭据仅用于本次连接），勾选时保留输入框以便下次自动连接。配置页的密码输入框始终不受影响。
+- **D-M9-19 单表格布局**：`table-layout:fixed` + colgroup 固定统计列宽度、时间轴列取剩余宽度；表格 `min-width:1100px`，窄屏时由 `.req-list` 内部横滚，避免固定列被压扁或页面横滚。
+- **D-M9-20 共享量程与进行中游标**：`axisSpan` 包含进行中请求的累计耗时。若唯一/最长的是进行中请求，量程会随它增长，游标始终贴近右端；要观察游标像素增长，需要一个已结束的更长请求先把量程固定（B4 的测试即如此）。
+- **D-M9-21 retry 时间来源**：retry 事件无时间戳，按 `Date.now() - start.ts` 定位；客户端与服务端时钟偏差会影响该竖线位置（chunk 使用服务端 `tsStart/tsEnd`，不受影响）。
+- **D-M9-22 清空语义**：清空只删除 ended 行，不改连接、不删凭据；量程按剩余请求重算；若剩余全为进行中，量程会随之缩小。
+- **D-M9-23 验收调试钩子**：`window.__modelRouterMonitor` 只读地暴露 monitor 状态，供 B5 检查 `ws.readyState`；不参与业务逻辑。
+- **D-M9-24 时间轴列与行高**：时间轴容器 16px 高、行高 33px；统计单元格与时间轴单元格同属一个 `<tr>`，行内 top 差为 0。33px 是 12px 主行（line-height 1.3）+ 11px 次行（line-height 1.2）+ 上下 ≥1px 留白的最小可行行高，既修掉两行文字被裁切，又保持在 ≤34px 预算内。
+
+### 27.9 时间轴第三轮细化（§24.6 X1–X9）
+
+- **等待段（X1）**：每行 `.tl-wait` 从 0 画到 `req.chunksList[0].s`（相对 `start.ts`）；已结束且零 trunk 画到 `durationMs`；进行中且零 trunk 画到 `Date.now() - start.ts`，随 250ms 定时器增长。颜色用 `--warn` + 35% 不透明度，`z-index:0` 低于 `.tl-block` 的 1；`title` 为「等待首包 N ms」；图例改为「等待首包 · trunk 蓝 · 含新 token 绿 · 虚线 重试」。
+- **表头（X2）**：第 11 列表头只保留 `<span id="monitor-axis-title">0s – Ns</span>`，不再出现「时间轴」「trunk」字样；N = `displaySpan/1000`。
+- **量程（X3）**：`axisSpan` 仍按 W3 取所有行最长耗时（含进行中累计、chunk 末端、retry），再 `displaySpan = max(1000, ceil(axisSpan/1000)*1000)`；块与刻度一律用 `displaySpan`。`displaySpan` 未变化时不重绘刻度/标题，避免亚秒抖动。
+- **刻度（X4）**：`S = displaySpan/1000`，步长从 `{1,2,5,10,15,20,30,60,120,300}` 取使 `S/step ≤ 4` 的最小值；序列 `0, step, 2*step, …` 并强制末格落在 S。首格 `0s`、末格 `Ns`，中间刻度沿用现有 CSS 居中；相邻文字边界框重叠时按步长表自动升档。
+- **每块 token（X6）**：`copySSE` 在 `outcome.state.feed` 前后读取累计值，`deltaTokens = max(0, after-before)`、`cumTokens = after`；新增 `tokensKnown` 布尔字段。非解析/非流式固定 `deltaTokens=0, tokensKnown=false`。不再用 `requestMonitor.cumTokens` 做跨事件差分。
+- **块高度（X7）**：以该行当前可见块的最大 `deltaTokens` 与常量 8 的较大者为阈值；`0 → 40%` 轨道高、`≥ 阈值 → 100%`，中间线性。0 token（未知或已知零）一律按 40% 绘制。
+- **气泡（X8）**：`.tl-block` 的 `title` 为 `#seq · bytes B · Δn tokens · 累计 c · 距请求开始 x ms`，x = `chunk.tsStart - start.ts` 的整数毫秒。
+
+第三轮补充决策：
+
+- **D-M9-25 X6 的“文本长度估算”前提与实现不符**：`sseState.tokens` 实际来自 usage（`usage.output_tokens` / `usage.completion_tokens`，见 §27.2 与 `design §24.2`），不是按文本长度估算。按 X6 规定的 before/after 差分实现后，若上游只在末尾 `message_delta` 上报 usage（MTI 的真实行为），则 `deltaTokens` 呈现「除末块外为 0」：`Σ deltaTokens == end.outTokens` 仍精确成立，但无法把 token 分摊到中间块。若要真正的逐块增量，需要改变 `sseState.tokens` 语义（会破坏 §23 日志的 usage 口径）或新增文本估算（超出 X6 决策），本轮未自行推断。**结论**：`Σ deltaTokens == end.outTokens` 仍精确成立，块高度缩放因此退化为「末块最高、其余等高」，对应验收数据见 `.claude-runs/m9-monitor3/acceptance-measurements.json` 的 `deltas` 数组（20 块为 0、末块 40，`deltaSum=40 == outTokens=40`，块高 6.39px 与 16px）。
+- **D-M9-26 S=1 的刻度下限**：X4 要求“至少 3 个刻度（含两端）”且刻度必须落在整数秒；当 `S=1` 时整数秒序列只能是 `0s,1s`（2 个）。实现按步长规则输出 `0s,1s`，不引入小数刻度；该冲突已记录。
+- **D-M9-27 超过 1200s 的步长**：X4 的步长表最大为 300s，`S>1200` 时不存在使 `S/step ≤ 4` 的候选；实现退化为 `ceil(S/4)` 秒步长以保持 ≤5 格，避免刻度挤在一起。
+- **D-M9-28 X7 阈值口径与 C11 的边界**：X7 写“当前可见块里的最大 deltaTokens 与 8 的较大者”，C11 又要求“deltaTokens ≥ 8 的块高度等于行高”。当某行最大值 > 8 时，二者不可能对所有块同时成立。实现按**行内**最大 Δ 计算阈值（X7 的实测样本即单个请求的块序列），使每行的最大块顶满；真实 MTI 流中每行通常只有末块一个非零 Δ，因此 C11 的“≥8 的块等于行高”在该块上成立。
+- **D-M9-29 C3 的“整行宽度”**：X1 规定零 trunk 已结束行的等待段覆盖 `durationMs`，X3 又把量程补齐到整数秒。因此等待段相对轨道宽度为 `durationMs/displaySpan`，只有 `durationMs` 恰好等于 `displaySpan`（例如 3000ms 对 3s 量程）时才是 100%。验收中同时报告真实失败行的 `waitPct == durationPct` 与受控 3000ms 行的 100%。
+
+## 28. 管理界面第四轮后端（M10，§24.7 D4/D6/D7/D9/D10）
+
+本轮只实现 §24.7 的后端契约；页面拆分、统计首页与全局重连属于下一轮前端工作。后端保证既有 `web.IndexHTML` 仍能正常加载。
+
+### 28.1 Cookie 会话登录（D4）
+
+| 端点 | 方法 | 鉴权 | 行为 |
+|---|---|---|---|
+| `/admin/login` | GET | 无需登录 | 返回独立的 `web.LoginHTML`（用户名/密码/记住我/登录按钮，表单提交 `POST /api/login`） |
+| `/api/login` | POST | 无需登录 | body `{"user","password","remember"}`；成功 200 + `Set-Cookie` + `{"redirect": <next>}`；失败 401，不设 cookie，响应体不含任何凭据 |
+| `/api/logout` | POST | 需登录 | 删除服务端会话，下发清除 cookie（`Max-Age=0`），返回 `{"status":"ok"}` |
+
+- 凭据校验仍走 `adminCredentialsMatch`（`constant-time` 比较 `cfg.AdminUser`/`cfg.AdminPassword`）。
+- Cookie：名称 `mr_session`，值 = `crypto/rand` 32 字节 → `base64.RawURLEncoding` 不透明 token；`HttpOnly; SameSite=Lax; Path=/`；**不加 `Secure`**，因为本地 HTTP 部署必须能登录。
+- `remember:true` → `Max-Age=2592000`（30 天），服务端会话同样 30 天；`remember:false` → 浏览器会话 cookie（无 `Max-Age`），服务端会话 12 小时。
+- 会话存储为进程内 `map[token]sessionEntry{user, expiresAt}` + `sync.RWMutex`，不落盘；每次鉴权顺带清理过期项，重启即全部失效。
+- `next` 只接受以 `/admin` 开头的站内路径；`//`、`://`、反斜杠、绝对 URL 与非 `/admin` 前缀一律回落到 `/admin/`，防开放重定向。
+- `admin_password` 为空时整块 admin 面（含登录端点）仍返回 404。
+- `ServeHTTP` 鉴权顺序严格为：① 登录路径放行 → ② 有效 `mr_session` → ③ 旧 `Authorization: Basic`；`?user=&password=` 仅对 `/api/ws` 保留（供脚本与既有测试）→ ④ 页面请求（路径 `/admin*` 或 `Accept` 含 `text/html`）302 `/admin/login`（页面路径附带 `?next=`）→ ⑤ 其余 `/api/*`、WS 升级返回 401，并保留 `WWW-Authenticate: Basic` 以免破坏既有脚本。
+
+### 28.2 独立页面路由（D6）
+
+| 路径 | 本轮后端响应 |
+|---|---|
+| `/admin` | 已登录 302 `/admin/`；未登录 302 `/admin/login`（同样 302，目标不同） |
+| `/admin/`、`/admin/monitor`、`/admin/config`、`/admin/json` | 已登录 200 `web.IndexHTML`；未登录 302 `/admin/login` |
+| `/admin/login` | 200 `web.LoginHTML`（公开，独立登录页） |
+
+页面内容区分、顶栏导航与登录表单由前端轮次实现；本轮只保证四个路径都返回同一份可加载资源、刷新后服务端不重定向回首页。`/admin/*` 的未知路径在鉴权后 404。当前没有静态资源，故未开放 `/admin/static/*`（前端轮次若新增再放行）。
+
+### 28.3 统计聚合（D7）
+
+`internal/proxy/stats.go` 的 `statsAggregator` 在进程内累积；`Server.statsSnapshot(wsClients)` 是唯一序列化入口，`GET /api/stats` 与 WS `stats` 帧的 `data` 都由它产出，键集合因此天然一致。
+
+JSON 形状：
+
+```json
+{
+  "uptime": "2d 3h 14m", "version": "0.1.2",
+  "wsClients": 1, "activeRequests": 0, "qps": 0.1,
+  "requests": {"total": 12, "success": 11, "failed": 1, "successRate": 91.7},
+  "byProtocol": {"openai": 8, "anthropic": 4},
+  "ttft": {"p50": 132.0, "p95": 410.0},
+  "duration": {"p50": 900.0, "p95": 2400.0},
+  "inTokens": 1200, "outTokens": 3400, "avgTps": 42.1, "retries": 2,
+  "instances": [{"name":"MTI","requests":12,"percent":100.0,"success":11,"failed":1,"avgTtftMs":120.5,"avgTps":40.2,"degraded":false}],
+  "recentErrors": [{"ts":1700000000000,"status":502,"instName":"MTI","upstreamModel":"m","model":"sonnet","error":"…"}]
+}
+```
+
+`requests` 采用嵌套对象是为了与现有统计页的 `normalizeStats` 对接（它优先读取 `data.requests.*`）；`failed` 与实例行的 `failed` 同名。`GET /api/stats` 的顶层键与 WS `stats.data` 完全一致。
+
+口径：
+
+- **累计**：进程启动起累积，重启清零；`requests.total = requests.success + requests.failed`，只统计已结束的 AI 请求（`serveChain` 粒度），`/v1/models`、favicon、401 不计入。
+- **成功/失败**：`status` 为 2xx/3xx 且 `end.error == ""` 记成功；其余（含“2xx 但流式错误”）记失败。
+- **分位数**：TTFT（`ttftMs`）与总耗时（`durationMs`）各保留最近 1000 个样本的环形窗口；样本 < 10 时 `p50`/`p95` 输出 `null`。采用 nearest-rank，单位 ms。
+- **QPS**：最近 60 秒内开始的 AI 请求数 ÷ 60，保留 1 位小数。
+- **平均生成速率**：全部 `genMs > 0` 请求的 `Σ outTokens / Σ genMs × 1000`，保留 1 位小数；实例行同口径。
+- **实例统计**：按 `end` 时的 `instName` 分组；占比 = 该实例已结束请求 / `total`；平均 TTFT = 该实例 `ttftMs` 算术均值；降级状态在快照时从当前 handler 的 `isDegraded(now)` 读取（reload 后跟着新实例状态走）。
+- **近期错误**：失败请求最多 20 行、最新在前；`ts` 为落库时间（毫秒），错误摘要按 80 个字符截断。
+- **运行时长**：`NewServer` 记录 `startedAt`；格式 `2d 3h 14m` / `3h 14m` / `14m`。
+- **活跃连接**：hub 的原子连接计数（唯一 WS 端点 `/api/ws`）。
+- **活跃请求**：从 `serveChain` 开始到 `end` 之间的 AI 请求数。
+
+### 28.4 全局 WS 与快照（D9/D10）
+
+- 唯一 WebSocket 端点 `GET /api/ws`（旧 `/api/monitor` 已按 §24.11 H2 删除，带正确凭据返回 404）；新连接先收到 `snapshot`（含已结束 100 条 + 进行中 ≤200 条）与 `stats` 帧，再接收实时事件。
+- 新连接在 `101` 之后、注册进 hub 之前，先入队两帧：
+  1. `{"type":"snapshot","requests":[…],"stats":{…}}`，`requests` 为最近 100 条**已结束**请求，时间倒序，条目含 start 字段、end 字段、`chunks` 计数与 `ended:true`（不含逐 chunk 明细，满足“最小字段”）；
+  2. `{"type":"stats","ts":<毫秒>,"data":{…}}`。
+  随后是实时 `start`/`chunk`/`retry`/`end` 事件。
+- 快照环形缓冲固定 100 条，超出丢最旧；`POST /api/monitor/clear`（需登录）只清空该缓冲，不动累计计数、活跃请求与 WS 连接。
+- **采集开关变更**：每个 AI 请求始终创建 tracker，`start`/`end` 始终写入统计与环形缓冲；只有逐 trunk 的 `chunk`、`retry` 与事件广播受 `hasClients()` 控制。无客户端时不构造/发送任何 WS 帧，也不启动统计推送循环的空转广播。
+- **统计推送**：ticker 每 1 秒检查一次；有变化时距上次推送 ≥ 2 秒才推（合并节流），无变化时每 10 秒推一次心跳快照。只推给 `/api/ws` 订阅者。
+- 进行中的请求不在快照里（缓冲只存已结束请求）；前端下一轮按 `id` 合并实时事件与快照，并保证 `ended=true` 的行不被后续事件改回进行中。
+
+### 28.5 决策与未覆盖
+
+- **D-M10-1 旧端点的快照语义（已作废）**：§24.11 H2 已删除 `/api/monitor`，所有客户端统一走 `/api/ws` 并接收 snapshot/stats；此前的兼容取舍不再适用。
+- **D-M10-2 活跃 WS 客户端口径**：使用 hub 的连接原子计数；§24.11 H2 后仅剩 `/api/ws` 一个端点。
+- **D-M10-3 登录页资源**：`/admin/login` 返回独立资源 `internal/web/login.html`（`web.LoginHTML`），后端只负责路由与鉴权放行；表单交互（`next` 透传、错误提示）由前端轮次维护。
+- **D-M10-4 静态资源**：当前没有 `/admin/static/*` 资源，故只保留“若未来新增则免登录”的约定，不创建空路由。
+- **D-M10-5 分位数算法**：D7 未指定插值方式，统一用 nearest-rank（`ceil(p·n)-1`）。
+- **D-M10-6 TTFT 样本范围**：按 D7 原文取“已结束请求的 `ttftMs`”，非流式请求的 0 值也进入窗口；若前端希望只看流式请求，需要规格补充。
+- **D-M10-7 错误摘要截断**：按 80 个字符（rune）截断，不加省略号；`ts` 取结束时刻。
+- **D-M10-8 实例行排序**：D7 未指定顺序，按 `name` 升序输出，前端可自行重排。
+- **D-M10-9 会话与配置变更**：会话只记 token/用户/过期时间；reload 修改用户名或密码不会主动失效既有会话（D4 未要求）。
+- **D-M10-10 登出鉴权**：`POST /api/logout` 属于 `/api/*`，未登录时按第 ⑤ 级返回 401；已登录时删除服务端会话并清 cookie。
+- **D-M10-11 认证 cleanup 频率**：按要求在每次鉴权时清理过期项；未额外启动后台清理 goroutine（D4 的“另可”为可选）。
+- **D-M10-12 快照条目字段**：为保持“最小字段”，快照不含逐 chunk 时间轴；前端可据 `ts`/`durationMs`/`chunks`/`ttftMs` 画概览，切换到实时事件后再获得完整块。
+- **D-M10-13 统计循环生命周期**：首次有 `/api/ws` 客户端时启动一个 1 秒 ticker goroutine，进程生命周期内复用；无订阅者时跳过快照计算与广播。
+- **D-M10-14 `next` 的额外加固**：规格要求拒绝 `//` 与绝对 URL；实现同时拒绝反斜杠（浏览器可能把 `\` 规范化为 `/`）。
+- **D-M10-15 `/admin` 的 POST**：沿用页面路由 405，不参与 302；D6 的 302 仅指 GET 书签场景。
+
+## 29. 时间轴逐行等高与块内容类型着色（M10，§24.8 Y5/Y6）
+
+### 29.1 后端：`contentDeltas`
+
+- `sseState` 新增 `contentDeltas int`：`processLine` 解析出 `"type":"content_block_delta"` 时 +1。它统计 SSE 事件行数，不依赖上游 `usage`，因此 MTI/DeepSeek 只在流末上报 usage 也能逐块反映“本块是否含真实增量内容”。
+- `copySSE` 与 `tokens` 差分同构：`before := outcome.state.contentDeltas` → `feed(buf[:n])` → 本块 `contentDeltas = after - before`；`parse=false`（无法解码的 gzip 流）时保持 0。
+- `monitorChunkEvent` 新增 `contentDeltas`（int）；`requestMonitor.chunk(...)` 增加对应入参。
+- `deltaTokens` / `cumTokens` / `tokensKnown` 字段与口径完全不变（§23 日志仍按 usage）；新增字段只增不减。
+
+### 29.2 前端：Y5 删除的高度计算路径
+
+`.tl-wait`、`.tl-block`、`.tl-block.tok` 的几何尺寸只由 CSS 决定：`top: 50%`、`transform: translateY(-50%)`、`height: var(--tl-base-h)`（`--tl-base-h: 40%`，轨道 16px → 6.4px）。JS 不再对块或等待段写 `height`，也不再维护行内 token 阈值。
+
+被删除的标识符（Y5a 的 grep 校验清单，源码中不应再出现）：
+
+| 标识符 | 原用途 |
+|---|---|
+| `timelineTokenThreshold` | 取行内最大 `deltaTokens` 与 8 的较大者作为缩放阈值 |
+| `blockHeightPercent` | 按 `deltaTokens` 在 40%–100% 间计算块高 |
+| `refreshRowTimelineHeights` | 阈值变化时重算整行块高 |
+| `rowBaseHeightPercent` | 取行内最小块高作为等待段高度 |
+| `syncWaitHeight` | 把等待段高度同步为行内最小块高 |
+| `maxDelta` | 请求对象上缓存的当前行最大 `deltaTokens` |
+
+### 29.3 前端：Y6 着色判据与 tooltip
+
+- `monitorChunk` 把事件映射为内部 chunk：`content: event.contentDeltas || 0`；snapshot 的历史块读 `raw.contentDeltas || raw.content || 0`（历史摘要没有逐块内容信息，按 0 处理 → 蓝色）。
+- `appendTimelineChunk`：`chunk.content > 0` → `.tl-block.tok`（绿），否则蓝色。
+- tooltip 固定为 `#seq · bytes B · Δn tokens · 内容块 k · 累计 c · 距请求开始 x ms`，其中 `k = contentDeltas`，`Δn = deltaTokens`（X8 字段保留）。
+- 表头图例文字由「含新 token」改为「含内容块」，与判据一致。
+- 块宽/等待段宽度规则不变：仍按 `tsStart/tsEnd` 与首包时刻相对 `displaySpan` 的百分比定位。
+
+### 29.4 决策与未覆盖
+
+- **D-M10-16 OpenAI 流**：Y6 的判据是 Anthropic 的 `content_block_delta`；OpenAI `chat.completion.chunk` 不含该 `type`，因此 OpenAI 请求的块全部为蓝色。规格未要求为 OpenAI 另设判据，未自行推断。
+- **D-M10-17 历史快照**：snapshot 只保存 `end` 摘要（`chunks` 为计数，不存逐块内容）；刷新页面后历史行的摘要块按 `content=0` 画蓝。实时块从连接后的 `chunk` 事件开始着色。
+- **D-M10-18 非内容事件**：`message_start`、`content_block_start`、`content_block_stop`、`message_delta`、`message_stop`、`ping`、`[DONE]` 均不计入 `contentDeltas`。
+- **D-M10-19 `parse=false`**：无法解码的压缩流不解析事件，`contentDeltas` 恒为 0（与 `deltaTokens` 的未知口径一致）。
+- **D-M10-20 图例文字**：Y5/Y6 未要求改图例，但为避免继续误导「含新 token」，同步改为「含内容块」。
+
+## 30. 第六轮：tooltip 开始时间、自适应高度、快照完整化、OpenAI 判据（§24.9 Z1–Z5）
+
+### 30.1 Z1 时间轴元素显示请求开始时间
+
+- 新增 `formatClock(ts)`：`new Date(ts)` 本地时区，24 小时制，`HH:MM:SS.mmm`（毫秒固定 3 位）；`startTimeSuffix(ts)` 返回 ` · 开始 HH:MM:SS.mmm`。
+- 追加位置：`.tl-wait`（`等待首包 N ms` 之后）、`.tl-block`（`距请求开始 x ms` 之后）、`.tl-cursor`（`当前时刻` 之后）、`.tl-retry`（`（原因）` 之后）。原有 title 内容不删不改。
+- 快照恢复行走同一套 `positionRowTimeline` / `appendTimelineChunk`，`start.ts` 来自 snapshot 的 `ts`，因此同样带后缀；Z1b 的“同一请求一致”由同一个 `req.ts` 保证。
+- 表头图例色块/刻度不属于行内时间轴元素，不追加。
+
+### 30.2 Z2 页面高度自适应
+
+监控页（`body.monitor-mode`）改为纵向 flex：
+
+```css
+body.monitor-mode { min-height: 100vh; display: flex; flex-direction: column; }
+body.monitor-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 0; }
+#monitor-pane, #monitor-pane > .card { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.req-list { flex: 1 1 auto; min-height: 200px; min-width: 0; overflow: auto; }
+```
+
+- 删除原来的 `max-height: max(260px, min(620px, calc(100vh - 330px)))` 以及 `@media (max-width:1099px)` 的 `max-height: 60vh`。
+- 其他页面不受影响（`monitor-mode` 只在监控页添加）。视口高度 <600px 时允许纵向滚动，`min-height: 200px` 保证可用性。
+- 横向滚动仍只发生在 `.req-list` 内部（表格 `min-width:1100px`），整页不横滚。
+
+### 30.3 Z3 快照倒排与序号
+
+- `applyMonitorSnapshot` 合并完所有 snapshot 行后调用 `sortMonitorRequests()`：按 `ts` 降序排序 `monitor.reqs`，再把每行 `appendChild` 回 `<tbody>`（DOM 顺序与数组一致）。
+- 新增 `refreshMonitorIndexes()`：序号列取行在列表中的位置（1-based）。插入（实时/快照）、移除（清空/上限裁剪）后都会重排。
+- 实时新请求仍 `unshift` + `insertBefore(firstChild)` 插到最上面，然后重排序号。
+
+### 30.4 Z4 快照逐块明细
+
+- 新增 `monitorChunkSnapshot`（7 字段：`seq`/`tsStart`/`tsEnd`/`bytes`/`deltaTokens`/`contentDeltas`/`cumTokens`），`monitorRequestSnapshot.ChunksList` 以 `chunksList` 输出。
+- `requestMonitor.chunk(...)` 在客户端开关判断**之前**把精简副本追加到 `m.chunksList`：无 WS 客户端时也累积，保证“无客户端期间的请求”在之后连上时仍有绿块；该累积不影响统计口径。
+- `end()` 调 `compactChunkSnapshots`：≤400 原样复制；>400 时保留前 200 + 后 199 + 1 个合成块，共 400。合成块 `seq` 取被跳过区间首尾 `seq` 之和的一半（整数除），`bytes`/`deltaTokens`/`contentDeltas` 求和，`tsStart`/`tsEnd` 取区间首尾，`cumTokens` 取区间末块的累计值。
+- 前端 `ingestSnapshotRequest`：`Array.isArray(item.chunksList)` 时逐块还原（绿色判据 `contentDeltas > 0`）；字段缺失时才回退到旧的单摘要块路径（`chunks > 0 && durationMs > 0`）。
+- 内存边界：100 条 × 400 块 ≈ 4 万个小结构，且与快照机制一样不落盘。
+
+### 30.5 Z5 OpenAI 等价内容判据
+
+`sseState.processLine` 新增解析 `choices[].delta`：
+
+- `delta.content != ""`、`delta.reasoning_content != ""`、任一 `delta.tool_calls[].function.arguments != ""` → 本块计入内容（三者同时出现也只 +1）。
+- `role` 首块、`finish_reason` 块、空 `delta`、空 `choices`、`[DONE]`、`: keep-alive` 注释行不计。
+- Anthropic 判据不变（每条 `content_block_delta` +1）；`deltaTokens`/`cumTokens`/`tokensKnown` 与 §23 日志口径完全不动。
+
+### 30.6 决策与未覆盖
+
+- **D-M10-21 400 上限与“前 200 + 后 200 + 合成块”的算术冲突**：字面为 401 块，与 Z4c 的 `≤400` 冲突。实现取 **前 200 + 合成 1 + 后 199 = 400**，保证硬上限；被跳过区间从原索引 200 到 `len-200`（含），合成块覆盖的字节/内容/时间跨度均为该区间真实值。
+- **D-M10-22 逐块累积时机**：始终累积（包括无客户端），因为 D9 的统计/环形缓冲本就无客户端也工作；逐块列表只在 `end()` 时压缩一次。
+- **D-M10-23 快照块类型**：采用独立精简结构而不是复用 `monitorChunkEvent`，避免在 JSON 中带出 `type`/`id`/`tokensKnown` 空字段；字段集合与 Z4 列表逐字一致。
+- **D-M10-24 Z4a 的“切页不刷新”**：本应用是服务端多页路由，点击“统计”再点“实时监控”是一次导航（页面重载 + 新 WS 快照），并非 SPA 保留 DOM。因此 Z4a 与 Z4b 都依赖同一份 `chunksList`；若未来改成 SPA，DOM 不会被销毁，绿块自然保留。
+- **D-M10-25 排序稳定性**：`sortMonitorRequests` 按 `ts` 降序；同一毫秒的多个请求保持数组原顺序（现代 JS 的稳定排序）。序号按位置而非创建顺序。
+- **D-M10-26 历史快照的 retry 标记**：快照只保存块，不保存 retry 事件，因此刷新后历史行不显示重试虚线；规格未要求。
+- **D-M10-27 OpenAI 旧式 `delta.function_call`**：Z5 只列 `tool_calls[].function.arguments`，旧式 `function_call.arguments` 未纳入判据；未自行扩展。
+- **D-M10-28 非字符串 delta**：`content`/`reasoning_content` 为 JSON null 时解码为空串（不计）；若为对象等非字符串类型，整条事件解析失败而跳过，与现有解析容错一致。
+- **D-M10-29 Z5b 的观测边界**：判据按 SSE **事件**定义。真实上游可能把若干内容事件与 `finish_reason` / `[DONE]` 合并在同一次 TCP 写里，此时该 trunk 的 `contentDeltas` 为正（内容事件仍然正确计数）。验收用「Σ 块 contentDeltas == 原始 SSE 内容事件数」证明边界事件未额外计数；单测 `TestContentDeltasOpenAICriteria` / `TestChunkEventContentDeltasOpenAIOverWS` 逐事件覆盖 `role`/`finish_reason`/`[DONE]` 为 0。
+- **D-M10-30 真实 OpenAI 验收模型**：按要求以 `POST /v1/chat/completions` 验证，但样本 body 里的 `claude-sonnet-5` 在本环境上游没有 OpenAI 通道（503 `model_not_found`），因此改用已配置的 `mti-pro` 获取真实流；协议与判据不变。
+
+## 31. 第七轮：OpenAI 模型语义、统计落盘、数值可读化（§24.10 A/B/C）
+
+### 31.1 A 组：OpenAI 协议模型语义
+
+- **Anthropic 入口**（`/v1/messages`、`/anthropic/v1/messages`）：请求 `model` 是角色名（`sonnet`/`opus`/`fable`/`haiku` 或对外 `claude-*` 名称），由实例 `roles`/`role_names` 映射到上游模型。
+- **OpenAI 入口**（`/v1/chat/completions`）：请求 `model` 就是上游模型名自身，代理不做角色映射，原样透传；可用集合是各实例 `models` 列表的并集。
+- 因此向 OpenAI 入口传 `claude-*` 属于用户错误，上游的 4xx/5xx 原样透传；路由层不拦截（纯透传，§24.10 A1）。
+- `/v1/models`（OpenAI）：按「实例顺序 + 实例内顺序」遍历 `models`，首次出现去重；`owned_by` 为该模型的**首个声明实例名**；实例没有 `name` 时回退为 `model-router`。集合不会混入 Anthropic 角色名（§24.10 A2）。
+
+### 31.2 B 组：统计落盘（D11）
+
+文件：`filepath.Dir(configPath)/stats.json`，与配置同目录。
+
+```json
+{
+  "schema": 1,
+  "requests": {"total": 12, "success": 11, "failed": 1},
+  "byProtocol": {"openai": 8, "anthropic": 4},
+  "inTokens": 1200, "outTokens": 3400,
+  "genOutTokens": 3000, "genMs": 71000,
+  "retries": 2,
+  "instances": [{"name":"MTI","requests":12,"success":11,"failed":1,"ttftCount":12,"ttftSumMs":1440,"genOutTokens":3000,"genMs":71000}],
+  "recentErrors": [{"ts":1700000000000,"status":502,"instName":"MTI","upstreamModel":"m","model":"sonnet","error":"…"}]
+}
+```
+
+- 落盘内容：累计计数、按协议计数、in/out tokens、`genOutTokens`/`genMs`（用于重启后恢复平均 t/s）、重试数、各实例累计（请求/成功/失败/TTFT 样本数与和/生成 tokens 与时长）、近期错误 ≤20。
+- 不落盘：100 条请求快照、TTFT/耗时 1000 样本窗口、活跃连接/请求、QPS、运行时长（D11）。
+- 写入：`statsAggregator` 在 `finish`/`retry`/clear 时置 dirty；后台每秒检查一次，距上次写 ≥5 秒且 dirty 才写；`os.CreateTemp` 同目录临时文件 → `Sync` → `Rename` 原子替换；失败保留 dirty 并在下一 tick 重试，只记 warning。
+- 生命周期：`NewServer` 只做加载（`attachStore`）；`main` 调用 `Server.StartPersistence()` 启动写盘回调，`Server.Close()` 关闭并强制补写，`SIGINT`/`SIGTERM` 与 HTTP 优雅关闭走同一路径。`NewServer` 不启动 goroutine，避免测试中产生额外写盘。
+- 加载：文件缺失 → 零值；JSON 解析失败、schema != 1、计数器为负或 `total < success + failed` → `warning` 日志 + 改名为 `stats.json.bad`（先删旧 `.bad`）+ 零值启动，绝不阻止启动；恢复时近期错误截断到 20 条、分位数窗口保持空（样本 <10 → null）。
+- 实例键为 `name`；加载后若某实例已不在配置中，D7 的实例表仍列出该行并带 `removed: true`，前端显示「已移除」（D11）。
+- `POST /api/stats/clear`（需登录，POST）：清零累计值、实例计数、近期错误与分位数窗口，立即落盘；**不动** 100 条请求快照（与 `/api/monitor/clear` 互不调用）。
+
+### 31.3 C 组：统计页数值可读化
+
+- **时间**（TTFT/总耗时 P50、P95、实例平均 TTFT）：`<1000ms` → 整数 `ms`；`≥1000ms` → 秒 2 位小数；`≥3600s` → 小时 1 位小数（`1.0h`）。运行时长保持 `2d 3h 14m`。
+- **计数**（累计/成功/失败、按协议、输入/输出 tokens、重试、实例请求/成功/失败）：`<1000` 原样；`≥1000` → `K` 1 位小数；`≥1e6` → `M` 2 位小数；先按原值选单位再舍入，若舍入后跨单位（999.96K → 1.00M）重新取单位。
+- **速率/百分比**：t/s、成功率、QPS、实例占比保持 1 位小数。
+- **精确值**：所有缩写单元格的 `title` 显示千分位精确值（`62,147`）；P50/P95 的 title 为 `P50 1,234ms · P95 5,678ms`。
+- 验收钩子：`window.__modelRouterStatsRender(statsObject)` 暴露统计渲染函数，供 CDP 构造数据验证，不参与业务逻辑。
+
+### 31.4 镜像与卷
+
+- `Dockerfile` 在运行阶段复制一份非 root 所有的占位 `config.json` 到 `/home/nonroot/config`，然后声明 `VOLUME ["/home/nonroot/config"]`：具名卷首次创建会继承 65532 属主，非 root 进程可直接写 `stats.json`。
+- `docker-compose.yml` 保留 `./.docker:/home/nonroot/config:rw` 并注明统计与配置一起持久化；新增 `docker-compose.named.yml`，用具名卷 `model-router-config`，端口可用 `MODEL_ROUTER_PORT` 覆盖。
+- distroless 以 uid/gid 65532 运行；Linux bind mount 由 root 创建时，正确做法是 `sudo chown -R 65532:65532 ./.docker`（或用部署系统的 `fsGroup`），不使用 `chmod 777`。
+
+### 31.5 决策与未覆盖
+
+- **D-M10-31 `owned_by` 回退**：实例没有 `name` 时用 `model-router`，保持旧测试与默认配置的可读性；有名字时必须用名字。
+- **D-M10-32 持久化字段**：在 D11 列表基础上显式保存 `genOutTokens`/`genMs`，以便重启后平均 t/s 与实例行一致；这仍属于累计值，不违反“只落盘累计统计”。
+- **D-M10-33 clear 与分位数**：规格只写“清零累计值与近期错误”；实现同时清空分位数窗口，避免出现“累计为 0 但 P50 有值”的矛盾展示。请求快照不受影响。
+- **D-M10-34 写盘生命周期**：由 `main` 显式 `StartPersistence`，而不是 `NewServer` 自动启动，避免所有测试 Server 都起一个写盘 goroutine；忘记启动时统计仍工作，只是不落盘。
+- **D-M10-35 损坏判定**：除解析失败/schema 不符外，负计数与 `total < success+failed` 也按损坏处理；未知 JSON 字段忽略，便于向后兼容。
+- **D-M10-36 具名卷初始配置**：镜像内置 `config.example.json` 的占位副本，使 `docker-compose.named.yml` 首次启动即可运行；密钥为占位值，README 要求替换。
+- **D-M10-37 权限验证**：本机为 Windows + Docker Desktop，bind mount 本身可写；Linux 宿主 root 属主目录的 `chown 65532:65532` 是标准做法，但本机无法复现 Linux 属主场景，报告里注明验证边界。
+- **D-M10-38 计数舍入**：`979999` → `980.0K`（先按原值选 K，再对 `979.999` 四舍五入到 1 位）；`999960` → `1.00M`（跨单位重取）。M 及以上未定义新单位，不自行扩展 G/T。
+- **D-M10-39 title 精确值**：缩写单元格都设置 `title`；未缩写的时间/百分比不加 title，避免噪声。
+- **D-M10-40 已移除实例**：`removed` 标志由快照时当前配置推导，不写入 `stats.json`（配置变化后自动重算）。
+
+## 32. 第八/九轮：进行中快照、删除旧 WS 路径、JSON 页自适应（§24.11 H / §24.12 J）
+
+### 32.1 H1 进行中请求进快照
+
+- `monitorHub` 新增活动集合 `active []*requestMonitor`（`activeMu` 保护，按创建顺序，硬上限 **200**；超出丢弃最早项）。`trackRequest` 创建 tracker 即注册，`end()` 完成后移除。
+- `requestMonitor` 新增 `mu` 与 `finished`/`cumTokens`：`begin`/`chunk`/`end` 在锁内更新状态；`snapshotInProgress(now)` 在锁内生成 `ended:false` 行，字段包括 `id/ts/method/path/protocol/reqModel/clientIP/userAgent/instName/upstreamModel/status(0)/durationMs(now-start)/inTokens(0)/outTokens(累计 cumTokens)/chunks/chunksList(同一 400 块压缩规则)/ttftMs/genMs/tps`。
+- `snapshotRequests()` 合并「已结束 100 条环形缓冲」与「进行中 ≤200 条」，按 `ts` 降序稳定排序；同一 `id` 同时出现时保留 `ended:true` 的记录。
+- `end()` 顺序：锁内生成 ended 快照并置 `finished=true` → `stats.finish`（写入环形缓冲）→ `removeActive` → 广播 `end`。这样快照若在结束瞬间生成，要么看到 ended 记录，要么看到进行中记录并能继续收到 `end`。
+- `serveWS` 在 `h.mu` 内完成「生成 snapshot/stats 帧 → 入队 → 注册连接」：广播无法插入期间，连接不会漏掉结束事件；之后才启动统计循环与读写 goroutine。
+- 前端：`ended:false` 的快照行按进行中渲染（`baseDurationMs` + 本地流逝时间），时间轴右端保留游标；同一 `id` 的 `chunk`/`end` 走正常 `monitorChunk`/`applyMonitorEnd` 续接。`monitorChunk` 按 `seq` 去重，避免「快照已含该块 + 该块实时事件随后到达」重复绘制；`end` 到达后游标移除、行结束。
+
+### 32.2 H2 删除 `/api/monitor`
+
+- 删除 `PathMonitor` 常量、路由与 `serveWS` 的兼容分支；`/api/monitor` 现在是普通未匹配 API 路径：带正确凭据走管理面默认分支返回 **404**，无凭据仍是 401，均不升级连接。
+- `?user=&password=` 回退只保留给 `/api/ws`；`isWSPath` 只匹配 `/api/ws`。
+- 所有客户端（唯一端点）都接收 snapshot/stats 帧；`hasStatsClients`/`wantsStats` 随之删除。
+- 测试改写：`dialMonitor` 目标改为 `/api/ws`；`readEventsUntilEnd` 跳过 snapshot/stats 帧；`TestMonitorNoHistoryReplay` 改写为 `TestWSHistoryOnlyViaSnapshot`（历史只在 snapshot 出现、不再作为实时事件回放）；新增 `TestRemovedMonitorRoute` 覆盖 404/401/101。其余 monitor 测试断言未改。
+
+### 32.3 J JSON 高级页编辑框自适应
+
+```css
+body.json-mode { min-height: 100vh; display: flex; flex-direction: column; }
+body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+#json-pane { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+#json-pane > .card { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+#json-editor { flex: 1 1 auto; min-height: 240px; resize: none; }
+```
+
+- `#json-pane` 的状态行、标题、提示、结果区与按钮组 `flex: 0 0 auto`，编辑框占据剩余空间。
+- 全局 `textarea { min-height:480px; resize:vertical }` 未改；`#json-editor` 以 ID 优先级覆盖高度与 resize，配置页 textarea 保持原行为。
+- 视口 <600px 时允许整页滚动，`min-height:240px` 兜底。
+
+### 32.4 决策与未覆盖
+
+- **D-M10-41 进行中字段口径**：`inTokens` 在流中不可知，固定 0；`outTokens` 用 `cumTokens`（usage 累计，通常流末才非 0）；`status` 为 0；`durationMs` 为取快照时刻的耗时。这些字段在 `end` 后用最终值覆盖。
+- **D-M10-42 200 条上限**：被丢弃的活动请求仍在运行并继续向已连接客户端广播事件，只是不再出现在后续快照中；不中断请求。
+- **D-M10-43 快照/事件竞态**：后端用 `h.mu` 原子化「快照+注册」，前端按 `seq` 去重；两层共同保证 H3b 的无缝续接。
+- **D-M10-44 快照顺序**：`ts` 降序使用稳定排序，同毫秒请求保持「已结束在前、进行中在后」的输入顺序。
+- **D-M10-45 `/api/monitor` 鉴权前行为**：H3f 只规定带正确凭据 404；无凭据时仍按管理面规则 401（不会 101），不额外放行。
+- **D-M10-46 旧路径 `/api/monitor/clear`**：这是清空接口而非 WS 端点，按 D10 保留，不受 H2 影响。
+- **D-M10-47 J 页 body class**：按 `PAGE === 'json'` 添加 `json-mode`，与监控页 `monitor-mode` 并列；其他页面不受影响。
+
+## 33. 第十轮：项目品牌化（§24.13 K）
+
+### 33.1 展示名与英文标识
+
+- 展示名「模型智能路由」只用于 `<title>`、页面左上角、PAGE_TITLES、README 标题与文档描述。
+- `model-router` 保持不变：Go module 路径、二进制名、镜像 tag `wuzm219/model-router`、compose 服务名、`config.json`、`MODEL_ROUTER_*` 环境变量、JSON 字段、HTTP 头、Cookie、日志行、包名、测试名、URL。`index.html` / `login.html` 中已不存在 `model-router` 可见文字。
+
+### 33.2 资源分工与路由
+
+- `internal/web/logo.svg`：手写矢量，`viewBox 0 0 256 256`，深色圆角底板 `<rect rx=58>` + 上下两段渐变圆弧 + 三条汇聚短线 + 白色箭头；24px 与 16px 下保持可辨认。页面用 `<img src="/admin/logo.svg" width="24" height="24">`。
+- `internal/web/favicon.ico`：由 `docs/assets/logo-source-256.png` 离线转换（Node 无损解码 PNG → 面积平均缩放 → 16/32/48 用 32 位 BMP 条目、64/128/256 用 PNG 条目），提交进仓库，运行期不做转换。多尺寸原因：浏览器标签页/书签/任务栏会选取不同尺寸，缺 16/32/48 会导致缩放模糊。
+- `GET /favicon.ico`：在 `Server.ServeHTTP` 最前面、鉴权之前直接处理。浏览器请求 favicon 不会带 Cookie/Authorization，若走管理面鉴权会被 302 到登录页，标签栏图标永远不显示；因此该路径必须匿名 200。`admin_password` 为空时同样返回 200。
+- `GET /admin/logo.svg`：走正常管理面鉴权（页面内 `<img>` 会带会话 Cookie），未登录 302 到 `/admin/login`。两者都带 `Cache-Control: public, max-age=86400`。
+
+### 33.3 布局
+
+- `<h1 class="brand">` 内含 `<img>` 与 `<span>模型智能路由</span>`；`.brand { display:flex; align-items:center; gap:8px }`，图标 `24×24`、`flex:none`，文字 `white-space:nowrap`。登录页复用同一规则。
+- 现有 header 的 `flex-wrap: wrap` 保留；1000×900 下品牌区 + 四个导航按钮 + 状态文字仍在同一行。
+
+### 33.4 决策与未覆盖
+
+- **D-M10-48 favicon 与鉴权的关系**：将 `/favicon.ico` 放在鉴权判断之前，而不是加入 `adminRequestAllowed` 白名单；因为它本身不在 `/admin` 或 `/api` 前缀下，放白名单也无法到达静态处理器。
+- **D-M10-49 ICO 编码**：16/32/48 使用传统 BMP 条目以兼容较旧的图标读取器，64/128/256 使用 PNG 条目；源图四角 alpha=0，无需额外抠图。
+- **D-M10-50 Logo 与源图**：SVG 按源图造型重绘（圆弧角度、三段渐变、箭头比例），未引入新元素；不同屏幕尺寸下渐变色标位置由 `gradientUnits="userSpaceOnUse"` 固定。
+- **D-M10-51 非 AI 日志测试调整**：`TestNonAICallOmitsTokenSegment` 原用 `/favicon.ico` 触发“未路由请求”日志；favicon 现在是静态资源、不再经过 AI handler，因此改用 `/health` 未知路径，断言意图（无模型/ token 段）不变。

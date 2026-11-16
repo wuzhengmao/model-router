@@ -1132,10 +1132,15 @@ func TestModelsOpenAI(t *testing.T) {
 		t.Errorf("object = %q, want %q", list.Object, "list")
 	}
 	ids := make([]string, 0, len(list.Data))
+	owners := map[string]string{
+		"gpt-a": first.URL,
+		"gpt-b": first.URL,
+		"gpt-c": second.URL,
+	}
 	for _, item := range list.Data {
 		ids = append(ids, item.ID)
-		if item.Object != "model" || item.OwnedBy != "model-router" || item.Created <= 0 {
-			t.Errorf("model entry has wrong shape: %+v", item)
+		if item.Object != "model" || item.OwnedBy != owners[item.ID] || item.Created <= 0 {
+			t.Errorf("model entry has wrong shape (owned_by must name the declaring instance): %+v", item)
 		}
 	}
 	want := []string{"gpt-a", "gpt-b", "gpt-c"}
@@ -1229,6 +1234,13 @@ func TestModelsOpenAICapabilities(t *testing.T) {
 	entries := decodeOpenAIModelEntries(t, resp)
 
 	wantIDs := []string{"m-pro", "m-fallthrough", "m-none", "m-both", "m-pdf"}
+	wantOwner := map[string]string{
+		"m-pro":         "https://openai-a.example",
+		"m-fallthrough": "https://openai-a.example",
+		"m-none":        "https://openai-a.example",
+		"m-both":        "https://openai-a.example",
+		"m-pdf":         "https://openai-b.example",
+	}
 	ids := make([]string, 0, len(entries))
 	byID := make(map[string]openAIModelEntryJSON, len(entries))
 	for _, entry := range entries {
@@ -1237,8 +1249,8 @@ func TestModelsOpenAICapabilities(t *testing.T) {
 			t.Errorf("model %q appears more than once (ids %v)", entry.ID, ids)
 		}
 		byID[entry.ID] = entry
-		if entry.Object != "model" || entry.OwnedBy != "model-router" || entry.Created <= 0 {
-			t.Errorf("model %q has wrong base shape: %+v", entry.ID, entry)
+		if entry.Object != "model" || entry.OwnedBy != wantOwner[entry.ID] || entry.Created <= 0 {
+			t.Errorf("model %q has wrong base shape (owned_by must name the declaring instance): %+v", entry.ID, entry)
 		}
 	}
 	if !reflect.DeepEqual(ids, wantIDs) {
@@ -1852,8 +1864,8 @@ func TestModelsSchemaIsDecidedByPath(t *testing.T) {
 			if list.Object != "list" || len(list.Data) != 1 || list.Data[0].ID != "gpt-a" {
 				t.Fatalf("openai list = %+v, want object=list data=[gpt-a]", list)
 			}
-			if len(list.Data[0].Type) != 0 || list.Data[0].OwnedBy != "model-router" {
-				t.Errorf("entry = %+v, want OpenAI base shape without type", list.Data[0])
+			if len(list.Data[0].Type) != 0 || list.Data[0].OwnedBy != "https://openai.example" {
+				t.Errorf("entry = %+v, want OpenAI base shape without type and owned_by=instance", list.Data[0])
 			}
 		})
 	}
@@ -2020,25 +2032,29 @@ func TestAdminDisabled(t *testing.T) {
 func TestAdminAuth(t *testing.T) {
 	server, _ := newAdminServer(t, adminTestConfig)
 
-	t.Run("admin page requires basic auth", func(t *testing.T) {
-		resp := send(t, http.MethodGet, server.URL+"/admin", "", nil)
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("status = %d, want 401", resp.StatusCode)
+	t.Run("admin page requires login", func(t *testing.T) {
+		resp := noRedirectRequest(t, http.MethodGet, server.URL+"/admin", "", nil)
+		if resp.StatusCode != http.StatusFound {
+			t.Fatalf("status = %d, want 302", resp.StatusCode)
 		}
-		if got := resp.Header.Get("WWW-Authenticate"); !strings.Contains(got, `Basic realm="model-router"`) {
-			t.Errorf("WWW-Authenticate = %q, want Basic realm", got)
+		if got := resp.Header.Get("Location"); !strings.HasPrefix(got, "/admin/login") {
+			t.Errorf("Location = %q, want /admin/login prefix", got)
 		}
 	})
 
-	t.Run("wrong password rejected", func(t *testing.T) {
-		resp := sendBasic(t, http.MethodGet, server.URL+"/admin", "", "admin", "wrong")
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Errorf("status = %d, want 401", resp.StatusCode)
+	t.Run("wrong password falls back to login", func(t *testing.T) {
+		resp := noRedirectRequest(t, http.MethodGet, server.URL+"/admin", "", basicAuthHeader("admin", "wrong"))
+		if resp.StatusCode != http.StatusFound {
+			t.Errorf("status = %d, want 302", resp.StatusCode)
 		}
 	})
 
 	t.Run("authorized admin page", func(t *testing.T) {
-		resp := sendBasic(t, http.MethodGet, server.URL+"/admin", "", "admin", "secret")
+		resp := noRedirectRequest(t, http.MethodGet, server.URL+"/admin", "", basicAuthHeader("admin", "secret"))
+		if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/admin/" {
+			t.Fatalf("status = %d, want 302 to /admin/", resp.StatusCode)
+		}
+		resp = sendBasic(t, http.MethodGet, server.URL+"/admin/", "", "admin", "secret")
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("status = %d, want 200", resp.StatusCode)
 		}
@@ -2046,7 +2062,9 @@ func TestAdminAuth(t *testing.T) {
 			t.Errorf("Content-Type = %q, want text/html", got)
 		}
 		body := readBody(t, resp)
-		if !strings.Contains(body, "<!DOCTYPE html>") || !strings.Contains(body, "model-router") {
+		// §24.13: the visible brand is now「模型智能路由」; the English identifier
+		// remains only in code/paths, so the embedded-UI marker follows the brand.
+		if !strings.Contains(body, "<!DOCTYPE html>") || !strings.Contains(body, "模型智能路由") {
 			t.Errorf("admin page body does not look like the embedded UI")
 		}
 	})
@@ -2928,8 +2946,9 @@ func TestRequestLogFormat(t *testing.T) {
 }
 
 // TestNonAICallOmitsTokenSegment covers §23 D1: a call that never reached a
-// route (favicon, health probe, unknown path) prints neither the model segment
-// nor the "↑n/a ↓n/a" token segment.
+// route (health probe, unknown path) prints neither the model segment nor the
+// "↑n/a ↓n/a" token segment. (Since §24.13 the favicon is a static asset
+// served before the AI handler, so an unknown path is used here.)
 func TestNonAICallOmitsTokenSegment(t *testing.T) {
 	backend, _, _ := newBackend(t, http.StatusOK, nil, `{"ok":true}`)
 	instance := anthropicInstance(backend.URL, anthropicKey, map[string]string{"sonnet": "model-a"})
@@ -2937,14 +2956,14 @@ func TestNonAICallOmitsTokenSegment(t *testing.T) {
 	proxyServer := newProxy(t, serviceToken, instance)
 	logs := captureLogs(t)
 
-	resp := send(t, http.MethodGet, proxyServer.URL+"/favicon.ico", "", map[string]string{
+	resp := send(t, http.MethodGet, proxyServer.URL+"/health", "", map[string]string{
 		"x-api-key":  serviceToken,
 		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
 	})
 	_ = resp.Body.Close()
 
-	line := logLineContaining(t, waitForLog(t, logs, "GET /favicon.ico in "), "GET /favicon.ico in ")
-	for _, want := range []string{"GET /favicon.ico in ", " from 127.0.0.1 Mozilla/5.0"} {
+	line := logLineContaining(t, waitForLog(t, logs, "GET /health in "), "GET /health in ")
+	for _, want := range []string{"GET /health in ", " from 127.0.0.1 Mozilla/5.0"} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("log line missing %q: %s", want, line)
 		}

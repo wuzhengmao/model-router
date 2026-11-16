@@ -1,0 +1,20 @@
+# §24.10 B2 示例：用具名卷持久化配置目录（config.json 与 stats.json 同目录）。
+# 不映射宿主目录时，容器重建/删除后可继续复用该卷。
+# 用法：
+#   docker compose -f docker-compose.named.yml up -d
+#   # 已有 ./config.json 时可复制进卷（distroless 无 shell）：
+#   docker cp ./config.json model-router-model-router-1:/home/nonroot/config/config.json
+services:
+  model-router:
+    build: .
+    image: wuzm219/model-router:0.1.1
+    ports:
+      - "${MODEL_ROUTER_PORT:-18080}:18080"
+    environment:
+      MODEL_ROUTER_LISTEN: "0.0.0.0:18080"
+    volumes:
+      - model-router-config:/home/nonroot/config
+    restart: unless-stopped
+
+volumes:
+  model-router-config:

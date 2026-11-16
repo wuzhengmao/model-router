@@ -37,6 +37,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("init proxy: %v", err)
 	}
+	app.StartPersistence()
+	defer app.Close()
 
 	server := &http.Server{
 		Addr:              cfg.Listen,
@@ -65,6 +67,7 @@ func main() {
 	select {
 	case err := <-serveErr:
 		if !errors.Is(err, http.ErrServerClosed) {
+			app.Close()
 			log.Fatalf("serve: %v", err)
 		}
 	case <-ctx.Done():
@@ -74,5 +77,6 @@ func main() {
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("shutdown: %v", err)
 		}
+		app.Close()
 	}
 }

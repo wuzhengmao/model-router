@@ -121,6 +121,7 @@ type Options struct {
 type Handler struct {
 	authToken          string
 	byProtocol         map[protocol][]*instanceRuntime
+	monitor            *monitorHub
 	now                func() time.Time
 	failureThreshold   int
 	degradeDuration    time.Duration
@@ -397,11 +398,17 @@ func (h *Handler) openAIModelList() openAIModelList {
 				continue
 			}
 			seen[model] = true
+			// §24.10 A2: owned_by names the first instance that declares the
+			// model, unless the instance has no display name.
+			owner := inst.name
+			if owner == "" {
+				owner = "model-router"
+			}
 			entry := openAIModelEntry{
 				ID:      model,
 				Object:  "model",
 				Created: now,
-				OwnedBy: "model-router",
+				OwnedBy: owner,
 			}
 			if capability, ok := openAIModelCapability(instances, model); ok {
 				applyOpenAIModelCapability(&entry, capability)
@@ -843,44 +850,59 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 	chain := buildChain(proto, insts, body)
 	now := h.now()
 
+	tracker := h.monitor.trackRequest(r, proto, reqModel)
+	finalStatus := 0
+	var finalMetrics attemptMetrics
+	var finalErr error
+	defer func() { tracker.end(finalStatus, finalErr, finalMetrics) }()
+
 	attempted := false
 	// last is the candidate that failed before any response was written. Its
 	// model information goes into the final log line so that a failed routed
 	// call still shows which instance/model was tried (§23 only drops the
 	// segment for traffic that never reached a route).
 	var last *candidate
-	for _, cand := range chain {
+	for i, cand := range chain {
 		if cand.inst.isDegraded(now) {
 			continue
 		}
 		attempted = true
-		committed, metrics, err := h.tryCandidate(w, r, proto, cand, body)
+		tracker.begin(cand)
+		committed, status, metrics, err := h.tryCandidate(w, r, proto, cand, body, tracker)
 		if committed {
 			if err != nil {
 				log.Printf("%s %s response committed with error: %v", r.Method, r.URL.Path, err)
 			}
 			metrics.reqModel = reqModel
+			finalStatus, finalMetrics, finalErr = status, metrics, err
 			logRequest(r, metrics, time.Since(start))
 			return
 		}
 		log.Printf("%s %s candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.name, err)
 		last = cand
+		finalMetrics = metrics
+		if i+1 < len(chain) {
+			tracker.retry(chain[i+1], retryReason(err))
+		}
 	}
 
 	if !attempted && len(chain) > 0 {
 		// All candidates are in sustained degradation: force the chain head once.
 		cand := chain[0]
-		committed, metrics, err := h.tryCandidate(w, r, proto, cand, body)
+		tracker.begin(cand)
+		committed, status, metrics, err := h.tryCandidate(w, r, proto, cand, body, tracker)
 		if committed {
 			if err != nil {
 				log.Printf("%s %s forced response committed with error: %v", r.Method, r.URL.Path, err)
 			}
 			metrics.reqModel = reqModel
+			finalStatus, finalMetrics, finalErr = status, metrics, err
 			logRequest(r, metrics, time.Since(start))
 			return
 		}
 		log.Printf("%s %s forced candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.name, err)
 		last = cand
+		finalMetrics = metrics
 	}
 
 	if last != nil {
@@ -893,6 +915,8 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 	}
 	log.Printf("%s %s -> (%s) total=%ss status=502 all candidates failed",
 		r.Method, r.URL.Path, proto, formatSeconds(time.Since(start)))
+	finalStatus = http.StatusBadGateway
+	finalErr = errors.New("upstream request failed")
 	writeProtocolError(w, proto, http.StatusBadGateway, "upstream request failed")
 }
 
@@ -1296,7 +1320,7 @@ func logRequest(r *http.Request, m attemptMetrics, total time.Duration) {
 // (at least partially) written to the client, so no further candidate may be
 // tried. A non-nil error with committed=false is a retryable pre-response
 // failure (connection/dial/response-header/first-token-timeout errors).
-func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto protocol, cand *candidate, body []byte) (committed bool, m attemptMetrics, err error) {
+func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto protocol, cand *candidate, body []byte, tracker *requestMonitor) (committed bool, status int, m attemptMetrics, err error) {
 	m.instName = cand.inst.name
 	m.model = cand.model
 	m.hasModel = true
@@ -1308,7 +1332,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	target, err := url.JoinPath(cand.inst.baseURL.String(), upstreamPath(r.URL.Path))
 	if err != nil {
 		h.recordFailure(cand.inst)
-		return false, m, fmt.Errorf("join upstream URL: %w", err)
+		return false, 0, m, fmt.Errorf("join upstream URL: %w", err)
 	}
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
@@ -1317,7 +1341,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(attemptBody))
 	if err != nil {
 		h.recordFailure(cand.inst)
-		return false, m, fmt.Errorf("build upstream request: %w", err)
+		return false, 0, m, fmt.Errorf("build upstream request: %w", err)
 	}
 	outReq.ContentLength = int64(len(attemptBody))
 
@@ -1341,7 +1365,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	resp, err := cand.inst.client.Do(outReq)
 	if err != nil {
 		h.recordFailure(cand.inst)
-		return false, m, fmt.Errorf("upstream request: %w", err)
+		return false, 0, m, fmt.Errorf("upstream request: %w", err)
 	}
 	defer resp.Body.Close()
 	headersAt := time.Now()
@@ -1361,7 +1385,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 		gz, gzErr := newGzipBody(resp.Body, streaming)
 		if gzErr != nil {
 			h.recordFailure(cand.inst)
-			return false, m, fmt.Errorf("decompress upstream gzip body: %w", gzErr)
+			return false, 0, m, fmt.Errorf("decompress upstream gzip body: %w", gzErr)
 		}
 		respBody = gz
 	default:
@@ -1390,20 +1414,23 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 		// For streams, headers are committed together with the first data chunk
 		// so a first-token timeout can still fail over to another instance.
 		outcome, streamErr := h.copySSE(w, respBody, h.idleTimeout, h.firstTokenTimeout,
-			h.minTokensPerSecond, proto == protocolAnthropic, parseable, writeResponseHead)
+			h.minTokensPerSecond, proto == protocolAnthropic, parseable, writeResponseHead, tracker)
 		if outcome.firstTokenTimeout {
 			h.recordFailure(cand.inst)
-			return false, m, fmt.Errorf("first token timeout after %s", h.firstTokenTimeout)
+			return false, 0, m, &attemptFailure{
+				reason: retryReasonFirstTokenTimeout,
+				err:    fmt.Errorf("first token timeout after %s", h.firstTokenTimeout),
+			}
 		}
 		if !outcome.committed {
 			if streamErr != nil {
 				h.recordFailure(cand.inst)
-				return false, m, fmt.Errorf("read stream: %w", streamErr)
+				return false, 0, m, fmt.Errorf("read stream: %w", streamErr)
 			}
 			// Empty stream: commit the (empty) response and treat as success.
 			writeResponseHead()
 			cand.inst.recordSuccess()
-			return true, m, nil
+			return true, resp.StatusCode, m, nil
 		}
 
 		if outcome.chunks > 0 {
@@ -1417,14 +1444,14 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 			if proto == protocolAnthropic && !outcome.state.finished {
 				if err := writePauseTurnTail(w, &outcome.state); err != nil {
 					h.recordFailure(cand.inst)
-					return true, m, fmt.Errorf("write pause_turn tail: %w", err)
+					return true, resp.StatusCode, m, fmt.Errorf("write pause_turn tail: %w", err)
 				}
 			} else if proto == protocolOpenAI {
 				truncateClientConnection(w)
 			}
 			h.recordFailure(cand.inst)
 			log.Printf("instance %s idle for %s; stream terminated", cand.inst.name, h.idleTimeout)
-			return true, m, nil
+			return true, resp.StatusCode, m, nil
 		}
 		if outcome.slow {
 			// §19 real-time low throughput: the verdict already implies a failed
@@ -1433,14 +1460,14 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 			log.Printf("instance %s slow stream (realtime): %.0fB/s", cand.inst.name, outcome.slowBytesPerSecond)
 			if proto == protocolAnthropic && !outcome.state.finished {
 				if err := writePauseTurnTail(w, &outcome.state); err != nil {
-					return true, m, fmt.Errorf("write pause_turn tail: %w", err)
+					return true, resp.StatusCode, m, fmt.Errorf("write pause_turn tail: %w", err)
 				}
 			}
-			return true, m, nil
+			return true, resp.StatusCode, m, nil
 		}
 		if streamErr != nil {
 			h.recordFailure(cand.inst)
-			return true, m, fmt.Errorf("copy response body: %w", streamErr)
+			return true, resp.StatusCode, m, fmt.Errorf("copy response body: %w", streamErr)
 		}
 		if h.judgeThroughput(&m) {
 			h.recordFailure(cand.inst)
@@ -1448,7 +1475,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 		} else {
 			cand.inst.recordSuccess()
 		}
-		return true, m, nil
+		return true, resp.StatusCode, m, nil
 	}
 
 	writeResponseHead()
@@ -1471,7 +1498,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 
 	if copyErr != nil {
 		h.recordFailure(cand.inst)
-		return true, m, fmt.Errorf("copy response body: %w", copyErr)
+		return true, resp.StatusCode, m, fmt.Errorf("copy response body: %w", copyErr)
 	}
 	if h.judgeThroughput(&m) {
 		h.recordFailure(cand.inst)
@@ -1479,7 +1506,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	} else {
 		cand.inst.recordSuccess()
 	}
-	return true, m, nil
+	return true, resp.StatusCode, m, nil
 }
 
 func isEventStream(header http.Header) bool {
@@ -1659,6 +1686,10 @@ type sseState struct {
 	inTokens   int
 	hasIn      bool
 	finished   bool
+	// contentDeltas counts content_block_delta events (§24.8 Y6). Unlike
+	// tokens (usage only, reported once at stream end) this ticks on every
+	// incremental content event, so per-chunk diffs identify real content.
+	contentDeltas int
 }
 
 func (s *sseState) feed(chunk []byte) {
@@ -1695,9 +1726,33 @@ func (s *sseState) processLine(line string) {
 			InputTokens      *int `json:"input_tokens"`
 			OutputTokens     *int `json:"output_tokens"`
 		} `json:"usage"`
+		// §24.9 Z5: OpenAI chat.completion chunks carry no content_block_delta;
+		// any non-empty delta field counts as one content-bearing chunk.
+		Choices []struct {
+			Delta struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []struct {
+					Function struct {
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
+			} `json:"delta"`
+		} `json:"choices"`
 	}
 	if err := json.Unmarshal([]byte(payload), &event); err != nil {
 		return
+	}
+	openAIContent := false
+	for _, choice := range event.Choices {
+		if choice.Delta.Content != "" || choice.Delta.ReasoningContent != "" {
+			openAIContent = true
+		}
+		for _, call := range choice.Delta.ToolCalls {
+			if call.Function.Arguments != "" {
+				openAIContent = true
+			}
+		}
 	}
 	if event.Usage.PromptTokens != nil {
 		s.inTokens = *event.Usage.PromptTokens
@@ -1725,6 +1780,12 @@ func (s *sseState) processLine(line string) {
 		s.inBlock = false
 	case "message_stop":
 		s.finished = true
+	}
+	if event.Type == "content_block_delta" || openAIContent {
+		// Anthropic: one per content_block_delta. OpenAI: one per chunk that
+		// carries content/reasoning/tool arguments, even if several appear
+		// together (§24.9 Z5).
+		s.contentDeltas++
 	}
 }
 
@@ -1765,7 +1826,7 @@ type byteSample struct {
 //
 // parse is false for bodies in an encoding the proxy cannot decode (§20.2);
 // such streams are forwarded but neither usage nor the byte window is tracked.
-func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, firstToken time.Duration, minTokensPerSecond float64, slowInterrupt, parse bool, commit func()) (outcome sseOutcome, err error) {
+func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, firstToken time.Duration, minTokensPerSecond float64, slowInterrupt, parse bool, commit func(), tracker *requestMonitor) (outcome sseOutcome, err error) {
 	var firstHit, idleHit, slowHit atomic.Bool
 	var timerMu sync.Mutex
 	var timer *time.Timer
@@ -1811,6 +1872,7 @@ func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, first
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
+		readStart := time.Now()
 		n, err := body.Read(buf)
 		if n > 0 {
 			now := time.Now()
@@ -1823,8 +1885,19 @@ func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, first
 			}
 			outcome.lastBlockAt = now
 			outcome.chunks++
+			deltaTokens, cumTokens, tokensKnown, contentDeltas := 0, 0, false, 0
 			if parse {
+				before := outcome.state.tokens
+				beforeContent := outcome.state.contentDeltas
 				outcome.state.feed(buf[:n])
+				after := outcome.state.tokens
+				deltaTokens = after - before
+				if deltaTokens < 0 {
+					deltaTokens = 0
+				}
+				cumTokens = after
+				tokensKnown = outcome.state.hasTokens
+				contentDeltas = outcome.state.contentDeltas - beforeContent
 				if minTokensPerSecond > 0 {
 					if firstChunkAt.IsZero() {
 						firstChunkAt = now
@@ -1846,6 +1919,7 @@ func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, first
 					}
 				}
 			}
+			tracker.chunk(readStart, now, n, deltaTokens, contentDeltas, cumTokens, tokensKnown)
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				return outcome, werr
 			}
@@ -2026,6 +2100,22 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, message str
 	})
 }
 
+// serveStaticAsset emits a small immutable-in-a-day static asset.
+func serveStaticAsset(w http.ResponseWriter, contentType string, body []byte) {
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = w.Write(body)
+}
+
+func (s *Server) serveFavicon(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	serveStaticAsset(w, "image/x-icon", web.FaviconICO)
+}
+
 func writeJSONError(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -2038,6 +2128,9 @@ func writeJSONError(w http.ResponseWriter, status int, body any) {
 type Server struct {
 	configPath string
 	state      atomic.Pointer[serverState]
+	monitor    *monitorHub
+	sessions   *sessionStore
+	startedAt  time.Time
 }
 
 type serverState struct {
@@ -2048,21 +2141,43 @@ type serverState struct {
 // NewServer builds a Server for cfg, which must have been loaded from
 // configPath so that reload reads the same file.
 func NewServer(configPath string, cfg *config.Config) (*Server, error) {
-	st, err := buildState(cfg)
+	startedAt := time.Now()
+	s := &Server{
+		configPath: configPath,
+		monitor:    newMonitorHub(),
+		sessions:   newSessionStore(),
+		startedAt:  startedAt,
+	}
+	s.monitor.startedAt = startedAt
+	s.monitor.statsSource = s.statsSnapshot
+	store := newStatsStore(configPath)
+	s.monitor.stats.attachStore(store, store.load())
+	st, err := buildState(cfg, s.monitor)
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{configPath: configPath}
 	s.state.Store(st)
 	return s, nil
 }
 
-func buildState(cfg *config.Config) (*serverState, error) {
+func buildState(cfg *config.Config, monitor *monitorHub) (*serverState, error) {
 	handler, err := New(cfg)
 	if err != nil {
 		return nil, err
 	}
+	handler.monitor = monitor
 	return &serverState{cfg: cfg, handler: handler}, nil
+}
+
+// StartPersistence starts the throttled stats writer (§24.10 B1). Tests that
+// drive NewServer directly may leave it off; main always starts it.
+func (s *Server) StartPersistence() {
+	s.monitor.stats.startPersistence()
+}
+
+// Close flushes pending statistics and stops the writer. It is idempotent.
+func (s *Server) Close() {
+	s.monitor.stats.stopPersistence()
 }
 
 func (s *Server) reload() error {
@@ -2070,7 +2185,7 @@ func (s *Server) reload() error {
 	if err != nil {
 		return err
 	}
-	st, err := buildState(cfg)
+	st, err := buildState(cfg, s.monitor)
 	if err != nil {
 		return err
 	}
@@ -2081,20 +2196,55 @@ func (s *Server) reload() error {
 // ServeHTTP implements http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	st := s.state.Load()
+	// §24.13 K3: browsers request the favicon without credentials, so it must
+	// bypass the admin auth gate entirely (never a 302 to the login page).
+	if r.URL.Path == "/favicon.ico" {
+		s.serveFavicon(w, r)
+		return
+	}
 	if isAdminPath(r.URL.Path) {
 		if st.cfg.AdminPassword == "" {
 			writeOpenAIError(w, http.StatusNotFound, "invalid_request_error", "not_found", "admin surface is disabled")
 			return
 		}
-		if !adminAuthorized(st.cfg, r) {
-			w.Header().Set("WWW-Authenticate", `Basic realm="model-router"`)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if s.adminRequestAllowed(st.cfg, r) {
+			s.serveAdmin(w, r, st)
 			return
 		}
-		s.serveAdmin(w, r, st)
+		if isPageRequest(r) {
+			target := PathLoginPage
+			if strings.HasPrefix(r.URL.Path, "/admin") {
+				target += "?next=" + url.QueryEscape(r.URL.Path)
+			}
+			http.Redirect(w, r, target, http.StatusFound)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="model-router"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	st.handler.ServeHTTP(w, r)
+}
+
+// adminRequestAllowed applies the §24.7 D4 priority: login paths, then a live
+// session cookie, then the retained Basic/query fallbacks for scripts.
+func (s *Server) adminRequestAllowed(cfg *config.Config, r *http.Request) bool {
+	if isLoginPath(r.URL.Path) {
+		return true
+	}
+	if s.sessions.authorized(r) {
+		return true
+	}
+	if adminAuthorized(cfg, r) {
+		return true
+	}
+	return isWSPath(r.URL.Path) && monitorQueryAuthorized(cfg, r)
+}
+
+// isPageRequest decides between a login redirect (pages) and a 401 (API, WS).
+func isPageRequest(r *http.Request) bool {
+	return strings.HasPrefix(r.URL.Path, "/admin") ||
+		strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html")
 }
 
 func isAdminPath(path string) bool {
@@ -2104,9 +2254,10 @@ func isAdminPath(path string) bool {
 
 func adminAuthorized(cfg *config.Config, r *http.Request) bool {
 	user, pass, ok := r.BasicAuth()
-	if !ok {
-		return false
-	}
+	return ok && adminCredentialsMatch(cfg, user, pass)
+}
+
+func adminCredentialsMatch(cfg *config.Config, user, pass string) bool {
 	userOK := subtle.ConstantTimeCompare([]byte(user), []byte(cfg.AdminUser)) == 1
 	passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(cfg.AdminPassword)) == 1
 	return userOK && passOK
@@ -2114,7 +2265,14 @@ func adminAuthorized(cfg *config.Config, r *http.Request) bool {
 
 func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request, st *serverState) {
 	switch r.URL.Path {
-	case "/admin", "/admin/":
+	case "/admin":
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		http.Redirect(w, r, "/admin/", http.StatusFound)
+	case "/admin/", "/admin/monitor", "/admin/config", "/admin/json":
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
 			writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -2122,6 +2280,45 @@ func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request, st *serverSt
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(web.IndexHTML)
+	case PathLoginPage:
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(web.LoginHTML)
+	case "/admin/logo.svg":
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		serveStaticAsset(w, "image/svg+xml", web.LogoSVG)
+	case PathLogin:
+		s.serveLogin(w, r, st.cfg)
+	case PathLogout:
+		s.serveLogout(w, r)
+	case PathStats:
+		s.serveStats(w, r)
+	case PathStatsClear:
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		s.monitor.stats.clearCumulative()
+		writeAdminOK(w)
+	case PathWS:
+		s.monitor.serveWS(w, r)
+	case PathMonitorClear:
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		s.monitor.stats.clearRequests()
+		writeAdminOK(w)
 	case "/api/config":
 		switch r.Method {
 		case http.MethodGet:
