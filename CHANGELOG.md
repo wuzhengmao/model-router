@@ -4,6 +4,20 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-16
+
+### Changed
+
+- Logo 改为匿名静态资源（§24.14 L1）：新增 `GET /logo.svg`（`image/svg+xml`，`Cache-Control: public, max-age=86400`），在鉴权之前处理，未登录也返回 200；`/admin/logo.svg` 路由删除。四个管理页与登录页左上角的 `<img src>` 统一改为 `/logo.svg`。
+
+### Fixed
+
+- 未登录时登录页左上角 Logo 始终不显示：原先 `/admin/logo.svg` 位于管理面鉴权之后，匿名请求被 302 重定向到登录页，`<img>` 拿到 HTML 无法解码。改为匿名路径后登录页与管理页一致显示。
+
+### Docs
+
+- `README.md` 标题下展示 Logo（`docs/assets/logo.svg`），并按新的匿名路由更新接口表；`docs/design.md` §33.5、`docs/requirements-monitor.md` §24.14 记录本轮修订与验收。
+
 ## [0.1.2] - 2026-11-16
 
 ### Added

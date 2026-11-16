@@ -2116,6 +2116,18 @@ func (s *Server) serveFavicon(w http.ResponseWriter, r *http.Request) {
 	serveStaticAsset(w, "image/x-icon", web.FaviconICO)
 }
 
+// serveLogo serves the vector brand mark to anonymous requests (§24.14 L1).
+// The login page shows it before any session exists, so it must not sit
+// behind the admin auth gate; a <img> tag also cannot send Basic credentials.
+func (s *Server) serveLogo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	serveStaticAsset(w, "image/svg+xml", web.LogoSVG)
+}
+
 func writeJSONError(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -2200,6 +2212,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// bypass the admin auth gate entirely (never a 302 to the login page).
 	if r.URL.Path == "/favicon.ico" {
 		s.serveFavicon(w, r)
+		return
+	}
+	// §24.14 L1: the left-top brand logo is an anonymous static asset for the
+	// same reason — the login page renders it before authentication.
+	if r.URL.Path == PathLogo {
+		s.serveLogo(w, r)
 		return
 	}
 	if isAdminPath(r.URL.Path) {
@@ -2288,13 +2306,6 @@ func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request, st *serverSt
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(web.LoginHTML)
-	case "/admin/logo.svg":
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			writeAdminError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		serveStaticAsset(w, "image/svg+xml", web.LogoSVG)
 	case PathLogin:
 		s.serveLogin(w, r, st.cfg)
 	case PathLogout:

@@ -1,6 +1,6 @@
 # 需求 §24：admin 实时请求监控（M9）
 
-> 版本：0.1.2（dev）｜状态：待实现｜作者：主代理（产品经理）
+> 版本：0.1.3（dev）｜状态：待实现｜作者：主代理（产品经理）
 
 ## 24.1 背景与目标
 
@@ -794,13 +794,13 @@
 
 - 新增 `internal/web/favicon.ico`：**多尺寸 ICO**，至少包含 16×16、32×32、48×48 三个尺寸（`go:embed` 打包）。
 - 新增 `internal/web/logo.svg`：矢量版，用于页面左上角（保证高分屏清晰）。
-- 新增路由：`GET /favicon.ico` 返回 ICO（`Content-Type: image/x-icon`，带 `Cache-Control: public, max-age=86400`）；`GET /admin/logo.svg` 返回 SVG（`image/svg+xml`）。
+- 新增路由：`GET /favicon.ico` 返回 ICO（`Content-Type: image/x-icon`，带 `Cache-Control: public, max-age=86400`）；Logo 的 SVG 路由见 §24.14 L（**已由 0.1.3 修订为匿名 `GET /logo.svg`，原 `/admin/logo.svg` 已删除**）。
 - **`/favicon.ico` 必须允许匿名访问**（浏览器拉 favicon 不带 Cookie），不能因为鉴权被 302 到登录页——否则标签栏图标永远不显示。这是本轮最容易出错的地方。
 - 若 favicon 无法用纯手写二进制可靠生成，允许用 Go 代码在构建期或运行期由内嵌的 PNG 转出 ICO；优先选择「直接把生成的 .ico 文件提交进仓库」的简单方案。
 
 **K4 左上角布局**
 
-- `<header>` 中 `<h1>` 前插入 `<img src="/admin/logo.svg" alt="" width="24" height="24">`，与标题垂直居中对齐（`display:flex; align-items:center; gap:8px` 的容器包住图标与文字）。
+- `<header>` 中 `<h1>` 前插入 `<img src="/logo.svg" alt="" width="24" height="24">`（§24.14 L 修订后的路径），与标题垂直居中对齐（`display:flex; align-items:center; gap:8px` 的容器包住图标与文字）。
 - 登录页同样处理。
 - 图标尺寸 24×24，不影响现有导航按钮位置；窄屏（1000px）下不产生额外换行。
 
@@ -817,7 +817,39 @@
 | K6b | 四个页面左上角都显示 24×24 Logo，与文字垂直居中，`gap` 8px；1000×900 下 header 不换行、无溢出 |
 | K6c | 登录页 `/admin/login` 同样有 Logo + 中文名 |
 | K6d | **匿名** `GET /favicon.ico`（不带任何凭据）返回 **200** 且 `Content-Type` 为 `image/x-icon`，响应体以 `00 00 01 00` 开头（ICO 魔数），尺寸至少含 16/32/48 |
-| K6e | 登录后 `GET /admin/logo.svg` 返回 200、`Content-Type: image/svg+xml`，内容为合法 SVG |
+| K6e | ~~登录后 `GET /admin/logo.svg` 返回 200~~ → 已由 §24.14 L3a 取代：匿名 `GET /logo.svg` 返回 200、`Content-Type: image/svg+xml`，内容为合法 SVG |
 | K6f | 页面里不存在残留的「model-router」可见文字（用 `grep -c "model-router"` 校验：只应出现在 `<script>` 内的 localStorage/凭据键、注释、以及不影响展示的地方；可见文本节点中为 0） |
 | K6g | `grep -rn "model-router" go.mod Dockerfile docker-compose.yml` 仍为原值（英文标识未被误改）；镜像 tag、服务名、module 路径不变 |
-| K6h | `go build`/`go vet`/`gofmt`/`go test ./... -race` 全绿；新增测试覆盖 `/favicon.ico` 匿名 200 与 `/admin/logo.svg` 鉴权行为 |
+| K6h | `go build`/`go vet`/`gofmt`/`go test ./... -race` 全绿；新增测试覆盖 `/favicon.ico` 匿名 200 与 Logo 资源行为（鉴权要求已由 §24.14 L3a 改为匿名 200） |
+
+## 24.14 第十一轮修订：Logo 匿名可访问（0.1.3）
+
+> 用户原话（2026-11-16）：
+
+> 「bump dev版本，没有登录的时候，/admin/logo.svg 会被重定向到登录页，这导致了的登录页的logo始终显示不出来；logo同时加到README.md中；」
+
+### L1 Logo 改为匿名静态资源
+
+- 矢量 Logo 改由 **`GET /logo.svg`** 提供，与 `/favicon.ico` 一样在鉴权之前处理，**匿名 200**，`Content-Type: image/svg+xml`，`Cache-Control: public, max-age=86400`。
+- 删除旧路由 `/admin/logo.svg`；`internal/web/index.html`（四个管理页）与 `internal/web/login.html` 的 `<img src>` 统一改为 `/logo.svg`。
+- 登录页与已登录页面拿到的资源完全一致，不再有「登录前空白、登录后出现」的差异。
+
+### L2 README 展示 Logo
+
+- `README.md` 标题下方展示 Logo：使用**相对路径 `docs/assets/logo.svg`** 的 `<img width="96">`，保证在 GitHub 与本地编辑器预览都能显示，不依赖运行中的服务。
+
+### L3 版本
+
+- `internal/version/version.txt` 由 `0.1.2` 升为 `0.1.3`（dev，构建版本 `0.1.3-rc`）；`CHANGELOG.md` 新增 `[0.1.3]` 条目。
+
+### L 验收
+
+| # | 标准 |
+|---|---|
+| L3a | 匿名 `GET /logo.svg` 返回 200、`Content-Type: image/svg+xml`、`Cache-Control` 含 `max-age=86400`，body 为合法 SVG（含 `viewBox="0 0 256 256"`） |
+| L3b | 匿名 `GET /admin/logo.svg` 不再返回 200 |
+| L3c | `admin_password` 为空时 `GET /logo.svg` 仍为 200 |
+| L3d | 登录后 `GET /logo.svg` 仍为 200 |
+| L3e | `internal/web/login.html` 与 `internal/web/index.html` 中不存在 `/admin/logo.svg` 引用 |
+| L3f | `README.md` 中出现指向 `docs/assets/logo.svg` 的图片引用，且该文件存在 |
+| L3g | `go build` / `go vet` / `gofmt` / `go test ./... -race` 全绿 |

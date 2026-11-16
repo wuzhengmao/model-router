@@ -840,7 +840,7 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 | 编号 | 检查项 | 测试/方法 | 判定 |
 |---|---|---|---|
 | UT-789 | K6d 匿名 favicon | `TestFaviconAnonymous` | 无凭据 GET `/favicon.ico` → 200、`Content-Type: image/x-icon`、`Cache-Control` 含 `max-age=86400`；响应体以 `00 00 01 00` 开头；ICONDIR count ≥3；含 16/32/48 条目；`admin_password` 为空时同样 200 |
-| UT-790 | K6e Logo 鉴权 | `TestLogoSVGAuth` | 未登录 GET `/admin/logo.svg` → 302 `/admin/login`；带会话 Cookie → 200、`image/svg+xml`、体以 `<svg` 开头且含 `viewBox="0 0 256 256"`、缓存 1 天 |
+| UT-790 | §24.14 L3a–L3d Logo 匿名 | `TestLogoSVGAnonymous` | 匿名 GET `/logo.svg` → 200、`image/svg+xml`、体以 `<svg` 开头且含 `viewBox="0 0 256 256"`、缓存 1 天；旧路径 `/admin/logo.svg` 非 200；带会话 Cookie 仍 200；`admin_password` 为空仍 200 |
 | UT-791 | K6a–K6c/K6f 页面品牌 | headless Chrome + CDP | 四页 `<title>` 与左上角文字为「模型智能路由」，登录页相同；可见文本无 `model-router` |
 | UT-792 | K6b 布局 | headless Chrome，1600×1019 与 1000×900 | 四页 Logo 24×24、与文字垂直居中、gap 8px；1000×900 header 不换行、无溢出 |
 | UT-793 | K6g 英文标识未误改 | `grep -rn "model-router" go.mod Dockerfile docker-compose.yml` | module/镜像 tag/服务名保持原值 |
@@ -854,7 +854,7 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 | K6b | 四页 Logo 渲染尺寸 24×24、`display:flex`、`gap:8px`、图标与文字中心差 0px；1000×900 下 header 高度 31.5px（与 1600 相同，未换行）、`scrollWidth<=clientWidth`、整页无横向滚动 |
 | K6c | `/admin/login` `<title>` 为「模型智能路由 · 登录」，卡片顶部 Logo 24×24 + 「模型智能路由」 |
 | K6d | 匿名 `curl -s -o /dev/null -w "%{http_code} %{content_type}"` → `200 image/x-icon`；响应体 `magic=00000100`、ICONDIR count=6（含 16/32/48） |
-| K6e | 未登录 `/admin/logo.svg` → 302 `/admin/login?next=%2Fadmin%2Flogo.svg`；带 Cookie → 200、`image/svg+xml`、体以 `<svg` 开头、含 `viewBox="0 0 256 256"` |
+| K6e / L3a | **已修订**：匿名 `/logo.svg` → 200、`image/svg+xml`、体以 `<svg` 开头、含 `viewBox="0 0 256 256"`；`/admin/logo.svg` 不再返回 200 |
 | K6f | `grep -c model-router internal/web/index.html internal/web/login.html` 均为 0；浏览器逐页 `document.body.innerText` 不含 `model-router` |
 | K6g | `grep -rn model-router go.mod Dockerfile docker-compose.yml` 仍为 `module model-router`、`wuzm219/model-router:0.1.1`、服务名 `model-router` |
 | K6h | UT-794：`go build`/`go vet`/`gofmt -l internal main.go`/`go test ./... -race -count=1` 全绿 |

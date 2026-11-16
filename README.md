@@ -1,8 +1,10 @@
 # 模型智能路由（model-router）
 
+<img src="docs/assets/logo.svg" alt="模型智能路由 Logo" width="96" height="96">
+
 模型智能路由（`model-router`）是 OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理透传。
 
-> 当前版本：`0.1.2`（实时监控 M9、统计首页与落盘、Cookie 登录与多页面路由、品牌化等）
+> 当前版本：`0.1.3`（实时监控 M9、统计首页与落盘、Cookie 登录与多页面路由、品牌化与匿名可访问的 Logo 等）
 > 需求：[docs/requirements.md](docs/requirements.md) ｜ 设计：[docs/design.md](docs/design.md) ｜ 测试：[docs/tests.md](docs/tests.md) ｜ 变更：[CHANGELOG.md](CHANGELOG.md)
 
 ## 能力范围（M1 ～ M4）
@@ -264,7 +266,7 @@ curl -sS http://127.0.0.1:18080/anthropic/v1/models -H "Authorization: Bearer <a
 | `/admin/`、`/admin/monitor`、`/admin/config`、`/admin/json` | GET | 四个独立页面（统计首页 / 实时监控 / 可视化配置 / JSON 高级，原生 HTML+JS，无外部 CDN）；未登录 302 到 `/admin/login` |
 | `/admin/login` | GET | 独立登录页 |
 | `/api/login`、`/api/logout` | POST | Cookie 会话登录/登出（`mr_session`；记住我 30 天，否则会话 cookie + 服务端 12 小时） |
-| `/favicon.ico` | GET | 匿名可访问的多尺寸图标（`image/x-icon`）；`/admin/logo.svg` 为需登录的矢量 Logo |
+| `/favicon.ico`、`/logo.svg` | GET | 匿名可访问的品牌资源（多尺寸图标 `image/x-icon`、矢量 Logo `image/svg+xml`，均为 `Cache-Control: public, max-age=86400`）；登录页与四个管理页左上角都用 `/logo.svg` |
 | `/api/config` | GET | 返回当前**生效**配置（含真实 key） |
 | `/api/config` | PUT | 校验后原子写回 `-config` 文件，**不生效** |
 | `/api/config/validate` | POST | 对请求体做全量校验（dry-run），返回 `{ok}`；不写回 |

@@ -1199,10 +1199,10 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 
 ### 33.2 资源分工与路由
 
-- `internal/web/logo.svg`：手写矢量，`viewBox 0 0 256 256`，深色圆角底板 `<rect rx=58>` + 上下两段渐变圆弧 + 三条汇聚短线 + 白色箭头；24px 与 16px 下保持可辨认。页面用 `<img src="/admin/logo.svg" width="24" height="24">`。
+- `internal/web/logo.svg`：手写矢量，`viewBox 0 0 256 256`，深色圆角底板 `<rect rx=58>` + 上下两段渐变圆弧 + 三条汇聚短线 + 白色箭头；24px 与 16px 下保持可辨认。页面用 `<img src="/logo.svg" width="24" height="24">`。
 - `internal/web/favicon.ico`：由 `docs/assets/logo-source-256.png` 离线转换（Node 无损解码 PNG → 面积平均缩放 → 16/32/48 用 32 位 BMP 条目、64/128/256 用 PNG 条目），提交进仓库，运行期不做转换。多尺寸原因：浏览器标签页/书签/任务栏会选取不同尺寸，缺 16/32/48 会导致缩放模糊。
 - `GET /favicon.ico`：在 `Server.ServeHTTP` 最前面、鉴权之前直接处理。浏览器请求 favicon 不会带 Cookie/Authorization，若走管理面鉴权会被 302 到登录页，标签栏图标永远不显示；因此该路径必须匿名 200。`admin_password` 为空时同样返回 200。
-- `GET /admin/logo.svg`：走正常管理面鉴权（页面内 `<img>` 会带会话 Cookie），未登录 302 到 `/admin/login`。两者都带 `Cache-Control: public, max-age=86400`。
+- `GET /logo.svg`：同样在鉴权之前处理，匿名 200（§24.14 L1，见 33.5）。`Cache-Control: public, max-age=86400`。
 
 ### 33.3 布局
 
@@ -1215,3 +1215,10 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 - **D-M10-49 ICO 编码**：16/32/48 使用传统 BMP 条目以兼容较旧的图标读取器，64/128/256 使用 PNG 条目；源图四角 alpha=0，无需额外抠图。
 - **D-M10-50 Logo 与源图**：SVG 按源图造型重绘（圆弧角度、三段渐变、箭头比例），未引入新元素；不同屏幕尺寸下渐变色标位置由 `gradientUnits="userSpaceOnUse"` 固定。
 - **D-M10-51 非 AI 日志测试调整**：`TestNonAICallOmitsTokenSegment` 原用 `/favicon.ico` 触发“未路由请求”日志；favicon 现在是静态资源、不再经过 AI handler，因此改用 `/health` 未知路径，断言意图（无模型/ token 段）不变。
+
+### 33.5 第十一轮修订：Logo 改为匿名资源（§24.14 L）
+
+- **问题**：Logo 原先只在 `/admin/logo.svg` 上提供，该路径在管理面鉴权之后。登录页属于登录路径但页面里的 `<img>` 是子资源，`<img>` 不能携带 HTTP Basic 凭据；未登录访问时 `/admin/logo.svg` 返回 302 `/admin/login`（SVG 请求不是页面请求，进的是 401/302 分支），浏览器把 HTML 当图片解码失败，登录页左上角 Logo 始终空白。
+- **D-M10-52 改为匿名路径**：新增顶层常量 `PathLogo = "/logo.svg"`（`internal/proxy/session.go`），`Server.ServeHTTP` 在鉴权之前、与 `/favicon.ico` 同一位置处理，移交 `(*Server).serveLogo`；`login.html` 与 `index.html` 的 `<img src>` 都改为 `/logo.svg`。
+- **D-M10-53 删除旧路由**：`serveAdmin` 中的 `case "/admin/logo.svg"` 一并删除，避免同一资源存在「匿名」与「需登录」两条路径。管理员登录后仍可匿名访问 `/logo.svg`，行为无差异。
+- **D-M10-54 测试调整**：`TestLogoSVGAuth` 更名为 `TestLogoSVGAnonymous`，断言匿名 `GET /logo.svg` = 200 且 `Content-Type: image/svg+xml`、`Cache-Control` 含 `max-age=86400`、body 以 `<svg`/`<?xml` 开头且含 `viewBox="0 0 256 256"`；追加断言旧路径 `/admin/logo.svg` 非 200、登录后 `/logo.svg` 仍 200、`admin_password` 为空时仍 200。

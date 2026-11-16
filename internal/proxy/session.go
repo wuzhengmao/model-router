@@ -21,6 +21,9 @@ const (
 	PathLogout    = "/api/logout"
 	PathLoginPage = "/admin/login"
 
+	// PathLogo is the brand mark served anonymously (§24.14 L1).
+	PathLogo = "/logo.svg"
+
 	sessionCookieName  = "mr_session"
 	sessionTokenBytes  = 32
 	sessionRememberTTL = 30 * 24 * time.Hour
