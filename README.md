@@ -4,7 +4,7 @@
 
 模型智能路由（`model-router`）是 OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理透传。
 
-> 当前版本：`0.1.3`（实时监控 M9、统计首页与落盘、Cookie 登录与多页面路由、品牌化与匿名可访问的 Logo 等）
+> 当前版本：`0.1.5`（熔断改真实请求驱动半开语义、全 open 时逐实例向后重试、默认回退 5 分钟、实时监控与统计落盘等）
 > 需求：[docs/requirements.md](docs/requirements.md) ｜ 设计：[docs/design.md](docs/design.md) ｜ 测试：[docs/tests.md](docs/tests.md) ｜ 变更：[CHANGELOG.md](CHANGELOG.md)
 
 ## 能力范围（M1 ～ M4）
@@ -204,7 +204,7 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
   2. 连接失败 / 超时（实例 `timeout`，默认 15s）→ 本次请求立即尝试下一候选（临时回退）；
   3. 连续失败 ≥ `failure_threshold` 次 → 转 `open` 并记录降级开始时间；已 `open` 的实例再次失败 → 回退截止时间重置为「当前时间 + `degrade_duration`」，不做指数退避；
   4. 每次请求按候选链顺序选择**第一个 `closed` 实例**；回退截止时间到期后实例自动回到 `closed`（空闲时也按时间恢复，无需任何额外动作）；
-  5. 候选链上全部实例都 `open` → 新请求发往**链上第一个**实例；它成功后恢复 `closed`，后续请求继续由它承接。
+  5. 候选链上全部实例都 `open` → 新请求从**链上第一个**实例开始，按链序逐个向后重试，第一个成功即返回，全部失败才 502；成功的实例恢复 `closed`，后续请求继续由它承接。
 - 实例回退状态按协议维护、只存内存；统计页实例行按「openai → anthropic、组内配置优先级」排序。
 - 锁定 / 解锁（`POST /api/instances/lock`、`POST /api/instances/unlock`）：锁定后熔断策略暂停，该协议全部请求发往被锁定实例；锁定状态不落盘，重启或 reload 后恢复。
 - 回退状态与锁定仅在进程内存；重启或 reload（重建 handler）后清零。

@@ -152,7 +152,7 @@ bash build.sh
 | UT-404 | 临时回退与持续回退 | `TestFallbackTemporaryAndSustained` | 失败 1/2 次仍先试主实例；第 3 次后进入 5 分钟回退并跳过 | 调用次数符合状态机 |
 | UT-405 | 回退期到期后真实请求重新试主实例 | `TestFallbackExpiredWindowRealRequestFails` | 回退期结束后主实例仍未恢复 | 真实请求重试主实例，失败后立即重新进入回退，后续请求跳过 |
 | UT-406 | 成功恢复清零 | `TestFallbackSuccessResets` | 回退期后主实例成功 | 计数/回退清零，之后失败重新按 3 次累计 |
-| UT-407 | 全降级使用链上第一个实例 | `TestFallbackAllDegradedUsesFirst` | 阈值 1、两实例均失败后全部降级 | 后续请求只打链上第一个实例（不是链尾），失败即 502 |
+| UT-407 | 全降级时逐实例重试（§24.19 M45–M48 修订） | `TestFallbackAllOpenRetriesEveryInstance` | 阈值 1、两实例均失败后全部降级 | 后续请求按链序依次尝试两个实例（各 +1 次调用），全部失败返回 502 |
 | UT-408 | 并发安全 | `TestFallbackConcurrent`（`go test -race`） | 20 并发请求 + 失败实例 | 全部 200，调用次数一致，无 data race |
 | UT-409 | 吞吐判定与样本门槛 | `TestThroughputFailure` | OpenAI `completion_tokens`、Anthropic `output_tokens`、无 usage；输出 ≤100 或生成时长 ≤2s；慢响应 | 低吞吐响应仍透传；满足门槛才记失败（下次跳过），样本不足/无 usage 不判失败 |
 | UT-413 | Anthropic 空闲超时收尾 | `TestIdleTimeoutAnthropicPauseTurn` | mock 上游发首块后静默；`idle_timeout=50ms` | 客户端收到 `content_block_stop`、`message_delta(stop_reason=pause_turn)`、`message_stop` |
@@ -181,7 +181,7 @@ go test -race ./internal/proxy
 | 状态机：临时回退、<3 仍试主实例、≥3 持续回退 | UT-404 |
 | 状态机：回退期结束由真实请求重试并重新计时 | UT-405 |
 | 状态机：成功恢复清零 | UT-406 |
-| 状态机：全部降级时使用链上第一个实例 | UT-407 |
+| 状态机：全部降级时逐实例向后重试 | UT-407、UT-844～UT-848 |
 | 并发安全（race） | UT-408 + `go test -race` |
 | 吞吐判定（mock 慢响应/低 usage） | UT-409 |
 | UI 拖动排序改变 instances 顺序 | 手工 e2e（主代理） |
@@ -912,9 +912,9 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 | UT-830 | M34/M15ak 状态域与 `current` 消失 | `TestStatsInstanceFieldsOrderAndLockAPI` | `/api/stats` 的 `instances[].state` 只取 `closed`/`open`/`locked`/`-`；`current` 恒为 false（字段保留以兼容既有 wire 格式） |
 | UT-831 | M35/M15aj 空闲自动恢复 | `TestIdleRecoveryWithoutRequests` | 实例转 `open` 后不发任何请求，仅推进时钟越过 `degradedUntil`：`state()` 与 `stateFor` 均为 `closed`，下一条请求打到它 |
 | UT-832 | M36/M15ag 第一个 `closed` 选路 | `TestFirstClosedRouting` | 三实例 [A,B,C]，A `open`、B/C `closed` → 请求打 B；A 的 `degradedUntil` 到期后再发请求 → 打 A |
-| UT-833 | M36/M15ah 全 `open` 打第一个 | `TestAllOpenUsesFirst` | 三实例全 `open` → 请求只打链上第一个 A（不是链尾）；A 成功后恢复 `closed` 并继续承接流量 |
+| UT-833 | ~~M36/M15ah 全 `open` 打第一个~~（§24.19 M47 撤订） | ~~`TestAllOpenUsesFirst`~~ | 该语义已撤订，用例按新语义改写为 `TestAllOpenRetriesEveryInstance` 等，见 §37 UT-844～UT-848 |
 | UT-834 | M37/M15ak 删除 `current` 指针 | 源码 grep | 不再出现 `protocolRuntime.current`、`setCurrent`、`advanceCurrent`、`noteRealSuccess`、`base = start` |
-| UT-835 | M38/M15ai 失败重置回退时间 | `TestFailureRetimesBackoff` | 实例 `open` 后推进时钟至 `degradedUntil` 前 1s 再失败：`degradedUntil` 重置为 `now + degrade_duration`，无指数增长 |
+| UT-835 | M38/M15ai 失败重置回退时间 | `TestFailureRetimesBackoff` | 实例 `open` 后推进时钟至 `degradedUntil` 前 1s 再失败：`degradedUntil` 重置为 `now + degrade_duration`，无指数增长；§24.19 后全 `open` 的两实例都会被重试并各自重新计时 |
 | UT-836 | M39 失败后继续尝试下一个 `closed` | `TestLockRoutesEverythingAndUnlockResets`、`TestFallbackTemporaryAndSustained` | 一个候选失败即重试下一个 `closed` 候选；`open` 候选跳过；全部失败才 502 |
 | UT-837 | M40/M15am 监控页无探测 | `TestMonitorPageHasNoProbeUI` | 页面源码不含 `probe-badge`、`probe-row`、`stat-probe`、`探测中`、`探测成功`、`探测失败`；状态列只会显示 `正常` / `降级 HH:MM:SS` / `已锁定` / `-` |
 | UT-838 | M15an 请求不被探测阻塞 | `TestFirstClosedRouting`、`TestNoActiveProbing` | 源码无后台探测路径；`open` 实例不因内部行为收到请求，请求时延只取决于上游本身 |
@@ -925,7 +925,7 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 ### 35.2 场景说明
 
 - 新增用例全部在 `internal/proxy/circuit_internal_test.go`，沿用 `cbClock` 假时钟与 `cbBackend` 可控上游；`cbBackend` 已删除 `probeStatus`/`blockProbes`/`probeCalls`/`probeTimes` 等探测专用装置。
-- 旧语义用例的处理：`TestFallbackAllDegradedUsesTail` 更名为 `TestFallbackAllDegradedUsesFirst` 并断言打链上第一个；`TestFallbackSuccessResets` 的 `firstCalls` 期望由 5 改为 4、后续由 7 改为 6（探测请求不再发生）；`TestFallbackRecoveryProbeFailure` 更名为 `TestFallbackExpiredWindowRealRequestFails`；`TestStatsInstanceTokenColumns` 删除 `addProbe` 探测行夹具。其余断言保持不变。
+- 旧语义用例的处理：`TestFallbackAllDegradedUsesTail` 更名为 `TestFallbackAllDegradedUsesFirst` 并断言打链上第一个（§24.19 后又更名为 `TestFallbackAllOpenRetriesEveryInstance`，见 §37）；`TestFallbackSuccessResets` 的 `firstCalls` 期望由 5 改为 4、后续由 7 改为 6（探测请求不再发生）；`TestFallbackRecoveryProbeFailure` 更名为 `TestFallbackExpiredWindowRealRequestFails`；`TestStatsInstanceTokenColumns` 删除 `addProbe` 探测行夹具。其余断言保持不变。
 - M15am 为前端源码级检查（无浏览器测试框架），由 `TestMonitorPageHasNoProbeUI` 读取 `go:embed` 的 `web.IndexHTML` 直接断言四个禁用字符串不存在。
 
 ## 36. 第十五轮：回退时间默认值改回 5 分钟（§24.18 M41–M44）
@@ -942,3 +942,22 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 - UT-842 在既有的 `TestLoadAppliesDefaults` 中新增一条字面量断言 `5*time.Minute`；原先只与 `config.DefaultDegradeDuration` 比较，常量改错时测试会跟着一起错，字面量断言用于固定 §24.18 的默认值。
 - 既有 `TestFallbackExplicit` 显式配置 `"1m"`，继续断言 1m 生效，覆盖 M44「显式值不受影响」。
 - 本轮未改动任何运行时语义、校验规则与前端行为。
+
+## 37. 第十六轮：全 open 时逐实例向后重试（§24.19 M45–M48）
+
+### 37.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-844 | M15av/M46 全 `open` 逐实例向后重试 | `TestAllOpenRetriesEveryInstance` | 三实例全 `open`：第一个仍失败后请求继续打第二个并成功；第三个不被调用；第二个成功后恢复 `closed` |
+| UT-845 | M15av-b 首实例成功不预发 | `TestAllOpenFirstSuccessNoPrefetch` | 三实例全 `open` 且第一个成功：只有第一个收到请求，第二、三个调用次数不变 |
+| UT-846 | M15aw 全 `open` 全部失败 | `TestAllOpenAllFail` | 三实例全 `open` 且全部失败：返回 502，本次请求中三个实例各被调用恰好 1 次 |
+| UT-847 | M15ax/M48 混合场景跳过 `open` | `TestMixedClosedAndOpenSkipsOpen` | 一实例 `open`、两实例 `closed`：请求只打两个 `closed` 候选，`open` 实例调用次数为 0 |
+| UT-848 | M15ay 失败记账不跳过 | `TestAllOpenFailureBookkeeping` | 全 `open` 重试链上每个失败实例的 `degradedUntil` 均重置为 `now + degrade_duration`，调用次数各 +1 |
+| UT-849 | M15az 构建与测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race` | 全部通过 |
+
+### 37.2 场景说明
+
+- 新增用例全部在 `internal/proxy/circuit_internal_test.go`；公共装置 `cbAllOpenThree` 先用一条请求让三个失败实例全部转 `open`（`failure_threshold = 1`），再发全 `open` 请求验证重试链，避免每个用例重复铺陈。
+- 旧用例处理：`TestAllOpenUsesFirst`（UT-833）的语义已被 §24.19 M47 撤订，用例删除，由 UT-844～UT-848 取代；`TestFailureRetimesBackoff`（UT-835）追加断言全 `open` 重试中第二个实例同样被调用并重新计时；`TestFallbackAllDegradedUsesFirst` 更名为 `TestFallbackAllOpenRetriesEveryInstance`（UT-407），第二次全 `open` 请求的期望由「首实例 +1、次实例 0 次追加调用」改为「两实例各 +1 次追加调用」。
+- `attempts` 的构造与既有重试循环、`tracker.begin`/`tracker.retry` 记账未变，因此监控统计与请求日志的三档格式不受影响。

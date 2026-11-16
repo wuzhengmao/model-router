@@ -1227,7 +1227,7 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 
 ## 34. 第十二轮：服务熔断（§24.15 M）
 
-> §24.17 已删除本节描述的 `current` 链头指针与 `probe` 态，选路改为「第一个 `closed`，全 `open` 用第一个」，见 §36。
+> §24.17 已删除本节描述的 `current` 链头指针与 `probe` 态，选路改为「第一个 `closed`，全 `open` 从链首逐个实例向后重试」，见 §37。
 
 ### 34.1 状态与链头指针
 
@@ -1358,17 +1358,17 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 - 实例时钟来自 `NewWithOptions` 的 `opts.Now`（写入 `instanceRuntime.now`），生产环境即 `time.Now`，测试用假时钟可验证 M15aj。`degradedUntil` 到期后字段本身不清零，因此「到期后再次失败」仍会走 `recordFailure` 的重新计时分支（见 §36.5）。
 - 说明：§24.17.2 M35 的字面表述 `isOpen() 即 !degradedUntil.IsZero()` 单独成立时无法让实例在到期后自动变回 `closed`；验收 M15aj 要求在推进时钟后 `state` 变为 `closed` 且下一请求打到该实例，故实现取「只由 `degradedUntil` 与当前时间决定」的时间比较语义。
 
-### 36.4 选路：第一个 `closed`，全 `open` 用第一个（M36/M37）
+### 36.4 选路：第一个 `closed`，全 `open` 从链首逐个重试（M36/M37，§24.19 M45–M48 修订）
 
 - 删除 `protocolRuntime.current`、`setCurrent`、`advanceCurrent`、`noteRealSuccess` 与 `buildChainFrom` 的 `start` 参数及 `base = start` 截断；`findBase` 的模型能力匹配规则（`exactChain`/`roleChain`/`wildcardChain`/`fallbackChain`）保持不变。
-- `internal/proxy/proxy.go` 的 `serveChain`：构造候选链后，按链顺序收集 `!isOpen()` 的候选作为尝试列表；列表为空（链上全部 `open`）时只放链上第一个候选（不是链尾）。随后依次尝试，一个候选在响应头写出前失败就重试下一个，全部失败返回 502。
+- `internal/proxy/proxy.go` 的 `serveChain`：构造候选链后，按链顺序收集 `!isOpen()` 的候选作为尝试列表；列表为空（链上全部 `open`）时**把整条链按链序放入尝试列表**。随后依次尝试，一个候选在响应头写出前失败就重试下一个，第一个成功即返回，全部失败才 502。`chain[0]` 只是重试的**起点**，不再是唯一尝试对象（§24.19 M45–M47，取代 M36 的「只打第一个」）。
 - 这样「哪个实例通，后续请求就往这里走」由状态本身自然达成：成功实例保持 `closed`，下一次选路仍先命中它；无需维护链头指针。也消除了旧 `current` 停在后面时、前面已恢复健康的实例被 `base = start` 永久跳过的缺陷。
 - 锁定时仍只发往被锁定实例（`lockedCandidate`），锁定实例即使是 `open` 也照常承接（`attempts` 的兜底分支保证单元素链不会被过滤掉）；`/api/instances/lock`、`/api/instances/unlock` 的签名与「解锁清零全部计数」行为不变。
 
 ### 36.5 失败重置回退时间（M38/M39）
 
 - `instanceRuntime.recordFailure`：`consecutiveFailures` 累加，达到 `failure_threshold` 调用 `markOpenLocked`；若 `degradedUntil` 非零（已处于 `open`，或到期后的半开试探再次失败），直接重置为 `now + degrade_duration`。没有退避、没有指数增长，`degradedSince` 保留本次故障的首次失败时刻。
-- 失败重试语义沿用既有回退：一个候选失败即试下一个 `closed` 候选，`open` 候选跳过，全部失败才 502。候选顺序完全由 §36.4 决定。
+- 失败重试语义沿用既有回退：一个候选失败即试下一个候选（closed 候选跳过 open 候选；全 open 时下一候选就是链上后一个 open 实例），全部失败才 502。候选顺序完全由 §36.4 决定。
 
 ### 36.6 前端与接口（M40）
 
@@ -1378,7 +1378,23 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 ### 36.7 决策与未覆盖
 
 - **D-M14-1 状态由时间派生**：不为「到期恢复」增加定时器或惰性清零回调，避免后台任务重新进入系统；`degradedUntil` 保留到被成功请求或下一次失败覆盖，`displayState`/`isOpen` 只在需要时与当前时间比较。
-- **D-M14-2 全 `open` 兜底取链首**：沿用用户原话「都 open 就用第一个实例」；旧的链尾兜底 `allOpenTailCandidate` 与 `allInstancesOpen` 分支删除。若首个实例持续失败，每次请求都会在它身上再失败一次并重置其回退时间，其它 `open` 实例不会被无谓尝试（M15ah）。
+- **D-M14-2 全 `open` 兜底从链首重试（§24.19 M45–M47 撤订）**：链上全部 `open` 时，尝试列表为整条链按顺序的全部候选，从索引 0 开始逐个向后重试，第一个成功即返回。M36 原「只打第一个、其它 `open` 实例不会被无谓尝试」的限制已撤订——「发往链上第一个」仅表示**起点**。每个失败的 `open` 实例仍照常记账并把自己的 `degradedUntil` 重置为 `now + degrade_duration`（§24.19 M15ay），不因重试而跳过失败记账。
 - **D-M14-3 保留 `current` JSON 字段**：M15ak 允许「不再输出」或「恒为 false」二选一；为满足「除 state 外其余字段保持」的接口约束，选择保留字段并恒为 false，前端不再读取。
 - **D-M14-4 探测行字段直接删除**：§24.17.3 允许保留但永不置真或直接删除；因唯一生产者已删除、前端已清理，保留字段会成为永久死数据，故选择直接删除 `probe`/`probeResult`。
 - **未覆盖**：并发请求同时竞争同一实例时，`open` 状态以各请求读取时刻为准；规格未定义该竞态下「选路快照」的一致性，实现按请求各自的读取结果执行。
+
+## 37. 第十六轮：全 open 时逐实例向后重试（§24.19 M45–M48）
+
+### 37.1 实现
+
+- `internal/proxy/proxy.go` 的 `serveChain`：全 open 兜底由 `attempts = append(attempts, chain[0])` 改为 `attempts = append(attempts, chain...)`，即整条候选链按链序进入尝试列表（M45）。`attempts` 的容量、过滤 `!isOpen()` 的构造方式、其后的 `for i, cand := range attempts` 重试循环与失败记账全部未改动。
+- 起点与方向（M46）：第一个候选仍是链上索引 0，其后按链序逐个向后；第一个成功即 `return`，后续候选不会被预发（M15av-b）；全部失败才走循环后的统一 502 分支。
+- 失败记账（M15ay）：每个失败候选仍由 `tryCandidate` 内的 `h.recordFailure` 记账，`consecutiveFailures` 累加与 `degradedUntil = now + degrade_duration` 重置和 closed 候选完全一致，不因处于全 open 重试而被跳过。
+- 混合场景（M48）：`!isOpen()` 过滤逻辑不变；只要链上存在 closed 候选，open 候选依旧被跳过。本次只改「过滤结果为空」时的兜底构造。
+- 锁定协议不受影响：锁定分支的链只有被锁定实例一个候选，`len(chain) == 1`，新旧兜底等价；被锁定实例即使 `open` 也照常承接（§24.15 M10）。
+- `serveChain` 与 `buildChainFrom` 签名未变，未新增依赖；`/api/stats` 字段与 `state` 取值域不变。
+
+### 37.2 决策与未覆盖
+
+- **D-M15-1 沿用同一重试循环**：不为全 open 另写一套重试/记账路径，避免与 closed 候选语义分叉；差异只在 `attempts` 的构造。
+- **未覆盖**：§24.19 未给全 open 重试增加总时长上限——一次请求最多尝试 `len(chain)` 个实例，总耗时受各实例 `timeout` 与上游返回共同约束；实现不引入额外总超时。

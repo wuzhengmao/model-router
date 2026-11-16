@@ -848,8 +848,9 @@ type candidate struct {
 // request, try the first closed instance, retry pre-response failures on the
 // next closed candidate, and record outcomes. §24.17 M36/M37: there is no
 // current pointer — every request starts at the first closed instance on the
-// chain, and an all-open chain sends the request to its first instance. A locked
-// protocol sends everything to the pinned instance (§24.15 M10).
+// chain. §24.19 M45–M48: an all-open chain tries every candidate in chain order,
+// starting at index 0. A locked protocol sends everything to the pinned
+// instance (§24.15 M10).
 func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto protocol, insts []*instanceRuntime, body []byte) {
 	start := time.Now()
 	reqModel, _ := requestModel(body)
@@ -869,8 +870,8 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 	}
 
 	// §24.17 M36/M39: closed candidates are tried in chain order; open ones are
-	// skipped. When every candidate is open the request goes to the first one on
-	// the chain (not the tail).
+	// skipped. §24.19 M45/M46: when every candidate is open the whole chain is
+	// tried from index 0, so a failing head falls through to the next instance.
 	attempts := make([]*candidate, 0, len(chain))
 	for _, cand := range chain {
 		if !cand.inst.isOpen() {
@@ -878,7 +879,7 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		}
 	}
 	if len(attempts) == 0 && len(chain) > 0 {
-		attempts = append(attempts, chain[0])
+		attempts = append(attempts, chain...)
 	}
 
 	tracker := h.monitor.trackRequest(r, proto, reqModel)

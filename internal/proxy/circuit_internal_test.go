@@ -270,16 +270,110 @@ func TestFirstClosedRouting(t *testing.T) {
 	}
 }
 
-// TestAllOpenUsesFirst covers M15ah: when every instance is open the request
-// goes to the first chain entry, not the tail.
-func TestAllOpenUsesFirst(t *testing.T) {
+// cbAllOpenThree drives three failing instances into the all-open state: the
+// first request runs with every breaker closed, so each instance is tried once
+// and opens (failure_threshold is 1 in these tests).
+func cbAllOpenThree(t *testing.T) (*cbClock, []*cbBackend, *Handler, *httptest.Server) {
+	t.Helper()
+	clock := &cbClock{now: time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)}
+	backends := []*cbBackend{
+		newCBBackend(t, http.StatusOK),
+		newCBBackend(t, http.StatusOK),
+		newCBBackend(t, http.StatusOK),
+	}
+	for _, backend := range backends {
+		backend.setFail(true)
+	}
+	handler := newCBHandler(t, clock, 1, time.Minute,
+		cbOpenAIInstance(backends[0], "first", "gpt-x"),
+		cbOpenAIInstance(backends[1], "second", "gpt-x"),
+		cbOpenAIInstance(backends[2], "third", "gpt-x"),
+	)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusBadGateway {
+		t.Fatalf("setup request status = %d, want 502", code)
+	}
+	for i := range backends {
+		if state := handler.byProtocol[protocolOpenAI][i].state(); state != stateOpen {
+			t.Fatalf("setup instance %d state = %q, want open", i, state)
+		}
+	}
+	return clock, backends, handler, server
+}
+
+// TestAllOpenRetriesEveryInstance covers M15av/M46: with every instance open the
+// request walks the whole chain from index 0, so a failing head falls through to
+// the next instance instead of ending the request.
+func TestAllOpenRetriesEveryInstance(t *testing.T) {
+	_, backends, handler, server := cbAllOpenThree(t)
+	backends[1].setFail(false)
+
+	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusOK {
+		t.Fatalf("all-open request status = %d, want 200", code)
+	}
+	if got := backends[0].calls(); got != 2 {
+		t.Errorf("first calls = %d, want 2 (head retried while open)", got)
+	}
+	if got := backends[1].calls(); got != 2 {
+		t.Errorf("second calls = %d, want 2 (tried after the head failed)", got)
+	}
+	if got := backends[2].calls(); got != 1 {
+		t.Errorf("third calls = %d, want 1 (chain stopped at the successful instance)", got)
+	}
+	if state := handler.byProtocol[protocolOpenAI][1].state(); state != stateClosed {
+		t.Errorf("second state = %q, want closed after its success", state)
+	}
+}
+
+// TestAllOpenFirstSuccessNoPrefetch covers M15av-b: when the first instance of an
+// all-open chain succeeds, no later instance receives a request.
+func TestAllOpenFirstSuccessNoPrefetch(t *testing.T) {
+	_, backends, handler, server := cbAllOpenThree(t)
+	backends[0].setFail(false)
+
+	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusOK {
+		t.Fatalf("all-open request status = %d, want 200", code)
+	}
+	if got := backends[0].calls(); got != 2 {
+		t.Errorf("first calls = %d, want 2", got)
+	}
+	if got := backends[1].calls(); got != 1 {
+		t.Errorf("second calls = %d, want 1 (no prefetch after the head succeeded)", got)
+	}
+	if got := backends[2].calls(); got != 1 {
+		t.Errorf("third calls = %d, want 1 (no prefetch after the head succeeded)", got)
+	}
+	if state := handler.byProtocol[protocolOpenAI][0].state(); state != stateClosed {
+		t.Errorf("first state = %q, want closed after its success", state)
+	}
+}
+
+// TestAllOpenAllFail covers M15aw: an all-open request tries each instance
+// exactly once and returns 502 once the chain is exhausted.
+func TestAllOpenAllFail(t *testing.T) {
+	_, backends, _, server := cbAllOpenThree(t)
+	before := []int{backends[0].calls(), backends[1].calls(), backends[2].calls()}
+
+	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusBadGateway {
+		t.Fatalf("all-open request status = %d, want 502", code)
+	}
+	for i, backend := range backends {
+		if got := backend.calls() - before[i]; got != 1 {
+			t.Errorf("instance %d calls delta = %d, want 1", i, got)
+		}
+	}
+}
+
+// TestMixedClosedAndOpenSkipsOpen covers M15ax/M48: open candidates are still
+// skipped — they receive no request — when closed candidates remain.
+func TestMixedClosedAndOpenSkipsOpen(t *testing.T) {
 	clock := &cbClock{now: time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)}
 	first := newCBBackend(t, http.StatusOK)
 	first.setFail(true)
 	second := newCBBackend(t, http.StatusOK)
-	second.setFail(true)
 	third := newCBBackend(t, http.StatusOK)
-	third.setFail(true)
 	handler := newCBHandler(t, clock, 1, time.Minute,
 		cbOpenAIInstance(first, "first", "gpt-x"),
 		cbOpenAIInstance(second, "second", "gpt-x"),
@@ -288,45 +382,54 @@ func TestAllOpenUsesFirst(t *testing.T) {
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 
-	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusBadGateway {
-		t.Fatalf("request 1 status = %d, want 502", code)
+	// Request 1: first fails and opens; the closed second serves the request.
+	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusOK {
+		t.Fatalf("request 1 status = %d, want 200", code)
 	}
-	for i, backend := range []*cbBackend{first, second, third} {
-		if got := backend.calls(); got != 1 {
-			t.Fatalf("instance %d calls = %d, want 1", i, got)
+	if state := handler.byProtocol[protocolOpenAI][0].state(); state != stateOpen {
+		t.Fatalf("first state = %q, want open", state)
+	}
+
+	// Request 2: first is open and skipped; second fails and falls through to
+	// the closed third instance.
+	second.setFail(true)
+	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusOK {
+		t.Fatalf("request 2 status = %d, want 200", code)
+	}
+	if got := first.calls(); got != 1 {
+		t.Errorf("first calls = %d, want 1 (open instance skipped)", got)
+	}
+	if got := second.calls(); got != 2 {
+		t.Errorf("second calls = %d, want 2", got)
+	}
+	if got := third.calls(); got != 1 {
+		t.Errorf("third calls = %d, want 1", got)
+	}
+}
+
+// TestAllOpenFailureBookkeeping covers M15ay: retrying an open candidate still
+// records the failure and re-times its degradedUntil.
+func TestAllOpenFailureBookkeeping(t *testing.T) {
+	clock, backends, handler, server := cbAllOpenThree(t)
+	openedAt := clock.Now()
+	for i := range backends {
+		if got := handler.byProtocol[protocolOpenAI][i].cbDeadline(); !got.Equal(openedAt.Add(time.Minute)) {
+			t.Fatalf("setup instance %d degradedUntil = %s, want %s", i, got, openedAt.Add(time.Minute))
 		}
 	}
 
-	// All open: the request goes to the first instance only.
+	clock.Advance(30 * time.Second)
 	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusBadGateway {
-		t.Fatalf("request 2 status = %d, want 502", code)
+		t.Fatalf("all-open request status = %d, want 502", code)
 	}
-	if got := first.calls(); got != 2 {
-		t.Errorf("first calls = %d, want 2 (all-open sends the request to the chain head)", got)
-	}
-	if got := second.calls(); got != 1 {
-		t.Errorf("second calls = %d, want 1 (not the tail)", got)
-	}
-	if got := third.calls(); got != 1 {
-		t.Errorf("third calls = %d, want 1 (not the tail)", got)
-	}
-
-	// The first instance succeeds again: it becomes closed and keeps the traffic.
-	first.setFail(false)
-	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusOK {
-		t.Fatalf("request 3 status = %d, want 200", code)
-	}
-	if got := first.calls(); got != 3 {
-		t.Errorf("first calls = %d, want 3", got)
-	}
-	if got := handler.byProtocol[protocolOpenAI][0].state(); got != stateClosed {
-		t.Errorf("first state after success = %q, want closed", got)
-	}
-	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusOK {
-		t.Fatalf("request 4 status = %d, want 200", code)
-	}
-	if got := second.calls(); got != 1 {
-		t.Errorf("second calls = %d, want 1 (first closed instance serves every request)", got)
+	want := clock.Now().Add(time.Minute)
+	for i, backend := range backends {
+		if got := handler.byProtocol[protocolOpenAI][i].cbDeadline(); !got.Equal(want) {
+			t.Errorf("instance %d degradedUntil = %s, want %s (failure re-times the window)", i, got, want)
+		}
+		if got := backend.calls(); got != 2 {
+			t.Errorf("instance %d calls = %d, want 2", i, got)
+		}
 	}
 }
 
@@ -358,14 +461,19 @@ func TestFailureRetimesBackoff(t *testing.T) {
 		t.Fatalf("request 2 status = %d, want 502", code)
 	}
 	if got := first.calls(); got != 2 {
-		t.Errorf("first calls = %d, want 2 (all-open sends the request to the head)", got)
+		t.Errorf("first calls = %d, want 2 (all-open retry starts at the head)", got)
 	}
 	want := clock.Now().Add(time.Minute)
 	if got := handler.byProtocol[protocolOpenAI][0].cbDeadline(); !got.Equal(want) {
 		t.Errorf("first degradedUntil = %s, want %s (reset, no exponential growth)", got, want)
 	}
-	if got := handler.byProtocol[protocolOpenAI][1].cbDeadline(); !got.Equal(openedAt.Add(time.Minute)) {
-		t.Errorf("second degradedUntil = %s, want its own unchanged deadline", got)
+	// §24.19 M45–M48: the all-open retry chain reaches the second instance too,
+	// so its failure re-times its own deadline to now + degrade_duration.
+	if got := handler.byProtocol[protocolOpenAI][1].cbDeadline(); !got.Equal(want) {
+		t.Errorf("second degradedUntil = %s, want %s (retried and re-timed)", got, want)
+	}
+	if got := second.calls(); got != 2 {
+		t.Errorf("second calls = %d, want 2 (retried while open)", got)
 	}
 }
 

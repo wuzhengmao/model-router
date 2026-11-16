@@ -431,7 +431,7 @@ func TestFallbackSuccessResets(t *testing.T) {
 	}
 }
 
-func TestFallbackAllDegradedUsesFirst(t *testing.T) {
+func TestFallbackAllOpenRetriesEveryInstance(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	first, failFirst, firstCalls, _ := newFlakyBackend(t)
 	failFirst.Store(true)
@@ -455,17 +455,17 @@ func TestFallbackAllDegradedUsesFirst(t *testing.T) {
 		t.Fatalf("calls = %d/%d, want 1/1", firstCalls(), secondCalls())
 	}
 
-	// §24.17 M36: all instances are open, so the next request goes to the first
-	// chain entry (not the tail).
+	// §24.19 M45–M48: all instances are open, so the next request walks the
+	// chain from the head and retries the second instance too.
 	resp = send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions", body, withAuth(config.ProtocolOpenAI, nil))
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", resp.StatusCode)
 	}
 	if got := firstCalls(); got != 2 {
-		t.Errorf("first calls = %d, want 2 (head used, tail skipped)", got)
+		t.Errorf("first calls = %d, want 2 (head retried)", got)
 	}
-	if got := secondCalls(); got != 1 {
-		t.Errorf("second calls = %d, want 1 (tail not forced)", got)
+	if got := secondCalls(); got != 2 {
+		t.Errorf("second calls = %d, want 2 (retried after the head failed)", got)
 	}
 }
 
