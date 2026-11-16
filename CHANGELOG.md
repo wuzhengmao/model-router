@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `docker-compose.yml` 与 `docker-compose.named.yml` 的镜像标签由固定版本号统一改为 `wuzm219/model-router:latest`，避免 compose 文件里的版本号落后于实际发布版本（此前仍停在 `0.1.1`）。
+
 ## [0.1.5] - 2026-11-17
 
 ### Changed

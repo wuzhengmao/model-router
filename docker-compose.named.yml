@@ -7,7 +7,7 @@
 services:
   model-router:
     build: .
-    image: wuzm219/model-router:0.1.1
+    image: wuzm219/model-router:latest
     ports:
       - "${MODEL_ROUTER_PORT:-18080}:18080"
     environment:
