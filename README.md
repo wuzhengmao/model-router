@@ -1,8 +1,10 @@
 # 模型智能路由（model-router）
 
+<img src="docs/assets/logo.svg" alt="模型智能路由 Logo" width="96" height="96">
+
 模型智能路由（`model-router`）是 OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理透传。
 
-> 当前版本：`0.1.2`（实时监控 M9、统计首页与落盘、Cookie 登录与多页面路由、品牌化等）
+> 当前版本：`0.1.3`（实时监控 M9、统计首页与落盘、Cookie 登录与多页面路由、品牌化与匿名可访问的 Logo 等）
 > 需求：[docs/requirements.md](docs/requirements.md) ｜ 设计：[docs/design.md](docs/design.md) ｜ 测试：[docs/tests.md](docs/tests.md) ｜ 变更：[CHANGELOG.md](CHANGELOG.md)
 
 ## 能力范围（M1 ～ M4）
@@ -17,14 +19,14 @@
   - 角色匹配（R4c）：`model` 等于 `sonnet`/`opus`/`fable`/`haiku` 或以 `claude-<role>-` 开头 → 命中声明该角色的条目，改写顶层 `model` 为实例映射的模型；尾部 `[1m]` 后缀（如 `opus[1m]`）在判定前剥除，大小写不敏感。
   - 托底（R4d）：未命中精确/角色且存在 `"*"` 角色 → 命中第一个，改写顶层 `model`。
   - 回退（R5）：都未命中 → 转发展开后的首条目，不改写。
-- **实例粒度回退降级（M4）**：每个协议下实例按配置顺序构成候选链；连接失败/超时自动在本次请求内回退到下一候选；连续失败 3 次进入 5 分钟持续回退（跳过该实例）；回退期结束后首次探测失败立即重新计时；成功清零。吞吐判定仅在「生成时长 >2s 且输出 >100 token」时进行，低于 `min_tokens_per_second` 记为失败（已发出的响应不回退、不打断）。
+- **实例粒度回退降级（M4）**：每个协议下实例按配置顺序构成候选链；连接失败/超时自动在本次请求内回退到下一候选；连续失败 3 次转 `open`（默认 5 分钟后自动恢复），恢复完全由真实请求驱动。吞吐判定仅在「生成时长 >2s 且输出 >100 token」时进行，低于 `min_tokens_per_second` 记为失败（已发出的响应不回退、不打断）。
 - **透传**：方法、路径、查询串、请求体（别名/角色命中时仅改顶层 `model`）与非认证请求头原样转发；响应原样回传，SSE 逐块 flush。
 - **上游认证分离**：OpenAI 实例使用 `Authorization: Bearer <api_key>`，Anthropic 实例使用 `x-api-key: <api_key>`；客户端 token 永不外传。
 - **请求日志**：每个请求打印 `req_model`（客户端原始模型）、`model`（实际转发模型）、`client`（客户端标识，十一级识别）、`ip`（来源 IP）与 `total`/`ttft`/`in`/`out`/`gen`（`gen` 满足吞吐门槛才显示数值，否则 `n/a`）。
 - **模型列表（路径决定格式）**：`GET /v1/models` 固定返回 OpenAI 格式（含可选能力字段），`GET /anthropic/v1/models` 固定返回 Anthropic 官方 schema；不调上游。
 - **Web 配置页 `/admin`**：可视化模式（回退参数输入框、OpenAI/Anthropic 双 tab、添加实例时先选供应商或自定义、实例卡片可拖动排序、测试连接、查询上游模型、勾选/手动填写）+ JSON 高级模式（含 `fallback` 与分组 `instances`；校验通过才可保存）。
 - **实时请求监控（M9）**：管理页「实时监控」页面通过 WebSocket（`GET /api/ws`）接收 AI 请求的 `start`/`chunk`/`retry`/`end` 事件，以一张表格展示状态、方法/路径、请求模型→实例/上游、token、耗时、TTFT 与速率，**每行**在最右侧绘制自己的 trunk 时间轴（横轴从 0 到该请求结束，块间空隙即 TTFT/卡顿，重试切换点用竖线标注）。连接后先收到 snapshot（已结束 100 条 + 进行中 ≤200 条），因此切页/刷新不会空白；「清空」只移除已完成的行、保留进行中的请求与连接。
-- **管理 API**：`GET/PUT /api/config`、`POST /api/reload`、`POST /api/config/validate`、`POST /api/probe/test`、`POST /api/probe/models`、`GET /api/providers`、`GET /api/stats`、`POST /api/stats/clear`、`GET /api/ws`（WebSocket）；HTTP Basic Auth 或会话 Cookie。
+- **管理 API**：`GET/PUT /api/config`、`POST /api/reload`、`POST /api/config/validate`、`POST /api/probe/test`、`POST /api/probe/models`、`GET /api/providers`、`GET /api/stats`、`POST /api/stats/clear`、`POST /api/instances/lock`、`POST /api/instances/unlock`、`GET /api/ws`（WebSocket）；HTTP Basic Auth 或会话 Cookie。
 - **手动重载**：重读 `-config` 文件并原子切换，进程不重启；失败保留旧配置。
 - **环境变量覆盖**：`listen`/`auth_token`/`admin_user`/`admin_password` 可用 `MODEL_ROUTER_*` 覆盖。
 - 版本号单一来源，构建通过 `-ldflags` 注入；`-version` 输出构建版本。
@@ -197,18 +199,20 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
   - OpenAI：实例含请求 `model` → 原样；不含 → 改用该实例 `models[0]` 并改写。
   - Anthropic：实例含角色 R → 用 `roles[R]` 并改写；不含但有 `*` → 用 `roles["*"]` 并改写；两者皆无 → 跳过。
   - R5（无 model/非字符串/null/非法 JSON/未命中）：以首个实例为基础，候选链覆盖该协议实例；Anthropic 只取声明 `*` 的实例；**正文不改写**。
-- 每个实例维护连续失败次数与持续回退截止时间（参数来自顶层 `fallback`，默认 3 次 / 5 分钟 / 30 token/s）：
-  1. 跳过仍在持续回退期的实例；
+- 每个实例维护显式熔断状态（`closed` / `open`）与回退截止时间（参数来自顶层 `fallback`，默认 3 次 / 5 分钟 / 30 token/s）：
+  1. 跳过处于 `open` 的实例；
   2. 连接失败 / 超时（实例 `timeout`，默认 15s）→ 本次请求立即尝试下一候选（临时回退）；
-  3. 连续失败 ≥ `failure_threshold` 次 → 进入持续回退 `degrade_duration`，后续请求跳过该实例；
-  4. 回退期结束后的首次探测若再失败 → 立即重新计时；成功则清零恢复；
-  5. 所有候选都在回退中 → 强制尝试链头一次；全部失败 → 502。
+  3. 连续失败 ≥ `failure_threshold` 次 → 转 `open` 并记录降级开始时间；已 `open` 的实例再次失败 → 回退截止时间重置为「当前时间 + `degrade_duration`」，不做指数退避；
+  4. 每次请求按候选链顺序选择**第一个 `closed` 实例**；回退截止时间到期后实例自动回到 `closed`（空闲时也按时间恢复，无需任何额外动作）；
+  5. 候选链上全部实例都 `open` → 新请求发往**链上第一个**实例；它成功后恢复 `closed`，后续请求继续由它承接。
+- 实例回退状态按协议维护、只存内存；统计页实例行按「openai → anthropic、组内配置优先级」排序。
+- 锁定 / 解锁（`POST /api/instances/lock`、`POST /api/instances/unlock`）：锁定后熔断策略暂停，该协议全部请求发往被锁定实例；锁定状态不落盘，重启或 reload 后恢复。
+- 回退状态与锁定仅在进程内存；重启或 reload（重建 handler）后清零。
 - 吞吐（M4.4 修订）：耗时按「首数据块→末数据块」的**纯生成时长**计算（建连/TTFT 不计入）。仅当「生成时长 >2s」且「输出 >100 token」且「能拿到 usage」时才计算 token/s，低于 `min_tokens_per_second` 记为失败（仅影响后续请求，已发出的响应不回退、不打断）。不满足样本门槛 → 跳过并视为健康。`min_tokens_per_second=0` 禁用该判定。
 - 空闲超时（M4.1）：流式响应 committed 后，连续 `idle_timeout`（默认 30s）无新数据块 → 终止上游读取并记实例失败：
   - Anthropic：先补 `content_block_stop`（若在块内），再补 `message_delta`（`stop_reason=pause_turn`）与 `message_stop`，客户端 SDK 可自动续接。
   - OpenAI：直接中断客户端连接（流截断，不补 `[DONE]`）。
   - 首字节等待仍由实例 `timeout` 控制；`idle_timeout=0` 禁用空闲判定。
-- 回退状态仅在进程内存；重启或 reload（重建 handler）后清零。
 
 ## 模型列表
 
@@ -253,7 +257,7 @@ curl -sS http://127.0.0.1:18080/anthropic/v1/models -H "Authorization: Bearer <a
 
 管理页是四个独立路由页面（刷新后停留在当前页）：
 
-- **统计首页 `/admin/`**：运行与连接、请求统计、实例统计、近期错误四块指标；数据来自 `GET /api/stats` 与全局 WS，缩写数值悬停显示精确值。
+- **统计首页 `/admin/`**：运行与连接、请求统计、实例统计、近期错误四块指标；实例表按协议与优先级排序，`open` 显示降级开始时间，`locked` 显示「已锁定」，其余显示「正常」，每行带锁定/解锁按钮。数据来自 `GET /api/stats` 与全局 WS，缩写数值悬停显示精确值。
 - **实时监控 `/admin/monitor`**：登录后自动建立全局 WebSocket，无需单独的认证栏或连接/断开按钮。快照包含最近 100 条已结束请求与最多 200 条进行中请求（带逐块明细），因此切页/刷新不空白；进行中的行会继续接收 chunk/end 事件。主体是**一张表格**：`#`、状态、方法/路径、客户端、请求模型/实例·上游、入、出、块、耗时、TTFT、t/s、时间轴；每行独立时间轴，等待首包（琥珀）/ trunk（蓝）/ 含内容块（绿）三色、重试虚线、进行中当前游标，所有行共享按最长耗时动态更新的量程，刻度与图例在表头。「清空」只移除已完成行并同时清空后端最近 100 条环形缓冲，列表最多保留最近 500 条已完成请求。无 WS 客户端时仍累计统计并维护快照，只是不广播逐 trunk 事件；现有日志格式不变。
 - **可视化配置 `/admin/config`**：OpenAI / Anthropic 双 tab；「添加实例」先弹出供应商选择框（内置供应商 + 自定义），选内置会按当前协议自动填 `base_url` 并记录 `provider`，自定义则手动填写；每张实例卡片可「测试连接」「查询模型」（带上 `provider`，自动走 models_override）、勾选/手填模型；保存 → `PUT /api/config`。页面底部的统计持久化说明见「统计持久化与卷」。
 - **JSON 高级 `/admin/json`**：编辑完整配置；「校验」→ `POST /api/config/validate`，通过后才启用「保存」；编辑框随视口高度自适应。
@@ -264,7 +268,7 @@ curl -sS http://127.0.0.1:18080/anthropic/v1/models -H "Authorization: Bearer <a
 | `/admin/`、`/admin/monitor`、`/admin/config`、`/admin/json` | GET | 四个独立页面（统计首页 / 实时监控 / 可视化配置 / JSON 高级，原生 HTML+JS，无外部 CDN）；未登录 302 到 `/admin/login` |
 | `/admin/login` | GET | 独立登录页 |
 | `/api/login`、`/api/logout` | POST | Cookie 会话登录/登出（`mr_session`；记住我 30 天，否则会话 cookie + 服务端 12 小时） |
-| `/favicon.ico` | GET | 匿名可访问的多尺寸图标（`image/x-icon`）；`/admin/logo.svg` 为需登录的矢量 Logo |
+| `/favicon.ico`、`/logo.svg` | GET | 匿名可访问的品牌资源（多尺寸图标 `image/x-icon`、矢量 Logo `image/svg+xml`，均为 `Cache-Control: public, max-age=86400`）；登录页与四个管理页左上角都用 `/logo.svg` |
 | `/api/config` | GET | 返回当前**生效**配置（含真实 key） |
 | `/api/config` | PUT | 校验后原子写回 `-config` 文件，**不生效** |
 | `/api/config/validate` | POST | 对请求体做全量校验（dry-run），返回 `{ok}`；不写回 |
@@ -272,7 +276,9 @@ curl -sS http://127.0.0.1:18080/anthropic/v1/models -H "Authorization: Bearer <a
 | `/api/probe/test` | POST | 按协议探测上游：openai `GET {base_url}/v1/models`；anthropic `POST {base_url}/v1/messages` 最小请求。返回 `{ok, latency_ms, message}`（2xx 或认证通过的 4xx 视为可达；401/403/404 视为失败） |
 | `/api/probe/models` | POST | `GET {base_url}/v1/models`（openai Bearer / anthropic x-api-key + version）；`provider` 命中 models_override 时改用 override 的 base_url/auth。返回 `{models:[...]}`；上游未实现该端点（404）时返回友好错误，引导手动输入 |
 | `/api/providers` | GET | 返回内置供应商清单（id/name/base_urls/models_override） |
-| `/api/stats` | GET | 返回统计快照（与 WS `stats` 帧的 `data` 同构，含累计值、分位数、实例与近期错误） |
+| `/api/stats` | GET | 返回统计快照（与 WS `stats` 帧的 `data` 同构，含累计值、分位数、实例与近期错误）；`instances[]` 每项含 `protocol`、`priority`、`state`（`closed`/`open`/`locked`/`-`）、`locked`、`degradedSince`（毫秒时间戳，0 表示未降级）、`reason`、`current`（恒为 false，兼容保留），并保留兼容字段 `degraded` |
+| `/api/instances/lock` | POST | `{"protocol":"openai","name":"MTI"}`：锁定该实例；该协议其余实例显示为 `-`，熔断计数暂停，全部请求发往被锁定实例；重复锁定幂等返回 200 |
+| `/api/instances/unlock` | POST | `{"protocol":"openai"}`：解除锁定，该协议全部实例状态清零、重新计数，之后按候选链第一个 `closed` 实例选路 |
 | `/api/stats/clear` | POST | 清零累计统计与近期错误并立即落盘；不影响 100 条请求快照 |
 | `/api/monitor/clear` | POST | 清空后端最近 100 条请求快照；不影响累计统计 |
 | `/api/ws` | GET（WebSocket） | 快照 + 统计 + 实时监控事件流（`start`/`chunk`/`retry`/`end`）；认证同管理面，另接受 `?user=&password=` 回退。旧 `/api/monitor` 已删除（404） |

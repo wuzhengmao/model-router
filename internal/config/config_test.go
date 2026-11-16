@@ -53,6 +53,11 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if got := cfg.Fallback.DegradeDuration.Duration(); got != config.DefaultDegradeDuration {
 		t.Errorf("degrade_duration = %s, want %s", got, config.DefaultDegradeDuration)
 	}
+	// §24.18 M41/M15as: the default is 5m (the 1m value belonged to the removed
+	// probe-period semantics), not just whatever the constant happens to be.
+	if got := cfg.Fallback.DegradeDuration.Duration(); got != 5*time.Minute {
+		t.Errorf("default degrade_duration = %s, want 5m", got)
+	}
 	if cfg.Fallback.MinTokensPerSecond != config.DefaultMinTokensPerSecond {
 		t.Errorf("min_tokens_per_second = %v, want %v", cfg.Fallback.MinTokensPerSecond, config.DefaultMinTokensPerSecond)
 	}

@@ -201,6 +201,8 @@
   }
   .stat-block h2 { font-size: 13px; margin: 0 0 8px; font-weight: 600; }
   .stat-block .hint { margin: 0 0 8px; }
+  .stat-subhead { font-size: 12px; font-weight: 600; color: var(--muted); margin: 10px 0 4px; }
+  .stat-block h2 + .stat-subhead { margin-top: 0; }
   .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 6px; }
   .stat-tile {
     background: var(--panel-2);
@@ -252,6 +254,30 @@
   .stat-degraded { color: var(--danger); font-weight: 600; }
   .stat-removed { color: var(--muted); font-weight: 600; }
   .stat-ok { color: var(--ok); }
+  /* §24.15 M14/M15：open 与锁定协议的其余行变灰，已锁定用琥珀色。 */
+  .stat-table tr.stat-muted td { color: var(--muted); }
+  .stat-table tr.stat-muted td.stat-degraded { color: var(--muted); }
+  .stat-shadowed { color: var(--muted); }
+  .stat-locked { color: var(--warn); font-weight: 600; }
+  .stat-lock-cell { text-align: center; }
+  .lock-button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 5px;
+    padding: 1px 4px;
+    line-height: 0;
+    cursor: pointer;
+  }
+  .lock-button:hover { color: var(--text); border-color: var(--accent); }
+  .lock-button.locked { color: var(--warn); border-color: var(--warn); }
+  .lock-button svg {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
   /* §24.12 J1：JSON 高级页编辑框弹性填满 header 以下剩余高度。 */
   body.json-mode {
     min-height: 100vh;
@@ -502,7 +528,7 @@
 </head>
 <body>
 <header>
-  <h1 class="brand"><img src="/admin/logo.svg" alt="" width="24" height="24"><span>模型智能路由</span></h1>
+  <h1 class="brand"><img src="/logo.svg" alt="" width="24" height="24"><span>模型智能路由</span></h1>
   <nav class="top-nav" aria-label="管理页导航">
     <a href="/admin/" data-page="stats">统计</a>
     <a href="/admin/monitor" data-page="monitor">实时监控</a>
@@ -541,17 +567,21 @@
     </div>
     <div class="stat-block">
       <h2>实例统计</h2>
+      <h3 class="stat-subhead">OpenAI 实例</h3>
       <div class="stat-table-wrap">
-        <table class="stat-table" id="stat-instances-table">
+        <table class="stat-table" id="stat-instances-openai-table">
           <colgroup>
-            <col style="width:26%">
+            <col style="width:19%">
+            <col style="width:7%">
+            <col style="width:6%">
+            <col style="width:6%">
+            <col style="width:6%">
             <col style="width:10%">
-            <col style="width:9%">
-            <col style="width:9%">
-            <col style="width:9%">
-            <col style="width:13%">
-            <col style="width:12%">
-            <col style="width:12%">
+            <col style="width:11%">
+            <col style="width:11%">
+            <col style="width:8%">
+            <col style="width:10%">
+            <col style="width:6%">
           </colgroup>
           <thead>
             <tr>
@@ -561,14 +591,52 @@
               <th class="num">成功</th>
               <th class="num">失败</th>
               <th class="num">平均 TTFT</th>
+              <th class="num">输入 token</th>
+              <th class="num">输出 token</th>
               <th class="num">平均 t/s</th>
               <th>状态</th>
+              <th class="lock-col" title="锁定 / 解锁">锁定</th>
             </tr>
           </thead>
-          <tbody id="stat-instances"></tbody>
+          <tbody id="stat-instances-openai"></tbody>
         </table>
       </div>
-      <div id="stat-instances-empty" class="empty" hidden>暂无实例数据。</div>
+      <div id="stat-instances-openai-empty" class="empty" hidden>暂无 OpenAI 实例。</div>
+      <h3 class="stat-subhead">Anthropic 实例</h3>
+      <div class="stat-table-wrap">
+        <table class="stat-table" id="stat-instances-anthropic-table">
+          <colgroup>
+            <col style="width:19%">
+            <col style="width:7%">
+            <col style="width:6%">
+            <col style="width:6%">
+            <col style="width:6%">
+            <col style="width:10%">
+            <col style="width:11%">
+            <col style="width:11%">
+            <col style="width:8%">
+            <col style="width:10%">
+            <col style="width:6%">
+          </colgroup>
+          <thead>
+            <tr>
+              <th>实例</th>
+              <th class="num">请求</th>
+              <th class="num">占比</th>
+              <th class="num">成功</th>
+              <th class="num">失败</th>
+              <th class="num">平均 TTFT</th>
+              <th class="num">输入 token</th>
+              <th class="num">输出 token</th>
+              <th class="num">平均 t/s</th>
+              <th>状态</th>
+              <th class="lock-col" title="锁定 / 解锁">锁定</th>
+            </tr>
+          </thead>
+          <tbody id="stat-instances-anthropic"></tbody>
+        </table>
+      </div>
+      <div id="stat-instances-anthropic-empty" class="empty" hidden>暂无 Anthropic 实例。</div>
     </div>
     <div class="stat-block">
       <h2>近期错误</h2>
@@ -2036,16 +2104,6 @@
   window.__modelRouterMonitor = monitor;
   window.__modelRouterLive = live;
 
-  function formatMs(ms) {
-    if (!isFinite(ms) || ms < 0) {
-      return '–';
-    }
-    if (ms < 1000) {
-      return Math.round(ms) + 'ms';
-    }
-    return (ms / 1000).toFixed(ms < 10000 ? 2 : 1) + 's';
-  }
-
   function formatNumber(value) {
     return value === undefined || value === null || value === 0 ? '–' : String(value);
   }
@@ -2245,9 +2303,10 @@
 
     var ip = req.clientIP || '–';
     var rawUA = req.userAgent || '';
+    var uaLabel = userAgentLabel(rawUA);
     req.cells.clientIp.textContent = ip;
     req.cells.clientIp.title = ip;
-    req.cells.clientUa.textContent = userAgentLabel(rawUA);
+    req.cells.clientUa.textContent = uaLabel;
     req.cells.clientUa.title = rawUA || '–';
     req.cells.client.title = ip + ' ' + (rawUA || '–');
 
@@ -2264,14 +2323,17 @@
     setMonitorCellText(req.cells.chunks, formatNumber(req.chunks));
     // §24.11 H1：快照恢复的进行中行从服务端已耗时继续增长。
     setMonitorCellText(req.cells.duration,
-      formatMs(req.ended ? req.durationMs : (req.baseDurationMs || 0) + (Date.now() - req.recvAt)));
-    setMonitorCellText(req.cells.ttft, monitorTTFT(req) ? formatMs(monitorTTFT(req)) : '–');
-    setMonitorCellText(req.cells.tps, req.tps ? req.tps.toFixed(1) : '–');
+      formatDuration(req.ended ? req.durationMs : (req.baseDurationMs || 0) + (Date.now() - req.recvAt)));
+    setMonitorCellText(req.cells.ttft, monitorTTFT(req) ? formatDuration(monitorTTFT(req)) : '–');
+    setMonitorCellText(req.cells.tps, formatRate(req.tps));
   }
 
   function addMonitorRow(req, append) {
     var row = document.createElement('tr');
     var pathCell = monitorStackCell('req-path', 'req-method', 'req-url');
+    var methodText = document.createElement('span');
+    methodText.className = 'req-method-text';
+    pathCell.top.appendChild(methodText);
     var clientCell = monitorStackCell('req-client', 'req-client-ip', 'req-client-id');
     var routeCell = monitorStackCell('req-route', 'req-model', 'req-target');
     var timelineCell = document.createElement('td');
@@ -2287,7 +2349,7 @@
       index: monitorCell('', 'num req-idx'),
       status: monitorCell('', 'req-status'),
       method: pathCell.cell,
-      methodText: pathCell.top,
+      methodText: methodText,
       url: pathCell.bottom,
       client: clientCell.cell,
       clientIp: clientCell.top,
@@ -3120,30 +3182,34 @@
     return seconds + 's';
   }
 
-  // §24.10 C1：<1000ms 用整数毫秒；≥1000ms 用秒（2 位小数）；≥3600s 用小时（1 位小数）。
-  function formatStatDuration(ms) {
+  // §24.15 M15t：页面内唯一的时长格式化（监控页耗时/首包、统计页 TTFT、P50/P95）。
+  // <1000ms 整数毫秒；1s–60s 用秒（2 位）；60s–3600s 用分（2 位）；否则用小时（2 位）。
+  function formatDuration(ms) {
     if (ms === null || ms === undefined) {
-      return null;
+      return '–';
     }
     var value = Number(ms);
     if (!isFinite(value) || value < 0) {
-      return null;
+      return '–';
     }
     if (value < 1000) {
       return Math.round(value) + 'ms';
     }
-    var seconds = value / 1000;
-    if (seconds >= 3600) {
-      return (seconds / 3600).toFixed(1) + 'h';
+    if (value < 60000) {
+      return (value / 1000).toFixed(2) + 's';
     }
-    return seconds.toFixed(2) + 's';
+    if (value < 3600000) {
+      return (value / 60000).toFixed(2) + 'm';
+    }
+    return (value / 3600000).toFixed(2) + 'h';
   }
 
   function formatExactNumber(value) {
     return Math.round(Number(value)).toLocaleString('en-US');
   }
 
-  // §24.10 C2：<1000 原样；≥1000 用 K（1 位）；≥1e6 用 M（2 位）。
+  // §24.10 C2 / §24.15 M15s/M15t：页面内唯一的 K/M 计数格式化（请求数、成功/失败、
+  // token、重试、WS 连接、活跃请求）。<1000 原样；≥1000 用 K（1 位）；≥1e6 用 M（2 位）。
   // 先按原值选单位，舍入后若跨到下一单位（999.96K → 1.00M）重新取单位。
   function formatStatCount(value) {
     if (value === null || value === undefined) {
@@ -3168,14 +3234,40 @@
     return { text: (rounded / 1e6).toFixed(2) + 'M', exact: exact };
   }
 
+  // §24.15 M15s：实例 token 列沿用唯一的 K/M 计数规则，仅把缺省/非法值显示为 0。
+  function formatInstanceTokenCount(value) {
+    var number = value === null || value === undefined ? NaN : Number(value);
+    if (!isFinite(number)) {
+      return { text: '0', exact: '0' };
+    }
+    return formatStatCount(number);
+  }
+
+  // §24.15 M15t：页面内唯一的百分比（1 位小数）与速率（1 位小数）格式化。
+  function formatPercent(value) {
+    var number = value === null || value === undefined ? NaN : Number(value);
+    if (!isFinite(number)) {
+      return '–';
+    }
+    return number.toFixed(1) + '%';
+  }
+
+  function formatRate(value, suffix) {
+    var number = value === null || value === undefined ? NaN : Number(value);
+    if (!isFinite(number)) {
+      return '–';
+    }
+    return number.toFixed(1) + (suffix || '');
+  }
+
   function formatPercentilePair(p50, p95) {
-    var left = formatStatDuration(p50);
-    var right = formatStatDuration(p95);
-    if (left === null && right === null) {
+    var left = formatDuration(p50);
+    var right = formatDuration(p95);
+    if (left === '–' && right === '–') {
       return { text: '–', title: '' };
     }
     return {
-      text: (left === null ? '–' : left) + ' / ' + (right === null ? '–' : right),
+      text: left + ' / ' + right,
       title: 'P50 ' + (p50 === null || p50 === undefined ? '–' : formatExactNumber(p50) + 'ms') +
         ' · P95 ' + (p95 === null || p95 === undefined ? '–' : formatExactNumber(p95) + 'ms'),
     };
@@ -3220,67 +3312,165 @@
     return cell;
   }
 
-  function renderStatInstances(instances) {
-    var tbody = document.getElementById('stat-instances');
-    var table = document.getElementById('stat-instances-table');
-    var empty = document.getElementById('stat-instances-empty');
+  function statInstanceState(item) {
+    if (typeof item.state === 'string' && item.state !== '') {
+      return item.state;
+    }
+    var degraded = item.degraded === true || item.isDegraded === true ||
+      item.degraded === 'degraded' || item.status === 'degraded';
+    return degraded ? 'open' : 'closed';
+  }
+
+  function statStateText(state, item) {
+    switch (state) {
+      case 'locked': return '已锁定';
+      case '-': return '-';
+      case 'open': {
+        var since = Number(item.degradedSince);
+        if (isFinite(since) && since > 0) {
+          return '降级 ' + formatClock(since).slice(0, 8);
+        }
+        return '降级';
+      }
+      case 'closed': return '正常';
+      default:
+        return item.degraded === true ? '降级' : '正常';
+    }
+  }
+
+  function statStateClass(state) {
+    switch (state) {
+      case 'locked': return 'stat-locked';
+      case '-': return 'stat-shadowed';
+      case 'open': return 'stat-degraded';
+      case 'closed': return 'stat-ok';
+      default: return '';
+    }
+  }
+
+  var LOCK_CLOSED_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">' +
+    '<rect x="3" y="7" width="10" height="7" rx="1.5"></rect>' +
+    '<path d="M5 7V5a3 3 0 0 1 6 0v2"></path></svg>';
+  var LOCK_OPEN_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">' +
+    '<rect x="3" y="7" width="10" height="7" rx="1.5"></rect>' +
+    '<path d="M5 7V5a3 3 0 0 1 5.6-1.5"></path></svg>';
+
+  function toggleInstanceLock(protocol, name, locked) {
+    var path = locked ? '/api/instances/unlock' : '/api/instances/lock';
+    var body = locked ? { protocol: protocol } : { protocol: protocol, name: name };
+    api(path, { method: 'POST', body: JSON.stringify(body) }).then(function () {
+      return api('/api/stats');
+    }).then(function (raw) {
+      if (raw) {
+        renderStats(raw);
+      }
+    }).catch(function (err) {
+      setStatus((locked ? '解锁失败：' : '锁定失败：') + err.message, 'error');
+    });
+  }
+
+  function appendStatInstanceRow(tbody, raw) {
+    var item = raw && typeof raw === 'object' ? raw : {};
+    var row = document.createElement('tr');
+    var requests = item.requests;
+    if (requests === undefined) {
+      requests = item.count;
+    }
+    if (requests === undefined) {
+      requests = item.total;
+    }
+    var share = item.share;
+    if (share === undefined) {
+      share = item.percent;
+    }
+    if (share === undefined && item.ratio !== undefined) {
+      share = Number(item.ratio) * 100;
+    }
+    var avgTtft = item.avgTtftMs;
+    if (avgTtft === undefined) {
+      avgTtft = item.avgTTFT;
+    }
+    if (avgTtft === undefined) {
+      avgTtft = item.ttftMs;
+    }
+    var avgTps = item.avgTps;
+    if (avgTps === undefined) {
+      avgTps = item.avgTPS;
+    }
+    var removed = item.removed === true || item.status === 'removed';
+    var state = removed ? '' : statInstanceState(item);
+    if (state === 'open' || state === '-') {
+      row.classList.add('stat-muted');
+    }
+    var requestCount = formatStatCount(requests);
+    var successCount = formatStatCount(item.success);
+    var failedCount = formatStatCount(item.failed);
+    var inTokenCount = formatInstanceTokenCount(item.inTokens);
+    var outTokenCount = formatInstanceTokenCount(item.outTokens);
+    var ttftText = formatDuration(avgTtft);
+    row.appendChild(statCell(String(item.name || item.instName || item.instance || '–')));
+    row.appendChild(statCell(requestCount.text, 'num', requestCount.exact));
+    row.appendChild(statCell(formatPercent(share), 'num'));
+    row.appendChild(statCell(successCount.text, 'num', successCount.exact));
+    row.appendChild(statCell(failedCount.text, 'num', failedCount.exact));
+    row.appendChild(statCell(ttftText, 'num',
+      avgTtft === undefined || avgTtft === null ? '' : formatExactNumber(avgTtft) + 'ms'));
+    row.appendChild(statCell(inTokenCount.text, 'num', inTokenCount.exact));
+    row.appendChild(statCell(outTokenCount.text, 'num', outTokenCount.exact));
+    row.appendChild(statCell(formatRate(avgTps), 'num'));
+    if (removed) {
+      row.appendChild(statCell('已移除', 'stat-removed'));
+    } else {
+      row.appendChild(statCell(statStateText(state, item), statStateClass(state)));
+    }
+    var lockCell = document.createElement('td');
+    lockCell.className = 'stat-lock-cell';
+    if (!removed && item.protocol && item.name) {
+      var locked = item.locked === true || state === 'locked';
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'lock-button' + (locked ? ' locked' : '');
+      button.title = locked ? '解锁实例' : '锁定实例';
+      button.setAttribute('aria-label', button.title);
+      button.innerHTML = locked ? LOCK_CLOSED_ICON : LOCK_OPEN_ICON;
+      button.addEventListener('click', function () {
+        toggleInstanceLock(String(item.protocol), String(item.name), locked);
+      });
+      lockCell.appendChild(button);
+    }
+    row.appendChild(lockCell);
+    tbody.appendChild(row);
+  }
+
+  function renderStatInstanceTable(instances, protocol, ids) {
+    var tbody = document.getElementById(ids.body);
+    var table = document.getElementById(ids.table);
+    var empty = document.getElementById(ids.empty);
     if (!tbody || !table || !empty) {
       return;
     }
     tbody.textContent = '';
-    var list = Array.isArray(instances) ? instances : [];
-    list.forEach(function (raw) {
-      var item = raw && typeof raw === 'object' ? raw : {};
-      var row = document.createElement('tr');
-      var requests = item.requests;
-      if (requests === undefined) {
-        requests = item.count;
-      }
-      if (requests === undefined) {
-        requests = item.total;
-      }
-      var share = item.share;
-      if (share === undefined) {
-        share = item.percent;
-      }
-      if (share === undefined && item.ratio !== undefined) {
-        share = Number(item.ratio) * 100;
-      }
-      var avgTtft = item.avgTtftMs;
-      if (avgTtft === undefined) {
-        avgTtft = item.avgTTFT;
-      }
-      if (avgTtft === undefined) {
-        avgTtft = item.ttftMs;
-      }
-      var avgTps = item.avgTps;
-      if (avgTps === undefined) {
-        avgTps = item.avgTPS;
-      }
-      var degraded = item.degraded === true || item.isDegraded === true ||
-        item.degraded === 'degraded' || item.status === 'degraded';
-      var removed = item.removed === true || item.status === 'removed';
-      var requestCount = formatStatCount(requests);
-      var successCount = formatStatCount(item.success);
-      var failedCount = formatStatCount(item.failed);
-      var ttftText = formatStatDuration(avgTtft) || '–';
-      row.appendChild(statCell(String(item.name || item.instName || item.instance || '–')));
-      row.appendChild(statCell(requestCount.text, 'num', requestCount.exact));
-      row.appendChild(statCell(share === undefined || share === null ? '–' : Number(share).toFixed(1) + '%', 'num'));
-      row.appendChild(statCell(successCount.text, 'num', successCount.exact));
-      row.appendChild(statCell(failedCount.text, 'num', failedCount.exact));
-      row.appendChild(statCell(ttftText, 'num',
-        avgTtft === undefined || avgTtft === null ? '' : formatExactNumber(avgTtft) + 'ms'));
-      row.appendChild(statCell(avgTps ? Number(avgTps).toFixed(1) : '–', 'num'));
-      if (removed) {
-        row.appendChild(statCell('已移除', 'stat-removed'));
-      } else {
-        row.appendChild(statCell(degraded ? '降级' : '正常', degraded ? 'stat-degraded' : 'stat-ok'));
-      }
-      tbody.appendChild(row);
+    var list = (Array.isArray(instances) ? instances : []).filter(function (item) {
+      return item && typeof item === 'object' && String(item.protocol || '') === protocol;
+    });
+    list.forEach(function (item) {
+      appendStatInstanceRow(tbody, item);
     });
     table.hidden = list.length === 0;
     empty.hidden = list.length > 0;
+  }
+
+  function renderStatInstances(instances) {
+    renderStatInstanceTable(instances, 'openai', {
+      body: 'stat-instances-openai',
+      table: 'stat-instances-openai-table',
+      empty: 'stat-instances-openai-empty'
+    });
+    renderStatInstanceTable(instances, 'anthropic', {
+      body: 'stat-instances-anthropic',
+      table: 'stat-instances-anthropic-table',
+      empty: 'stat-instances-anthropic-empty'
+    });
   }
 
   function renderStatErrors(errors) {
@@ -3342,18 +3532,18 @@
     setStat('stat-version', stats.version || '–');
     setStat('stat-ws', wsClients.text, wsClients.exact);
     setStat('stat-active', active.text, active.exact);
-    setStat('stat-qps', stats.qps === null ? '–' : stats.qps.toFixed(1));
+    setStat('stat-qps', formatRate(stats.qps));
     setStat('stat-total', total.text, total.exact);
     setStat('stat-okfail', success.text + ' / ' + failed.text,
       (success.exact || '–') + ' / ' + (failed.exact || '–'));
-    setStat('stat-success-rate', stats.successRate === null ? '–' : stats.successRate.toFixed(1) + '%');
+    setStat('stat-success-rate', formatPercent(stats.successRate));
     setStat('stat-protocols', openai.text + ' / ' + anthropic.text,
       (openai.exact || '–') + ' / ' + (anthropic.exact || '–'));
     setStat('stat-ttft', ttft.text, ttft.title);
     setStat('stat-duration', duration.text, duration.title);
     setStat('stat-in-tokens', inTokens.text, inTokens.exact);
     setStat('stat-out-tokens', outTokens.text, outTokens.exact);
-    setStat('stat-tps', stats.avgTps === null ? '–' : stats.avgTps.toFixed(1) + ' t/s');
+    setStat('stat-tps', formatRate(stats.avgTps, ' t/s'));
     setStat('stat-retries', retries.text, retries.exact);
     renderStatInstances(stats.instances);
     renderStatErrors(stats.errors);

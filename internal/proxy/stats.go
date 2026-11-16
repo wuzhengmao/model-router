@@ -44,12 +44,52 @@ type statsInstance struct {
 	Percent  float64 `json:"percent"`
 	Success  int64   `json:"success"`
 	Failed   int64   `json:"failed"`
-	AvgTTFT  float64 `json:"avgTtftMs"`
-	AvgTPS   float64 `json:"avgTps"`
-	Degraded bool    `json:"degraded"`
+	// §24.15 M17: full usage input/output tokens accumulated over every finished
+	// request of this instance, failures included. OutTokens deliberately counts
+	// thinking/reasoning output, so it is not the genOut throughput sample.
+	InTokens  int64   `json:"inTokens"`
+	OutTokens int64   `json:"outTokens"`
+	AvgTTFT   float64 `json:"avgTtftMs"`
+	AvgTPS    float64 `json:"avgTps"`
+	Degraded  bool    `json:"degraded"`
+	// §24.15.3 breaker view. State is closed/open/locked, or "-" for the
+	// shadowed instances of a locked protocol. §24.17 M37 removed the current
+	// pointer, so Current is always false and kept only for wire compatibility.
+	Protocol      string `json:"protocol"`
+	Priority      int    `json:"priority"`
+	State         string `json:"state"`
+	Locked        bool   `json:"locked"`
+	DegradedSince int64  `json:"degradedSince"`
+	Reason        string `json:"reason"`
+	Current       bool   `json:"current"`
 	// Removed marks persisted counters for an instance no longer configured
 	// (§24.7 D11): the row stays visible with a "removed" label.
 	Removed bool `json:"removed"`
+}
+
+// protocolRank orders instance rows by protocol group: OpenAI first, Anthropic
+// second (§24.15 M15r). Unknown protocols (legacy rows) go last.
+func protocolRank(protocol string) int {
+	switch protocol {
+	case config.ProtocolOpenAI:
+		return 0
+	case config.ProtocolAnthropic:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// compareStatsInstance implements the /api/stats row order (§24.15 M15r):
+// protocol group, then configured priority, then instance name.
+func compareStatsInstance(x, y statsInstance) int {
+	if diff := cmp.Compare(protocolRank(x.Protocol), protocolRank(y.Protocol)); diff != 0 {
+		return diff
+	}
+	if diff := cmp.Compare(x.Priority, y.Priority); diff != 0 {
+		return diff
+	}
+	return cmp.Compare(x.Name, y.Name)
 }
 
 type statsRequests struct {
@@ -89,13 +129,24 @@ type statsSnapshot struct {
 }
 
 type instanceCounters struct {
+	protocol  string
+	name      string
 	requests  int64
 	success   int64
 	failure   int64
+	inTokens  int64
+	outTokens int64
 	ttftCount int64
 	ttftSum   int64
 	genOut    int64
 	genMs     int64
+}
+
+// instanceKey keys cumulative counters by protocol too, so the same instance
+// name in both protocols yields two independent rows (§24.15 M15a).
+type instanceKey struct {
+	protocol string
+	name     string
 }
 
 type sampleRing struct {
@@ -136,7 +187,7 @@ type statsAggregator struct {
 	ttftSamples     sampleRing
 	durationSamples sampleRing
 
-	instances    map[string]*instanceCounters
+	instances    map[instanceKey]*instanceCounters
 	recentErrors []statsError
 	requests     []monitorRequestSnapshot
 	starts       []time.Time
@@ -159,7 +210,7 @@ func newStatsAggregator() *statsAggregator {
 			config.ProtocolOpenAI:    0,
 			config.ProtocolAnthropic: 0,
 		},
-		instances:   make(map[string]*instanceCounters),
+		instances:   make(map[instanceKey]*instanceCounters),
 		persistStop: make(chan struct{}),
 		persistDone: make(chan struct{}),
 	}
@@ -219,10 +270,10 @@ func (a *statsAggregator) finish(req monitorRequestSnapshot, success bool) {
 		a.genOut += int64(req.OutTokens)
 	}
 
-	inst := a.instances[req.InstName]
+	inst := a.instances[instanceKey{protocol: req.Protocol, name: req.InstName}]
 	if inst == nil {
-		inst = &instanceCounters{}
-		a.instances[req.InstName] = inst
+		inst = &instanceCounters{protocol: req.Protocol, name: req.InstName}
+		a.instances[instanceKey{protocol: req.Protocol, name: req.InstName}] = inst
 	}
 	inst.requests++
 	if success {
@@ -230,6 +281,9 @@ func (a *statsAggregator) finish(req monitorRequestSnapshot, success bool) {
 	} else {
 		inst.failure++
 	}
+	// M17: every finished request contributes its full usage, failed ones too.
+	inst.inTokens += int64(req.InTokens)
+	inst.outTokens += int64(req.OutTokens)
 	inst.ttftCount++
 	inst.ttftSum += req.TTFTMs
 	if req.GenMs > 0 {
@@ -304,12 +358,15 @@ func (a *statsAggregator) snapshot(wsClients int, startedAt time.Time) statsSnap
 	}
 
 	instances := make([]statsInstance, 0, len(a.instances))
-	for name, counters := range a.instances {
+	for key, counters := range a.instances {
 		item := statsInstance{
-			Name:     name,
-			Requests: counters.requests,
-			Success:  counters.success,
-			Failed:   counters.failure,
+			Name:      key.name,
+			Protocol:  key.protocol,
+			Requests:  counters.requests,
+			Success:   counters.success,
+			Failed:    counters.failure,
+			InTokens:  counters.inTokens,
+			OutTokens: counters.outTokens,
 		}
 		if a.total > 0 {
 			item.Percent = round1(float64(counters.requests) * 100 / float64(a.total))
@@ -322,7 +379,7 @@ func (a *statsAggregator) snapshot(wsClients int, startedAt time.Time) statsSnap
 		}
 		instances = append(instances, item)
 	}
-	slices.SortFunc(instances, func(x, y statsInstance) int { return cmp.Compare(x.Name, y.Name) })
+	slices.SortFunc(instances, compareStatsInstance)
 
 	recentErrors := make([]statsError, len(a.recentErrors))
 	copy(recentErrors, a.recentErrors)
@@ -407,31 +464,96 @@ func truncateRunes(value string, limit int) string {
 	return string(runes[:limit])
 }
 
-// statsSnapshot builds the shared snapshot, filling the live degraded state
-// from the currently active handler.
+// statsSnapshot builds the shared snapshot. It merges the cumulative counters
+// with the live breaker view and orders every row — configured or removed — by
+// protocol group (OpenAI first), configured priority, then name (§24.15 M15r);
+// a configured instance is listed even before its first request so its state is
+// always visible.
 func (s *Server) statsSnapshot(wsClients int) statsSnapshot {
 	snapshot := s.monitor.stats.snapshot(wsClients, s.startedAt)
 	st := s.state.Load()
 	if st == nil || st.handler == nil {
 		return snapshot
 	}
-	now := time.Now()
-	degraded := make(map[string]bool)
-	configured := make(map[string]bool)
-	for _, instances := range st.handler.byProtocol {
+	handler := st.handler
+
+	counters := make(map[instanceKey]statsInstance, len(snapshot.Instances))
+	legacy := make(map[string]statsInstance)
+	for _, row := range snapshot.Instances {
+		if row.Protocol == "" {
+			if _, exists := legacy[row.Name]; !exists {
+				legacy[row.Name] = row
+			}
+			continue
+		}
+		counters[instanceKey{protocol: row.Protocol, name: row.Name}] = row
+	}
+
+	mergeCounters := func(row statsInstance, from statsInstance) statsInstance {
+		row.Requests = from.Requests
+		row.Percent = from.Percent
+		row.Success = from.Success
+		row.Failed = from.Failed
+		row.InTokens = from.InTokens
+		row.OutTokens = from.OutTokens
+		row.AvgTTFT = from.AvgTTFT
+		row.AvgTPS = from.AvgTPS
+		return row
+	}
+
+	rows := make([]statsInstance, 0, len(snapshot.Instances)+len(handler.byProtocol))
+	used := make(map[instanceKey]bool)
+	legacyUsed := make(map[string]bool)
+	for _, proto := range []protocol{protocolOpenAI, protocolAnthropic} {
+		ps := handler.protocolRuntime(proto)
+		insts := handler.byProtocol[proto]
+		for i, inst := range insts {
+			row := statsInstance{Name: inst.name, Protocol: string(proto), Priority: i}
+			key := instanceKey{protocol: string(proto), name: inst.name}
+			if from, ok := counters[key]; ok {
+				row = mergeCounters(row, from)
+				used[key] = true
+			} else if from, ok := legacy[inst.name]; ok {
+				row = mergeCounters(row, from)
+				legacyUsed[inst.name] = true
+			}
+			if ps != nil {
+				row.State, row.DegradedSince, row.Reason, row.Locked = ps.stateFor(i)
+			}
+			row.Degraded = row.State == stateOpen
+			rows = append(rows, row)
+		}
+	}
+
+	removed := make([]statsInstance, 0)
+	for key, row := range counters {
+		if used[key] {
+			continue
+		}
+		row.Removed = true
+		removed = append(removed, row)
+	}
+	for name, row := range legacy {
+		if legacyUsed[name] || configuredName(handler, name) {
+			continue
+		}
+		row.Removed = true
+		removed = append(removed, row)
+	}
+	snapshot.Instances = append(rows, removed...)
+	slices.SortFunc(snapshot.Instances, compareStatsInstance)
+	return snapshot
+}
+
+func configuredName(handler *Handler, name string) bool {
+	for _, instances := range handler.byProtocol {
 		for _, inst := range instances {
-			configured[inst.name] = true
-			if _, seen := degraded[inst.name]; !seen {
-				degraded[inst.name] = inst.isDegraded(now)
+			if inst.name == name {
+				return true
 			}
 		}
 	}
-	for i := range snapshot.Instances {
-		name := snapshot.Instances[i].Name
-		snapshot.Instances[i].Degraded = degraded[name]
-		snapshot.Instances[i].Removed = !configured[name]
-	}
-	return snapshot
+	return false
 }
 
 func (s *Server) serveStats(w http.ResponseWriter, r *http.Request) {

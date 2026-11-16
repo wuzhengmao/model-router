@@ -938,7 +938,7 @@ JSON 形状：
   "ttft": {"p50": 132.0, "p95": 410.0},
   "duration": {"p50": 900.0, "p95": 2400.0},
   "inTokens": 1200, "outTokens": 3400, "avgTps": 42.1, "retries": 2,
-  "instances": [{"name":"MTI","requests":12,"percent":100.0,"success":11,"failed":1,"avgTtftMs":120.5,"avgTps":40.2,"degraded":false}],
+  "instances": [{"name":"MTI","requests":12,"percent":100.0,"success":11,"failed":1,"inTokens":1200,"outTokens":3400,"avgTtftMs":120.5,"avgTps":40.2,"degraded":false}],
   "recentErrors": [{"ts":1700000000000,"status":502,"instName":"MTI","upstreamModel":"m","model":"sonnet","error":"…"}]
 }
 ```
@@ -952,6 +952,7 @@ JSON 形状：
 - **分位数**：TTFT（`ttftMs`）与总耗时（`durationMs`）各保留最近 1000 个样本的环形窗口；样本 < 10 时 `p50`/`p95` 输出 `null`。采用 nearest-rank，单位 ms。
 - **QPS**：最近 60 秒内开始的 AI 请求数 ÷ 60，保留 1 位小数。
 - **平均生成速率**：全部 `genMs > 0` 请求的 `Σ outTokens / Σ genMs × 1000`，保留 1 位小数；实例行同口径。
+- **实例 token（M17）**：实例行 `inTokens` / `outTokens` 为该实例全部已结束请求的 `usage` 全量累加，失败/中断/截断请求同样计入；探测请求不计入。`outTokens` 含 thinking/reasoning，与上一条平均生成速率的 `genOut` 吞吐样本口径不同，两者不得互相替代。
 - **实例统计**：按 `end` 时的 `instName` 分组；占比 = 该实例已结束请求 / `total`；平均 TTFT = 该实例 `ttftMs` 算术均值；降级状态在快照时从当前 handler 的 `isDegraded(now)` 读取（reload 后跟着新实例状态走）。
 - **近期错误**：失败请求最多 20 行、最新在前；`ts` 为落库时间（毫秒），错误摘要按 80 个字符截断。
 - **运行时长**：`NewServer` 记录 `startedAt`；格式 `2d 3h 14m` / `3h 14m` / `14m`。
@@ -1108,12 +1109,13 @@ body.monitor-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-dire
   "inTokens": 1200, "outTokens": 3400,
   "genOutTokens": 3000, "genMs": 71000,
   "retries": 2,
-  "instances": [{"name":"MTI","requests":12,"success":11,"failed":1,"ttftCount":12,"ttftSumMs":1440,"genOutTokens":3000,"genMs":71000}],
+  "instances": [{"name":"MTI","requests":12,"success":11,"failed":1,"inTokens":1200,"outTokens":3400,"ttftCount":12,"ttftSumMs":1440,"genOutTokens":3000,"genMs":71000}],
   "recentErrors": [{"ts":1700000000000,"status":502,"instName":"MTI","upstreamModel":"m","model":"sonnet","error":"…"}]
 }
 ```
 
-- 落盘内容：累计计数、按协议计数、in/out tokens、`genOutTokens`/`genMs`（用于重启后恢复平均 t/s）、重试数、各实例累计（请求/成功/失败/TTFT 样本数与和/生成 tokens 与时长）、近期错误 ≤20。
+- 落盘内容：累计计数、按协议计数、in/out tokens、`genOutTokens`/`genMs`（用于重启后恢复平均 t/s）、重试数、各实例累计（请求/成功/失败/输入 tokens/输出 tokens/TTFT 样本数与和/生成 tokens 与时长）、近期错误 ≤20。
+- 实例级 `inTokens`/`outTokens` 于 §24.15 M17 加入；schema 仍为 1，旧文件缺少这两个字段时按 0 恢复，不因升级丢弃其余累计值（历史 token 不可追溯）。
 - 不落盘：100 条请求快照、TTFT/耗时 1000 样本窗口、活跃连接/请求、QPS、运行时长（D11）。
 - 写入：`statsAggregator` 在 `finish`/`retry`/clear 时置 dirty；后台每秒检查一次，距上次写 ≥5 秒且 dirty 才写；`os.CreateTemp` 同目录临时文件 → `Sync` → `Rename` 原子替换；失败保留 dirty 并在下一 tick 重试，只记 warning。
 - 生命周期：`NewServer` 只做加载（`attachStore`）；`main` 调用 `Server.StartPersistence()` 启动写盘回调，`Server.Close()` 关闭并强制补写，`SIGINT`/`SIGTERM` 与 HTTP 优雅关闭走同一路径。`NewServer` 不启动 goroutine，避免测试中产生额外写盘。
@@ -1199,10 +1201,10 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 
 ### 33.2 资源分工与路由
 
-- `internal/web/logo.svg`：手写矢量，`viewBox 0 0 256 256`，深色圆角底板 `<rect rx=58>` + 上下两段渐变圆弧 + 三条汇聚短线 + 白色箭头；24px 与 16px 下保持可辨认。页面用 `<img src="/admin/logo.svg" width="24" height="24">`。
+- `internal/web/logo.svg`：手写矢量，`viewBox 0 0 256 256`，深色圆角底板 `<rect rx=58>` + 上下两段渐变圆弧 + 三条汇聚短线 + 白色箭头；24px 与 16px 下保持可辨认。页面用 `<img src="/logo.svg" width="24" height="24">`。
 - `internal/web/favicon.ico`：由 `docs/assets/logo-source-256.png` 离线转换（Node 无损解码 PNG → 面积平均缩放 → 16/32/48 用 32 位 BMP 条目、64/128/256 用 PNG 条目），提交进仓库，运行期不做转换。多尺寸原因：浏览器标签页/书签/任务栏会选取不同尺寸，缺 16/32/48 会导致缩放模糊。
 - `GET /favicon.ico`：在 `Server.ServeHTTP` 最前面、鉴权之前直接处理。浏览器请求 favicon 不会带 Cookie/Authorization，若走管理面鉴权会被 302 到登录页，标签栏图标永远不显示；因此该路径必须匿名 200。`admin_password` 为空时同样返回 200。
-- `GET /admin/logo.svg`：走正常管理面鉴权（页面内 `<img>` 会带会话 Cookie），未登录 302 到 `/admin/login`。两者都带 `Cache-Control: public, max-age=86400`。
+- `GET /logo.svg`：同样在鉴权之前处理，匿名 200（§24.14 L1，见 33.5）。`Cache-Control: public, max-age=86400`。
 
 ### 33.3 布局
 
@@ -1215,3 +1217,168 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 - **D-M10-49 ICO 编码**：16/32/48 使用传统 BMP 条目以兼容较旧的图标读取器，64/128/256 使用 PNG 条目；源图四角 alpha=0，无需额外抠图。
 - **D-M10-50 Logo 与源图**：SVG 按源图造型重绘（圆弧角度、三段渐变、箭头比例），未引入新元素；不同屏幕尺寸下渐变色标位置由 `gradientUnits="userSpaceOnUse"` 固定。
 - **D-M10-51 非 AI 日志测试调整**：`TestNonAICallOmitsTokenSegment` 原用 `/favicon.ico` 触发“未路由请求”日志；favicon 现在是静态资源、不再经过 AI handler，因此改用 `/health` 未知路径，断言意图（无模型/ token 段）不变。
+
+### 33.5 第十一轮修订：Logo 改为匿名资源（§24.14 L）
+
+- **问题**：Logo 原先只在 `/admin/logo.svg` 上提供，该路径在管理面鉴权之后。登录页属于登录路径但页面里的 `<img>` 是子资源，`<img>` 不能携带 HTTP Basic 凭据；未登录访问时 `/admin/logo.svg` 返回 302 `/admin/login`（SVG 请求不是页面请求，进的是 401/302 分支），浏览器把 HTML 当图片解码失败，登录页左上角 Logo 始终空白。
+- **D-M10-52 改为匿名路径**：新增顶层常量 `PathLogo = "/logo.svg"`（`internal/proxy/session.go`），`Server.ServeHTTP` 在鉴权之前、与 `/favicon.ico` 同一位置处理，移交 `(*Server).serveLogo`；`login.html` 与 `index.html` 的 `<img src>` 都改为 `/logo.svg`。
+- **D-M10-53 删除旧路由**：`serveAdmin` 中的 `case "/admin/logo.svg"` 一并删除，避免同一资源存在「匿名」与「需登录」两条路径。管理员登录后仍可匿名访问 `/logo.svg`，行为无差异。
+- **D-M10-54 测试调整**：`TestLogoSVGAuth` 更名为 `TestLogoSVGAnonymous`，断言匿名 `GET /logo.svg` = 200 且 `Content-Type: image/svg+xml`、`Cache-Control` 含 `max-age=86400`、body 以 `<svg`/`<?xml` 开头且含 `viewBox="0 0 256 256"`；追加断言旧路径 `/admin/logo.svg` 非 200、登录后 `/logo.svg` 仍 200、`admin_password` 为空时仍 200。
+
+## 34. 第十二轮：服务熔断（§24.15 M）
+
+> §24.17 已删除本节描述的 `current` 链头指针与 `probe` 态，选路改为「第一个 `closed`，全 `open` 用第一个」，见 §36。
+
+### 34.1 状态与链头指针
+
+- 实例自身只有 `closed` / `open` / `probe` 三种内部状态；`locked` 与 `-` 由 `protocolRuntime.stateFor` 按协议在展示层给出（M1/M10）。
+- `protocolRuntime.current` 按协议维护、只存内存，`Handler` 重建即回到索引 0（M9/M11）。
+- **失败顺延**：真实请求使 `current` 指向的实例转入 `open` 时，`Handler.recordFailure` 调用 `advanceCurrent`，把 `current` 推进到其后第一个非 `open` 实例；若其后全部 `open`，`current` 不动，`serveChain` 的全 open 分支继续打链尾（M8）。
+- **成功回退**：探测成功由 `setCurrent` 回退；链尾兜底成功由 `noteRealSuccess` 就地设为 `current`（仅当原 `current` 为 `open`，避免模型定向请求把健康的高优先实例降级）。
+- 锁定期间 `recordFailure` / `recordSuccess` / `probeTick` 全部跳过；`unlock` 把 `current` 设为被解锁实例并清零全部实例计数（M10/M15l）。
+
+### 34.2 统一探测 tick 与请求顺序
+
+- §24.16 起探测不再由请求触发：`serveChain` 不执行探测，独立后台循环每 1s 调用 `probeTick`（详见 §35）。本节其余顺序与判定语义继续适用。
+- 一轮最多一个并发 tick；探测失败只把该实例 `degradedUntil` 重置为 `now + degrade_duration`，不退避（M6/M15h）。首轮探测与轮次间隔改由 §35 的 M23/M20 规则控制。
+- 探测请求：OpenAI `POST /v1/chat/completions`、Anthropic `POST /anthropic/v1/messages`（M21），`max_tokens:1`、非流式、使用实例自己的 `timeout`；模型按 M3 取映射（OpenAI `models[0]`；Anthropic `* → haiku → sonnet → opus → fable`）。
+- 判定：2xx 与 4xx 为成功；连接失败、超时、3xx/5xx 为失败（M5）。
+- 探测行经 `beginProbeMonitor` / `probeMonitor.end` 进入最近 100 条环形缓冲（`probe=true`、`probeResult`），只调用 `stats.addProbe`，不增加累计请求数、成功率分母与分位样本（M13/§24.15.4）。
+
+### 34.3 非流式响应的写出顺序（D-M12-1）
+
+- `copyBody` / `copyBodyTee` 不再逐块 `Flush`：net/http 在写缓冲满时自动出队，末尾不足一缓冲的部分在 handler 返回时统一写出。这样 `serveChain` defer 中的 `tracker.end`（累计统计与环形缓冲）一定先于客户端读到 EOF 完成，避免“响应已结束但请求未入账”的统计窗口。SSE 仍由 `copySSE` 逐块 flush（§20 与需求「SSE 逐块 flush」）。
+
+### 34.4 测试装置
+
+- `internal/proxy/circuit_internal_test.go` 的 `cbBackend` 提供四种上游行为：`fail`（连接中断）、`truncate`（200 已提交后断流，用于构造“已提交的失败请求”）、`probeStatus`（仅探测请求返回指定状态）、`blockProbes`（阻塞探测以观察 `probe` 态）。
+- `TestProbeNotCountedInStats` 的两条真实请求分别是“提交后断流的失败请求（记在 `first`）”与“成功请求（记在 `second`）”，故 `total=2`、`success/failed=1/1`、实例计数 1/1 同时成立；探测行只进环形缓冲，不改变累计值。
+- 探测行为测试通过“只有目标实例声明的模型”把真实请求留在其它实例上，从而在显式调用 `probeTick` 后仍能检查探测报文（`first.last()`）；`probeTick` 在测试中同步返回，替代原先「请求触发 tick」的时序。
+
+### 34.5 实例级输入/输出 token 两列（M17）
+
+- `instanceCounters` 新增 `inTokens` / `outTokens`；`statsAggregator.finish` 对每个已结束请求无条件累加 `req.InTokens` / `req.OutTokens`（成功与失败一致），因此失败、中断、被截断的请求只要拿到了 usage 就计入。
+- 探测请求走 `statsAggregator.addProbe`，只进最近 100 条环形缓冲，不经过 `finish`，故两列与 M13 的「探测不进累计」保持一致。
+- `statsInstance` 新增 JSON 字段 `inTokens` / `outTokens`（`int64`，缺省 0）；`Server.statsSnapshot` 在合并配置行、旧版无协议行与 `removed` 行时同步复制这两个值。
+- `stats.json` 的 `instances[]` 同步新增 `inTokens` / `outTokens`；schema 保持 1，旧文件按 0 恢复（§31.2）。
+- 前端实例表在「平均 t/s」之前插入「输入 token」「输出 token」两列，`<colgroup>` 由 9 列同步为 11 列；数值用 `formatExactNumber` 以千分位原值展示，缺省 `0`，不做 K/M 缩写。
+- **D-M12-2 输出口径**：输出列取上游 `usage` 的全量输出（Anthropic `output_tokens` / OpenAI `completion_tokens`，均含 thinking/reasoning），不是只统计 `genMs > 0` 吞吐样本的 `genOut`。`TestStatsInstanceOutTokensIncludeThinking` 构造单 trunk 的 thinking-only 流（`genMs == 0`）：`genOut` 不增长，`outTokens` 仍增加 512。
+- **D-M12-3 输入 token 口径**：Anthropic 的 `usage` 把输入拆成 `input_tokens` + `cache_creation_input_tokens` + `cache_read_input_tokens`，三者求和作为输入全量（含缓存命中）；OpenAI 系 `prompt_tokens` 已包含缓存（`prompt_tokens_details.cached_tokens` 是其子集），不再重复相加。流式 `message_start` 的 usage 嵌在 `message.usage` 中，现在也参与输入解析；输出仍以 `message_delta.usage.output_tokens` 为准。该口径同时用于 §23 日志 `↑`、聚合 `inTokens` 与实例列，三者保持同源。
+
+### 34.6 实例统计拆表与排序（M15q/M15r）
+
+- 统计页「实例统计」拆成上下两张同构表：上表 `OpenAI 实例`、下表 `Anthropic 实例`。两张表各自拥有 11 列 `<colgroup>`、表头、`<tbody>` 与空状态（`暂无 OpenAI 实例。` / `暂无 Anthropic 实例。`），列顺序与列宽沿用拆分前的单表；某协议无行时只隐藏该表并显示对应空状态，另一张表不受影响。
+- 行渲染抽成 `appendStatInstanceRow(tbody, item)`，两张表共用：`stat-current`、`stat-muted`、`stat-degraded`/`stat-probe`/`stat-locked`/`stat-shadowed`/`stat-removed` 以及锁按钮调用 `/api/instances/lock` / `/api/instances/unlock` 的行为完全一致。
+- `GET /api/stats` 与 WS `stats` 帧的 `instances[]` 由同一比较器排序：协议分组（`openai` → `anthropic` → 其它/旧版无协议行）、组内 `priority` 升序、同优先级 `name` 升序。聚合器快照与 `Server.statsSnapshot` 合并后的最终列表都调用该比较器；`removed` 行不再统一追加到末尾，而是按同一规则归入协议组。JSON 字段不变，仅顺序变化。
+- 前端不依赖抵达顺序：`renderStatInstanceTable` 按 `String(item.protocol)` 过滤后分别渲染，行内顺序沿用后端给出的顺序。
+
+- **D-M12-4 拆表方式**：保留一个「实例统计」`stat-block`，用紧凑的 `.stat-subhead` 分节，而不是拆成两个卡片；这样两张表之间只有 10px 分节间距，不产生额外卡片边框与 `#stats-pane` 的 12px 网格间距，满足「不要大块留白」。
+- **D-M12-5 排序键**：协议组用显式 rank（openai=0、anthropic=1、其它=2）而非字符串比较，避免 `anthropic < openai` 的字典序把 Anthropic 排到前面；`priority` 取配置数组下标（配置无显式 priority 字段）；`removed` 行没有配置优先级，按 0 参与组内排序。
+- **D-M12-6 实例 token 阈值回归 1000**：M15s 最初为实例列单独设了 10000 阈值以控制列宽，但用户要求页面内只保留一套数值规则（M15t），因此实例两列与顶部「输入 tokens / 输出 tokens」磁贴统一走 `formatStatCount`（阈值 1000、K 1 位、M 2 位）。`formatInstanceTokenCount` 仅保留为薄封装，负责把缺省/非法值显示为 `0`；`title` 仍给出精确千分位值。
+- **D-M12-7 全局唯一格式化**：K/M 计数统一由 `formatStatCount` 提供（请求数、成功/失败、token、重试、WS 连接、活跃请求）。时长统一由 `formatDuration` 提供：`< 1000ms` 整数毫秒；`1s–60s` 秒保留 2 位；`60s–3600s` 分保留 2 位；`≥ 3600s` 小时保留 2 位；单位按原值所在区间选择，不在舍入后跨档重选（`59999ms → 60.00s`，避免与 `60s 起用分` 的规则产生第二套判断），监控页耗时/首包与统计页平均 TTFT、P50/P95 共用该函数。百分比与速率分别走 `formatPercent` / `formatRate`（均 1 位小数），调用点不再散落 `toFixed`。`formatUptime` 不属于该缩写体系：它是运行时长专用的 d/h/m 复合格式（超过 24h 显示天），语义与请求耗时的 ms/s/m/h 缩写不同，故保留独立实现。
+
+## 35. 第十三轮：后台周期探测（§24.16 M）
+
+> §24.17 已整体删除本节描述的主动探测子系统（探测器、探测报文、探测行展示），恢复完全由真实请求驱动，见 §36。
+
+### 35.1 探测器生命周期
+
+- `Server` 持有唯一的探测 goroutine：`StartPersistence` 启动（main 在监听前调用），`Close` 停止；`NewServer`/`reload` 不启动后台任务，直接构造 `Handler` 的测试无需额外清理。
+- 循环使用 `time.NewTicker(probeCheckInterval)`，`probeCheckInterval = 1s`；每个检查点从 `s.state.Load()` 取当前 `serverState` 并调用其 `handler.probeTick(handler.now())`，因此热重载后自动跟随新 Handler（旧 Handler 只服务仍在使用它的在途请求）。
+- `probeTick` **同步**执行一轮探测；循环 goroutine 在轮次结束前不会进入下一次检查，天然保证「同时进行的轮次不超过 1」。`Close` 关闭 stop channel 后等待轮次结束再返回，goroutine 不泄漏；若探测仍在飞，关闭最多等待该实例的 `timeout`。
+- 没有任何 `open` 实例时 `probeTick` 只做一次廉价状态检查后返回：不发请求、不启动 goroutine、不推进 `nextProbe`。
+
+### 35.2 检查点与调度
+
+- `Handler.nextProbe` 的零值表示「可立即探测」。一轮结束后统一设为「本轮结束时刻 + `degrade_duration`」，即 M20 的「所有协议中最晚的 nextProbe」——两个协议在同一轮内并发结束，轮次截止时间取最晚完成者。
+- M23 首轮不等周期：`Handler.probeOpen` 记录各协议上一次观察到的 open 状态；某协议从 no-open 变为 has-open 时，下一次 1s 检查点立即起一轮，不受 `nextProbe` 限制。轮次结束或观察到 no-open 时清除该标记。
+- 实例级首轮由 `instanceRuntime.probeAttempted` 控制：closed→open 时置 false，`probeWindow` 据此让实例立即到期；一次探测尝试后置 true，之后只有 `now >= degradedUntil` 才再次到期。因此新降级的实例在下一个检查点就被探测，探测失败后按 `degrade_duration` 重新排期，不做指数退避（M7/M15h）。
+- 每个协议从索引 0 开始遍历**全部**实例，只对 `open && due && !probing` 的发探测；首个探测成功后该实例 `recordSuccess`、`setCurrent(i)` 并结束本轮（M31 修订原 `[0, current)` 区间，M7/M30 的「一次成功即停」语义不变）。锁定协议整体跳过，锁定实例不探测。
+- 单实例协议按 M32 永不进入 `open`，因此 `openProtocols` 不会为它启动探测轮次，`probeProtocol` 也不会命中（详见 §35.8）。
+
+### 35.3 并发粒度
+
+- `probeTick` 为每个「有 open 实例且未锁定」的协议启动一个 goroutine，`WaitGroup` 等待全部结束；不同协议之间并发，避免两个 15s 探测串成 30s 长链（M24/M15x）。
+- 同一协议内部保持顺序探测与「首个成功即停」，顺序覆盖整条链（M31）；`inst.probing` 继续保证同一实例同一时刻最多一个探测在飞。
+- 探测请求路径：OpenAI `POST /v1/chat/completions`，Anthropic `POST /anthropic/v1/messages`（M21）；报文 `max_tokens: 1`、`messages[0].content = "ping"`、非流式，使用实例自己的 `timeout`（M22/M29）。
+
+### 35.4 与请求路径解耦
+
+- `serveChain` 不再调用探测，真实请求的候选链直接按调用时刻的 `current`/open 状态构建；探测阻塞或超时不影响请求时延（M19/M15v）。
+- 探测行仍通过 `beginProbeMonitor` / `probeMonitor.end` 进入最近 100 条环形缓冲并带 `probe=true`/`probeResult`，不计入累计统计（M28）。
+
+### 35.5 监控页探测展示（§24.16.4）
+
+- 状态列：未结束 `探测中`；结束后直接显示 `成功` / `失败`，不再拼接 `探测` 前缀。
+- 方法/路径列：与真实请求完全同构，固定两行（第一行 `POST`、第二行路径），不含任何探测相关节点（M26）。
+- 客户端列：探测徽标渲染在这里，探测行该列只显示 `探测` 徽标，IP 与 UA 两个文本节点内容为空（不是 `-`、不显示 `model-router-probe`）；真实请求仍显示 IP 与 UA 两行、不带徽标。后端 `userAgent` 字段不变（M27）。
+
+### 35.6 决策与未覆盖
+
+- **D-M13-1 探测器归属**：放在 `Server` 而不是 `Handler`，因为热重载会替换 Handler；`Server` 每 tick 读取最新 state，生命周期与进程一致。
+- **D-M13-2 检查点周期**：固定 1s 而非按 `degrade_duration` 定时，保证新降级实例最迟 1s 内被探测（M23），同时空闲时每秒只做一次状态遍历。
+- **D-M13-3 首轮与轮次间隔**：`probeAttempted` 区分「实例首次降级」与「探测失败后的重排」，前者立即到期，后者等待 `degradedUntil`；轮次级别的 `nextProbe` 从本轮结束起算。
+- **D-M13-4 并发维度**：并发发生在协议之间；协议内部保留顺序与「首个成功即停」，但探测范围改为整条链（M31），不再依赖 `current` 裁剪。
+- **D-M13-5 关闭语义**：`Close` 等待在飞轮次结束以保证无 goroutine 泄漏；代价是探测阻塞时关闭最多等待一个实例 `timeout`。
+- **D-M13-6 测试驱动**：`probeTick` 同步且可由测试直接调用；外部 `proxy_test` 通过 `export_test.go` 的 `ProbeTickForTest` 触发检查点，新增的 Server 级测试则用真实 1s 循环验证空闲、首轮与停止行为。
+
+### 35.7 第十三轮修订（§24.16 M31/M15af/M15aa–M15ab）
+
+- **D-M13-7 全链探测边界**：`probeProtocol` 删除基于 `current` 的位置裁剪，按索引遍历该协议全部实例，只对 `open && due && !probing` 发探测；成功后 `recordSuccess` + `setCurrent(i)` 并结束本轮。修复链尾实例降级而 `current` 停在其前方健康实例时、链尾 open 实例落在原 `[0, current)` 区间外而永久不探测的问题；单实例协议已由 M32 判定为永不 open，不再依赖探测恢复。`locked` 协议整体跳过、锁定实例不探测的语义不变（M31/M15ae）。
+- **D-M13-8 非流式写出时机**：`copyBody` / `copyBodyTee` 保持不逐块 `Flush`（同 D-M12-1），非流式响应的末尾缓冲在 handler 返回时统一写出，使 `serveChain` defer 中的统计入账先于客户端读到 EOF；`copySSE` 仍逐块 flush。本轮补充 `flush_internal_test.go` 用计数 ResponseWriter 固化该差异（M15af）。
+- **D-M13-9 探测徽标列位置**：`探测` 徽标由「方法/路径」列移至「客户端」列；路径列只保留 `POST` 与路径两行，客户端列在探测行只渲染徽标，IP/UA 文本节点写空字符串（不写 `-`，也不写 `model-router-probe`）。真实请求的客户端列不变（M26/M27/M15aa/M15ab）。
+
+### 35.8 单实例协议不参与熔断（M32）
+
+- **判定依据**：`NewWithOptions` 在构建 `Handler.protocols` 之后，对每个 `len(protocolRuntime.insts) == 1` 的协议设置其唯一实例的 `instanceRuntime.singleInstanceProtocol = true`。判定只读配置后的实例总数，不使用 `index`、`current` 或运行时健康实例数；多实例协议即使当前只剩一个健康实例，该标记仍为 false，熔断行为完全不变。
+- **实现位置**：`instanceRuntime.markOpenLocked` 是所有熔断开闸的唯一入口（`recordFailure` 达到阈值与 `recordProbeFailure` 都会调用它），在该函数开头对 `singleInstanceProtocol` 直接返回。因此 `degradedUntil` 恒为零、`degradedSince` 恒为空、`reason` 恒为空，`state()`/`displayState()` 恒为 `closed`，监控页状态列显示「正常」。
+- **探测推论**：单实例不会 `open`，`Handler.openProtocols` 看不到该协议，`probeTick` 不会启动轮次；即使直接调用 `probeProtocol`，`probeWindow` 也返回 `open=false`。`advanceCurrent` 与 `allInstancesOpen` 在单实例协议下不会被触发。
+- **统计不变**：`serveChain` 仍照常调用 `h.recordFailure`（`consecutiveFailures` 继续累加），`statsAggregator.finish` 独立统计 `requests`/`failed`/`recentErrors` 与失败日志，熔断状态迁移是唯一被抑制的行为。
+- **D-M13-10 判定时点**：标记在 Handler 构造期一次性写入，随后只读；配置热重载会重建 Handler 与新实例，因此更换实例数后无需额外同步。该设计避免在每次失败时读取协议链长，同时保证「单实例」定义始终等于配置实例总数。
+
+## 36. 第十四轮：取消主动探测，真实请求驱动半开熔断（§24.17 M33–M40）
+
+### 36.1 删除主动探测子系统（M33）
+
+- 生产代码中与后台探测相关的实体全部物理删除，不留停用分支：`internal/proxy/circuit.go` 删除 `probeCheckInterval`、`probeProtocols`、`probeTick`、`openProtocols`、`probeProtocol`、`probeWindow`、`sendProbe`、`probeSucceeded`、`probeModel`、`newProbeChatBody`、`probeChatBody`、`probeMessage`、`probeChatPath`、`errProbeNoModel`、`reasonProbeFailed`、`recordProbeFailure`、`probeMonitor`/`beginProbeMonitor`/`emitSkippedProbe`，以及 `instanceRuntime` 的 `probing`/`probeAttempted`、`Handler` 的 `probeMu`/`probing`/`nextProbe`/`probeOpen`。
+- `internal/proxy/proxy.go` 删除 `Server.startProber`/`stopProber` 与 `proberStarted`/`proberStartOnce`/`proberStopOnce`/`proberStop`/`proberDone` 字段；`StartPersistence` 只启动统计落盘，`Close` 只停止统计落盘。`NewWithOptions` 不再初始化 `probeOpen`。
+- `internal/proxy/monitor.go` 删除 `monitorStartEvent`/`monitorEndEvent`/`monitorRequestSnapshot` 的 `probe`/`probeResult` 字段；`internal/proxy/stats.go` 删除 `addProbe` 与 `appendRecentLocked`。最近请求环形缓冲只承载真实请求。
+- 删除 `internal/proxy/periodic_probe_internal_test.go` 与 `internal/proxy/export_test.go`（后者只为测试暴露 `probeTick`）。`/api/probe/test` 与 `/api/probe/models` 是配置页的「上游连通性/模型列表」管理接口，与本轮删除的后台熔断探测无关，保持原样（`probeResponseLimit` 因此保留）。
+- 删除理由（§24.17.1）：1 token 的探测报文对 12–18 万 token 的真实请求没有预测力，且只读 HTTP 状态码会把「纯 thinking、无正文」的残废响应判为健康；上游过载时探测仍秒回成功，导致 `current` 被拉回故障实例。
+
+### 36.2 状态收窄（M34）
+
+- `circuit.go` 常量只剩 `stateClosed`/`stateOpen`/`stateLocked`/`stateShadowed`；`stateProbe` 与所有产出 `probe` 的分支删除。`instanceRuntime.state()` 与 `displayState()` 只返回 `closed`/`open`。
+- `/api/stats` 的 `instances[].state` 取值域收窄为 `closed`/`open`/`locked`/`-`；`statsInstance.Current` 字段为 wire 兼容而保留，但因 `current` 指针删除而恒为 false（对应 M15ak 的「或其恒为 false」）。
+- 单实例协议（M32）继续不参与熔断：`markOpenLocked` 开头的 `singleInstanceProtocol` 判断保留，实例恒为 `closed`。
+
+### 36.3 半开判定：只看向回退时间（M35）
+
+- `internal/proxy/circuit.go` 的 `instanceRuntime.isOpen()` / `isOpenAt(now)` 只读取 `degradedUntil`：`!degradedUntil.IsZero() && now.Before(degradedUntil)`。到期后实例自动回到 `closed`，不需要探测、不需要请求，也没有任何到期回调或定时器——空闲时靠时间自然恢复（用户原话「空闲的时候回退时间到了实例就回到 closed」）。
+- 实例时钟来自 `NewWithOptions` 的 `opts.Now`（写入 `instanceRuntime.now`），生产环境即 `time.Now`，测试用假时钟可验证 M15aj。`degradedUntil` 到期后字段本身不清零，因此「到期后再次失败」仍会走 `recordFailure` 的重新计时分支（见 §36.5）。
+- 说明：§24.17.2 M35 的字面表述 `isOpen() 即 !degradedUntil.IsZero()` 单独成立时无法让实例在到期后自动变回 `closed`；验收 M15aj 要求在推进时钟后 `state` 变为 `closed` 且下一请求打到该实例，故实现取「只由 `degradedUntil` 与当前时间决定」的时间比较语义。
+
+### 36.4 选路：第一个 `closed`，全 `open` 用第一个（M36/M37）
+
+- 删除 `protocolRuntime.current`、`setCurrent`、`advanceCurrent`、`noteRealSuccess` 与 `buildChainFrom` 的 `start` 参数及 `base = start` 截断；`findBase` 的模型能力匹配规则（`exactChain`/`roleChain`/`wildcardChain`/`fallbackChain`）保持不变。
+- `internal/proxy/proxy.go` 的 `serveChain`：构造候选链后，按链顺序收集 `!isOpen()` 的候选作为尝试列表；列表为空（链上全部 `open`）时只放链上第一个候选（不是链尾）。随后依次尝试，一个候选在响应头写出前失败就重试下一个，全部失败返回 502。
+- 这样「哪个实例通，后续请求就往这里走」由状态本身自然达成：成功实例保持 `closed`，下一次选路仍先命中它；无需维护链头指针。也消除了旧 `current` 停在后面时、前面已恢复健康的实例被 `base = start` 永久跳过的缺陷。
+- 锁定时仍只发往被锁定实例（`lockedCandidate`），锁定实例即使是 `open` 也照常承接（`attempts` 的兜底分支保证单元素链不会被过滤掉）；`/api/instances/lock`、`/api/instances/unlock` 的签名与「解锁清零全部计数」行为不变。
+
+### 36.5 失败重置回退时间（M38/M39）
+
+- `instanceRuntime.recordFailure`：`consecutiveFailures` 累加，达到 `failure_threshold` 调用 `markOpenLocked`；若 `degradedUntil` 非零（已处于 `open`，或到期后的半开试探再次失败），直接重置为 `now + degrade_duration`。没有退避、没有指数增长，`degradedSince` 保留本次故障的首次失败时刻。
+- 失败重试语义沿用既有回退：一个候选失败即试下一个 `closed` 候选，`open` 候选跳过，全部失败才 502。候选顺序完全由 §36.4 决定。
+
+### 36.6 前端与接口（M40）
+
+- `internal/web/index.html` 删除 `.probe-badge` CSS 与 DOM 创建、`req.cells.probeBadge`、`tr.probe-row` 琥珀色标识、`.stat-probe` 状态色、`monitorStatus()` 的「探测中」分支、`statStateText`/`statStateClass` 的 `probe` 分支，以及 `buildMonitorRequest`/`applyMonitorEnd`/`ingestSnapshotRequest` 中的 `probe`/`probeResult`；`current` 行高亮（`.stat-current`）随指针删除一并移除。实例统计表状态列只渲染 `正常` / `降级 HH:MM:SS` / `已锁定` / `-`。
+- 后端不再产生 `model-router-probe` 用户代理的请求；`/api/stats` 除 `state` 取值域收窄与 `current` 恒 false 外，其余字段保持。
+
+### 36.7 决策与未覆盖
+
+- **D-M14-1 状态由时间派生**：不为「到期恢复」增加定时器或惰性清零回调，避免后台任务重新进入系统；`degradedUntil` 保留到被成功请求或下一次失败覆盖，`displayState`/`isOpen` 只在需要时与当前时间比较。
+- **D-M14-2 全 `open` 兜底取链首**：沿用用户原话「都 open 就用第一个实例」；旧的链尾兜底 `allOpenTailCandidate` 与 `allInstancesOpen` 分支删除。若首个实例持续失败，每次请求都会在它身上再失败一次并重置其回退时间，其它 `open` 实例不会被无谓尝试（M15ah）。
+- **D-M14-3 保留 `current` JSON 字段**：M15ak 允许「不再输出」或「恒为 false」二选一；为满足「除 state 外其余字段保持」的接口约束，选择保留字段并恒为 false，前端不再读取。
+- **D-M14-4 探测行字段直接删除**：§24.17.3 允许保留但永不置真或直接删除；因唯一生产者已删除、前端已清理，保留字段会成为永久死数据，故选择直接删除 `probe`/`probeResult`。
+- **未覆盖**：并发请求同时竞争同一实例时，`open` 状态以各请求读取时刻为准；规格未定义该竞态下「选路快照」的一致性，实现按请求各自的读取结果执行。

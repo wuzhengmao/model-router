@@ -27,7 +27,9 @@ const (
 	// ProtocolAnthropic marks an instance that speaks the Anthropic protocol.
 	ProtocolAnthropic = "anthropic"
 
-	// Fallback defaults (§12.2 / §13.2).
+	// Fallback defaults (§12.2 / §13.2). §24.18 M41: the 1m default only existed
+	// because degrade_duration doubled as the probe period; with active probing
+	// removed (§24.17) the default is back to 5m.
 	DefaultFailureThreshold   = 3
 	DefaultDegradeDuration    = 5 * time.Minute
 	DefaultMinTokensPerSecond = 30.0

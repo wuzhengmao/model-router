@@ -60,28 +60,15 @@ func TestFaviconAnonymous(t *testing.T) {
 	}
 }
 
-// TestLogoSVGAuth covers §24.13 K6e: the header logo requires login and is
-// served as SVG.
-func TestLogoSVGAuth(t *testing.T) {
+// TestLogoSVGAnonymous covers §24.14 L1: the header logo is served to
+// anonymous requests, because the login page renders it before any session
+// exists and an <img> tag cannot carry Basic credentials.
+func TestLogoSVGAnonymous(t *testing.T) {
 	server, _ := newAdminServer(t, adminTestConfig)
 
-	anonymous := noRedirectRequest(t, http.MethodGet, server.URL+"/admin/logo.svg", "", nil)
-	if anonymous.StatusCode != http.StatusFound {
-		t.Fatalf("anonymous GET /admin/logo.svg = %d, want 302", anonymous.StatusCode)
-	}
-	if location := anonymous.Header.Get("Location"); !strings.HasPrefix(location, "/admin/login") {
-		t.Errorf("Location = %q, want /admin/login", location)
-	}
-
-	login := postLogin(t, server.URL, `{"user":"admin","password":"secret","remember":false}`)
-	cookie := sessionCookie(t, login)
-	if cookie == nil {
-		t.Fatal("login did not set mr_session")
-	}
-	resp := noRedirectRequest(t, http.MethodGet, server.URL+"/admin/logo.svg", "",
-		map[string]string{"Cookie": cookie.Name + "=" + cookie.Value})
+	resp := noRedirectRequest(t, http.MethodGet, server.URL+"/logo.svg", "", nil)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("logged-in GET /admin/logo.svg = %d, want 200", resp.StatusCode)
+		t.Fatalf("anonymous GET /logo.svg = %d, want 200", resp.StatusCode)
 	}
 	if got := resp.Header.Get("Content-Type"); got != "image/svg+xml" {
 		t.Errorf("Content-Type = %q, want image/svg+xml", got)
@@ -95,5 +82,33 @@ func TestLogoSVGAuth(t *testing.T) {
 	}
 	if !strings.Contains(body, `viewBox="0 0 256 256"`) {
 		t.Errorf("SVG body is missing the expected viewBox: %.120q", body)
+	}
+
+	// The old authenticated path must no longer be routed as an asset.
+	legacy := noRedirectRequest(t, http.MethodGet, server.URL+"/admin/logo.svg", "", nil)
+	if legacy.StatusCode == http.StatusOK {
+		t.Errorf("legacy GET /admin/logo.svg = %d, want a non-200", legacy.StatusCode)
+	}
+
+	// A logged-in session gets the same asset (no behavioural split).
+	login := postLogin(t, server.URL, `{"user":"admin","password":"secret","remember":false}`)
+	cookie := sessionCookie(t, login)
+	if cookie == nil {
+		t.Fatal("login did not set mr_session")
+	}
+	authed := noRedirectRequest(t, http.MethodGet, server.URL+"/logo.svg", "",
+		map[string]string{"Cookie": cookie.Name + "=" + cookie.Value})
+	if authed.StatusCode != http.StatusOK {
+		t.Errorf("logged-in GET /logo.svg = %d, want 200", authed.StatusCode)
+	}
+
+	// The admin surface being disabled must not remove the brand mark.
+	disabled, _ := newAdminServer(t, `{
+		"auth_token": "tok",
+		"instances": {"openai": [{"base_url": "https://example.com", "api_key": "k", "models": ["m"]}]}
+	}`)
+	resp = noRedirectRequest(t, http.MethodGet, disabled.URL+"/logo.svg", "", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("logo with admin disabled = %d, want 200", resp.StatusCode)
 	}
 }

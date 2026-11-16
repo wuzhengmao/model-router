@@ -150,9 +150,9 @@ bash build.sh
 | UT-402 | Anthropic 候选链 | `TestCandidateChainAnthropic` | 角色逐候选改写；缺角色时用 `*`；既无角色又无 `*` 的实例跳过；角色值精确命中不改写 | 命中实例与改写正确 |
 | UT-403 | R5 无 `*` 兜底 | `TestFallbackChainR5WithoutWildcard` | 无 model、实例无 `*` | 仍尝试首实例且正文不改写 |
 | UT-404 | 临时回退与持续回退 | `TestFallbackTemporaryAndSustained` | 失败 1/2 次仍先试主实例；第 3 次后进入 5 分钟回退并跳过 | 调用次数符合状态机 |
-| UT-405 | 回退期探测失败重新计时 | `TestFallbackRecoveryProbeFailure` | 回退期结束后主实例探测再失败 | 立即重新进入回退，后续请求跳过 |
+| UT-405 | 回退期到期后真实请求重新试主实例 | `TestFallbackExpiredWindowRealRequestFails` | 回退期结束后主实例仍未恢复 | 真实请求重试主实例，失败后立即重新进入回退，后续请求跳过 |
 | UT-406 | 成功恢复清零 | `TestFallbackSuccessResets` | 回退期后主实例成功 | 计数/回退清零，之后失败重新按 3 次累计 |
-| UT-407 | 全降级强制链头 | `TestFallbackAllDegradedForcesHead` | 阈值 1、两实例均失败后全部降级 | 后续请求只强制尝试链头一次，其余不试，返回 502 |
+| UT-407 | 全降级使用链上第一个实例 | `TestFallbackAllDegradedUsesFirst` | 阈值 1、两实例均失败后全部降级 | 后续请求只打链上第一个实例（不是链尾），失败即 502 |
 | UT-408 | 并发安全 | `TestFallbackConcurrent`（`go test -race`） | 20 并发请求 + 失败实例 | 全部 200，调用次数一致，无 data race |
 | UT-409 | 吞吐判定与样本门槛 | `TestThroughputFailure` | OpenAI `completion_tokens`、Anthropic `output_tokens`、无 usage；输出 ≤100 或生成时长 ≤2s；慢响应 | 低吞吐响应仍透传；满足门槛才记失败（下次跳过），样本不足/无 usage 不判失败 |
 | UT-413 | Anthropic 空闲超时收尾 | `TestIdleTimeoutAnthropicPauseTurn` | mock 上游发首块后静默；`idle_timeout=50ms` | 客户端收到 `content_block_stop`、`message_delta(stop_reason=pause_turn)`、`message_stop` |
@@ -160,7 +160,7 @@ bash build.sh
 | UT-415 | OpenAI 慢速流不打断 | `TestSlowStreamIsNotInterrupted` | mock 持续慢速输出、低 usage | 流完整结束（含 `[DONE]`），仅记失败，下次请求跳过 |
 | UT-416 | 配置 idle_timeout 生效 | `TestIdleTimeoutFromConfig` | JSON `fallback.idle_timeout="50ms"` + 静默 anthropic 上游 | 收到 pause_turn 收尾，usage 复用已见 output_tokens |
 | UT-410 | 配置阈值生效 | `TestFallbackFromConfigThreshold` | `fallback.failure_threshold=2`（JSON 配置） | 连续失败 2 次后持续回退 |
-| UT-411 | 配置回退时长生效 | `TestFallbackFromConfigDegradeDuration` | `degrade_duration="100ms"` | 回退期结束后重新探测主实例 |
+| UT-411 | 配置回退时长生效 | `TestFallbackFromConfigDegradeDuration` | `degrade_duration="100ms"` | 回退期结束后由真实请求重试主实例 |
 | UT-412 | 配置禁用吞吐判定 | `TestFallbackFromConfigDisableThroughput` | `min_tokens_per_second=0` + 慢响应/低 usage | 不记录吞吐失败，主实例持续使用 |
 
 执行补充：
@@ -179,9 +179,9 @@ go test -race ./internal/proxy
 | 候选链：Anthropic 同角色改写 / 无角色用 `*` / 皆无跳过 | UT-402 |
 | R5 未命中候选链与不改写 | UT-403、`TestRouteWildcardFallback`（R5 子用例） |
 | 状态机：临时回退、<3 仍试主实例、≥3 持续回退 | UT-404 |
-| 状态机：回退期结束恢复探测失败重新计时 | UT-405 |
+| 状态机：回退期结束由真实请求重试并重新计时 | UT-405 |
 | 状态机：成功恢复清零 | UT-406 |
-| 状态机：全部降级强制链头 | UT-407 |
+| 状态机：全部降级时使用链上第一个实例 | UT-407 |
 | 并发安全（race） | UT-408 + `go test -race` |
 | 吞吐判定（mock 慢响应/低 usage） | UT-409 |
 | UI 拖动排序改变 instances 顺序 | 手工 e2e（主代理） |
@@ -840,7 +840,7 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 | 编号 | 检查项 | 测试/方法 | 判定 |
 |---|---|---|---|
 | UT-789 | K6d 匿名 favicon | `TestFaviconAnonymous` | 无凭据 GET `/favicon.ico` → 200、`Content-Type: image/x-icon`、`Cache-Control` 含 `max-age=86400`；响应体以 `00 00 01 00` 开头；ICONDIR count ≥3；含 16/32/48 条目；`admin_password` 为空时同样 200 |
-| UT-790 | K6e Logo 鉴权 | `TestLogoSVGAuth` | 未登录 GET `/admin/logo.svg` → 302 `/admin/login`；带会话 Cookie → 200、`image/svg+xml`、体以 `<svg` 开头且含 `viewBox="0 0 256 256"`、缓存 1 天 |
+| UT-790 | §24.14 L3a–L3d Logo 匿名 | `TestLogoSVGAnonymous` | 匿名 GET `/logo.svg` → 200、`image/svg+xml`、体以 `<svg` 开头且含 `viewBox="0 0 256 256"`、缓存 1 天；旧路径 `/admin/logo.svg` 非 200；带会话 Cookie 仍 200；`admin_password` 为空仍 200 |
 | UT-791 | K6a–K6c/K6f 页面品牌 | headless Chrome + CDP | 四页 `<title>` 与左上角文字为「模型智能路由」，登录页相同；可见文本无 `model-router` |
 | UT-792 | K6b 布局 | headless Chrome，1600×1019 与 1000×900 | 四页 Logo 24×24、与文字垂直居中、gap 8px；1000×900 header 不换行、无溢出 |
 | UT-793 | K6g 英文标识未误改 | `grep -rn "model-router" go.mod Dockerfile docker-compose.yml` | module/镜像 tag/服务名保持原值 |
@@ -854,9 +854,91 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 | K6b | 四页 Logo 渲染尺寸 24×24、`display:flex`、`gap:8px`、图标与文字中心差 0px；1000×900 下 header 高度 31.5px（与 1600 相同，未换行）、`scrollWidth<=clientWidth`、整页无横向滚动 |
 | K6c | `/admin/login` `<title>` 为「模型智能路由 · 登录」，卡片顶部 Logo 24×24 + 「模型智能路由」 |
 | K6d | 匿名 `curl -s -o /dev/null -w "%{http_code} %{content_type}"` → `200 image/x-icon`；响应体 `magic=00000100`、ICONDIR count=6（含 16/32/48） |
-| K6e | 未登录 `/admin/logo.svg` → 302 `/admin/login?next=%2Fadmin%2Flogo.svg`；带 Cookie → 200、`image/svg+xml`、体以 `<svg` 开头、含 `viewBox="0 0 256 256"` |
+| K6e / L3a | **已修订**：匿名 `/logo.svg` → 200、`image/svg+xml`、体以 `<svg` 开头、含 `viewBox="0 0 256 256"`；`/admin/logo.svg` 不再返回 200 |
 | K6f | `grep -c model-router internal/web/index.html internal/web/login.html` 均为 0；浏览器逐页 `document.body.innerText` 不含 `model-router` |
 | K6g | `grep -rn model-router go.mod Dockerfile docker-compose.yml` 仍为 `module model-router`、`wuzm219/model-router:0.1.1`、服务名 `model-router` |
 | K6h | UT-794：`go build`/`go vet`/`gofmt -l internal main.go`/`go test ./... -race -count=1` 全绿 |
 
 原始数据：`.claude-runs/m9-brand/measurements.json`；截图：`stats-1600x1019.png`、`stats-1000x900.png`、`monitor-1600x1019.png`、`monitor-1000x900.png`、`login-1600x1019.png`。
+
+## 33. 第十二轮：服务熔断（§24.15 M）
+
+### 33.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-800 | M10/M15e 锁定与解锁 | `TestLockRoutesEverythingAndUnlockResets`、`TestLockedOpenInstanceStillServes` | 锁定后全部流量到被锁实例（含处于 open 的被锁实例）、熔断暂停；移动锁生效；解锁清零状态并按第一个 `closed` 重新选路 |
+| UT-807 | M14/M15a/M15c/M15d/M15l 统计行与锁 API | `TestStatsInstanceFieldsOrderAndLockAPI` | openai 在前的优先级排序；`state/locked/degradedSince/reason` 字段，`state` 仅取 `closed`/`open`/`locked`/`-` 且 `current` 恒为 false；lock/unlock 幂等与校验；重启后全 closed、unlocked |
+| UT-808 | M15n 实例 token 两列 | 前端 `internal/web/index.html`（`renderStatInstances`） | OpenAI / Anthropic 两张实例表各在「平均 t/s」之前有「输入 token」「输出 token」两列；两张表各自的 `<colgroup>` 均为 11 列且与表头一致；数值千分位、缺省 `0` |
+| UT-809 | M15o 实例 token 累计与失败计入 | `TestStatsInstanceTokenColumns` | 成功请求累加 `100/40`，失败请求再累加 `10/5`；实例行 `110/45` 与聚合值一致；JSON 键为 `inTokens`/`outTokens` |
+| UT-810 | M15p 输出全量含 thinking、与 genOut 不同口径 | `TestStatsInstanceOutTokensIncludeThinking` | 单 trunk thinking-only 流（`usage.output_tokens=512`、`genMs=0`）：`genOut` 不增长，实例 `outTokens` 增加 512；再加一条 100 token/1s 的普通请求后，输出列为 `612`、平均 t/s 仍按 `genOut=100` 计算 |
+| UT-811 | M17 实例 token 落盘与旧文件升级 | `TestStatsInstanceTokensPersistence` | `stats.json` 的实例 `inTokens`/`outTokens` 可写可恢复；旧 schema-1 文件缺字段时请求计数保留、token 列恢复为 0 |
+| UT-812 | M17 输入全量（缓存分字段求和） | `TestUsageInputTokensIncludeCache` | Anthropic `100 + 25 + 50 = 175`（非流式与 `message_start.message.usage` 流式一致）；OpenAI `prompt_tokens=100` 不叠加 `cached_tokens=50`；输出仍为 `output_tokens=7` |
+| UT-813 | M15q 实例统计按协议拆表 | 前端 `internal/web/index.html`（`renderStatInstances` / `appendStatInstanceRow`） | 上表标注「OpenAI 实例」、下表标注「Anthropic 实例」；两张表各有独立 `<colgroup>`（均 11 列且顺序与表头一致）、`<tbody>` 与空状态，文案分别为 `暂无 OpenAI 实例。` / `暂无 Anthropic 实例。`；按 `item.protocol` 各自取行，某协议为空时只隐藏该表；`stat-muted`/状态色与锁按钮由同一行渲染函数生成，两张表行为一致 |
+| UT-814 | M15r 实例排序（协议分组 + 优先级） | `TestStatsInstanceOrderByProtocolAndPriority` | `/api/stats` 的 `instances[]` 为 openai 组在前、anthropic 组在后；组内 `priority` 升序、同优先级按 `name` 升序；`removed` 行使用同一比较器，不再统一追加到所有配置行之后 |
+| UT-815 | M15s 实例 token K/M 缩写 | 前端 `internal/web/index.html`（`formatInstanceTokenCount` → `formatStatCount`） | 与顶部磁贴共用阈值 `1000`：`< 1000` 为整数原值（`999`/`0`）；`≥ 1000` 且 `< 1e6` 为 K 保留 1 位（`1.0K`/`1.2K`/`441.4K`）；`≥ 1e6` 为 M 保留 2 位（`1.00M`/`1.05M`）；`999960 → 1.00M`（舍入后跨单位重新取单位）；`exact` 为精确千分位并作为单元格 `title`；缺省/`NaN`/非有限值为 `0` |
+| UT-816 | M15t 数值与单位展示全局唯一 | 前端 `internal/web/index.html`（`formatStatCount` / `formatDuration` / `formatPercent` / `formatRate`） | 页面内仅一套 K/M 计数与一套时长规则。计数：`999→999`、`1000→1.0K`、`1234→1.2K`、`999960→1.00M`、`1000000→1.00M`、`1050000→1.05M`。时长：`0→0ms`、`999→999ms`、`1000→1.00s`、`1500→1.50s`、`9999→10.00s`、`10000→10.00s`、`59999→60.00s`、`60000→1.00m`、`3600000→1.00h`；监控页耗时/首包与统计页平均 TTFT、P50/P95 调用同一函数；百分比/速率统一 1 位小数。`formatMs`、`formatStatDuration`、`formatInstanceTokens` 已删除，`formatInstanceTokenCount` 仅薄封装 `formatStatCount`；`formatUptime` 保留为独立的 d/h/m 复合格式 |
+
+### 33.2 场景说明
+
+- §24.17 起主动探测子系统已删除，本节原探测用例（`probe` 瞬态、探测报文、探测模型优先级、`current` 回退、全 open 链尾等）同步作废；状态机用例改由 §35 的 UT-829～UT-841 覆盖。
+- M17 用例在 `stats_tokens_internal_test.go`：`recordTokenRequest` 以单 trunk（`genMs=0`）模拟 thinking-only 流，以双 trunk 模拟 1s 生成窗口；`TestStatsInstanceOutTokensIncludeThinking` 先把含 `thinking_delta` 与 `message_delta.usage.output_tokens=512` 的 SSE 喂给 `sseState`，再断言实例 `genOut` 与 `outTokens` 的差异；`TestUsageInputTokensIncludeCache` 覆盖 Anthropic 缓存分字段求和与 `message_start.message.usage` 嵌套解析。
+
+## 34. 第十三轮：后台周期探测与监控页探测展示修正（§24.16 M12）
+
+> §24.17（第十四轮）已整体删除本节描述的主动探测子系统与其监控展示，下列用例中仅构建检查、单实例协议与非流式 flush 语义继续有效；探测调度、探测报文、探测行展示、`current` 推进相关用例作废，替代覆盖见 §35。
+
+### 34.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-823 | M15ac 构建与测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race` | 全部通过 |
+| UT-824 | M32/M15ap 单实例协议不参与熔断 | `TestSingleInstanceProtocolNeverOpens` | 单实例协议连续 3 次失败（超过阈值 1）后：`stateFor` 恒为 `closed`、`degradedSince = 0`、`reason` 为空，`degradedUntil` 为零；推进假时钟后仍为 `closed` 且上游请求数不变；`requests.total = failed = 3`、`recentErrors` 3 条、实例行 requests/failed 均为 3 |
+| UT-826 | M15af 非流式不逐块 flush、SSE 仍逐块 flush | `TestNonStreamingCopyDoesNotFlush`、`TestStreamingCopyStillFlushes` | 3×32KiB 以上的 body 被分成多次写入；`copyBody`/`copyBodyTee` 的 `Flush` 计数为 0 且内容/捕获完整；`copySSE` 每个 chunk 恰好 flush 一次 |
+
+### 34.2 场景说明
+
+- UT-823 与 UT-826 与探测无关，继续有效；M15af 的 flush 语义在本轮未改动。
+- UT-824 的测试名由 `TestProbeCoversSingleInstanceProtocol` 改为 `TestSingleInstanceProtocolNeverOpens`，去掉 `probeTick` 调用后仍断言单实例恒为 `closed`、统计与 `recentErrors` 正常累加。
+- 本节原 UT-817～UT-822、UT-825、UT-827、UT-828 依赖探测定时器、探测报文、探测行 DOM 与 `current` 推进，已随 §24.17 删除。
+
+## 35. 第十四轮：取消主动探测，真实请求驱动半开熔断（§24.17 M33–M40）
+
+### 35.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-829 | M33/M15al 无主动探测 | `TestNoActiveProbing` | 三实例全 `open`、推进假时钟 5 分钟且不发请求：上游请求数不变、`requests.total` 不变；到期实例自动 `closed` |
+| UT-830 | M34/M15ak 状态域与 `current` 消失 | `TestStatsInstanceFieldsOrderAndLockAPI` | `/api/stats` 的 `instances[].state` 只取 `closed`/`open`/`locked`/`-`；`current` 恒为 false（字段保留以兼容既有 wire 格式） |
+| UT-831 | M35/M15aj 空闲自动恢复 | `TestIdleRecoveryWithoutRequests` | 实例转 `open` 后不发任何请求，仅推进时钟越过 `degradedUntil`：`state()` 与 `stateFor` 均为 `closed`，下一条请求打到它 |
+| UT-832 | M36/M15ag 第一个 `closed` 选路 | `TestFirstClosedRouting` | 三实例 [A,B,C]，A `open`、B/C `closed` → 请求打 B；A 的 `degradedUntil` 到期后再发请求 → 打 A |
+| UT-833 | M36/M15ah 全 `open` 打第一个 | `TestAllOpenUsesFirst` | 三实例全 `open` → 请求只打链上第一个 A（不是链尾）；A 成功后恢复 `closed` 并继续承接流量 |
+| UT-834 | M37/M15ak 删除 `current` 指针 | 源码 grep | 不再出现 `protocolRuntime.current`、`setCurrent`、`advanceCurrent`、`noteRealSuccess`、`base = start` |
+| UT-835 | M38/M15ai 失败重置回退时间 | `TestFailureRetimesBackoff` | 实例 `open` 后推进时钟至 `degradedUntil` 前 1s 再失败：`degradedUntil` 重置为 `now + degrade_duration`，无指数增长 |
+| UT-836 | M39 失败后继续尝试下一个 `closed` | `TestLockRoutesEverythingAndUnlockResets`、`TestFallbackTemporaryAndSustained` | 一个候选失败即重试下一个 `closed` 候选；`open` 候选跳过；全部失败才 502 |
+| UT-837 | M40/M15am 监控页无探测 | `TestMonitorPageHasNoProbeUI` | 页面源码不含 `probe-badge`、`probe-row`、`stat-probe`、`探测中`、`探测成功`、`探测失败`；状态列只会显示 `正常` / `降级 HH:MM:SS` / `已锁定` / `-` |
+| UT-838 | M15an 请求不被探测阻塞 | `TestFirstClosedRouting`、`TestNoActiveProbing` | 源码无后台探测路径；`open` 实例不因内部行为收到请求，请求时延只取决于上游本身 |
+| UT-839 | M15ao 锁定仍然生效 | `TestLockRoutesEverythingAndUnlockResets`、`TestLockedOpenInstanceStillServes` | 锁定后所有请求只发往被锁实例（即使它处于 `open`）；解锁后按第一个 `closed` 重新选路；锁定状态只存内存、不落盘 |
+| UT-840 | M15ap 单实例协议 | `TestSingleInstanceProtocolNeverOpens` | 连续失败超过阈值仍恒为 `closed`、`degradedUntil` 为零；`requests`/`failed`/`recentErrors` 照常累加；无后台请求 |
+| UT-841 | M15aq 构建与测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race` | 全部通过 |
+
+### 35.2 场景说明
+
+- 新增用例全部在 `internal/proxy/circuit_internal_test.go`，沿用 `cbClock` 假时钟与 `cbBackend` 可控上游；`cbBackend` 已删除 `probeStatus`/`blockProbes`/`probeCalls`/`probeTimes` 等探测专用装置。
+- 旧语义用例的处理：`TestFallbackAllDegradedUsesTail` 更名为 `TestFallbackAllDegradedUsesFirst` 并断言打链上第一个；`TestFallbackSuccessResets` 的 `firstCalls` 期望由 5 改为 4、后续由 7 改为 6（探测请求不再发生）；`TestFallbackRecoveryProbeFailure` 更名为 `TestFallbackExpiredWindowRealRequestFails`；`TestStatsInstanceTokenColumns` 删除 `addProbe` 探测行夹具。其余断言保持不变。
+- M15am 为前端源码级检查（无浏览器测试框架），由 `TestMonitorPageHasNoProbeUI` 读取 `go:embed` 的 `web.IndexHTML` 直接断言四个禁用字符串不存在。
+
+## 36. 第十五轮：回退时间默认值改回 5 分钟（§24.18 M41–M44）
+
+### 36.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-842 | M15as 配置缺省回退时间为 5m | `TestLoadAppliesDefaults`（`internal/config`） | 未显式填写 `fallback.degrade_duration` 时解析结果为 `5m`，同时等于 `config.DefaultDegradeDuration`；显式 `"1m"` 仍按 1m 生效（`TestFallbackExplicit` 断言不变，证明只改默认值、不改行为） |
+| UT-843 | M15ar/M15at 示例与文档同步 | `config.example.json`、`README.md` | 示例配置为 `"5m"`；README 参数总览/示例片段/字段表均为 `5m`，且不含「同时是半开探测周期」「同时是统一半开探测周期」 |
+
+### 36.2 场景说明
+
+- UT-842 在既有的 `TestLoadAppliesDefaults` 中新增一条字面量断言 `5*time.Minute`；原先只与 `config.DefaultDegradeDuration` 比较，常量改错时测试会跟着一起错，字面量断言用于固定 §24.18 的默认值。
+- 既有 `TestFallbackExplicit` 显式配置 `"1m"`，继续断言 1m 生效，覆盖 M44「显式值不受影响」。
+- 本轮未改动任何运行时语义、校验规则与前端行为。
