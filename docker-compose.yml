@@ -11,5 +11,7 @@ services:
       # MODEL_ROUTER_ADMIN_USER: "admin"
       # MODEL_ROUTER_ADMIN_PASSWORD: "replace-with-your-admin-password"
     volumes:
+      # 配置与统计（stats.json）同目录，二者一起持久化；不映射该目录时
+      # 统计仍会落在容器内，但容器重建后会随容器一起丢失。
       - ./.docker:/home/nonroot/config:rw
     restart: unless-stopped

@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模型智能路由 · 登录</title>
+<link rel="icon" href="/favicon.ico" type="image/x-icon">
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #12151c;
+    --panel: #1b2130;
+    --panel-2: #222a3b;
+    --text: #e6ebf5;
+    --muted: #9aa7bd;
+    --accent: #5b8cff;
+    --danger: #ff6b6b;
+    --ok: #4ade80;
+    --border: #2d374d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  .login-card {
+    width: min(380px, 100%);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  /* §24.13 K4：登录页同样显示 Logo + 中文展示名。 */
+  .brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .brand img { width: 24px; height: 24px; flex: none; display: block; }
+  .brand span { white-space: nowrap; }
+  .subtitle { color: var(--muted); font-size: 12px; margin: 0 0 18px; }
+  label { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  input[type="text"], input[type="password"] {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font: inherit;
+    width: 100%;
+  }
+  input[type="text"]:focus, input[type="password"]:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  .remember {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    color: var(--text);
+    font-size: 12px;
+    margin-bottom: 16px;
+    cursor: pointer;
+  }
+  .remember input { width: 15px; height: 15px; margin: 0; padding: 0; accent-color: var(--accent); }
+  button {
+    width: 100%;
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 6px;
+    padding: 9px 14px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  #login-error { min-height: 18px; margin: 10px 0 0; color: var(--danger); font-size: 12px; }
+  .hint { color: var(--muted); font-size: 11px; margin: 12px 0 0; }
+</style>
+</head>
+<body>
+<main class="login-card">
+  <h1 class="brand"><img src="/admin/logo.svg" alt="" width="24" height="24"><span>模型智能路由</span></h1>
+  <p class="subtitle">管理员登录</p>
+  <form id="login-form" autocomplete="on">
+    <label>用户名
+      <input id="login-user" name="username" type="text" autocomplete="username" autocapitalize="off" spellcheck="false" autofocus>
+    </label>
+    <label>密码
+      <input id="login-password" name="password" type="password" autocomplete="current-password">
+    </label>
+    <label class="remember">
+      <input id="login-remember" type="checkbox"> 记住我（30 天内自动登录）
+    </label>
+    <button type="submit" id="login-submit">登录</button>
+    <div id="login-error" role="alert"></div>
+  </form>
+  <p class="hint">未勾选「记住我」时，关闭浏览器即退出登录。</p>
+</main>
+<script>
+(function () {
+  'use strict';
+  var form = document.getElementById('login-form');
+  var userInput = document.getElementById('login-user');
+  var passwordInput = document.getElementById('login-password');
+  var rememberInput = document.getElementById('login-remember');
+  var submitButton = document.getElementById('login-submit');
+  var errorEl = document.getElementById('login-error');
+
+  function setError(message) {
+    errorEl.textContent = message || '';
+  }
+
+  // 只接受站内 /admin 路径，拒绝 // 与反斜杠，避免开放重定向。
+  function safeNext(value) {
+    if (typeof value !== 'string' || value === '') {
+      return '';
+    }
+    if (value.indexOf('/admin') !== 0 || value.indexOf('//') === 0 || value.indexOf('\\') >= 0) {
+      return '';
+    }
+    return value;
+  }
+
+  async function submit(event) {
+    event.preventDefault();
+    var user = (userInput.value || '').trim();
+    var password = passwordInput.value || '';
+    if (user === '' || password === '') {
+      setError('请输入用户名和密码。');
+      (user === '' ? userInput : passwordInput).focus();
+      return;
+    }
+    submitButton.disabled = true;
+    setError('');
+    try {
+      var response = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user: user, password: password, remember: !!rememberInput.checked }),
+      });
+      var data = null;
+      try { data = await response.json(); } catch (err) { data = null; }
+      if (!response.ok) {
+        setError('用户名或密码错误。');
+        passwordInput.value = '';
+        passwordInput.focus();
+        return;
+      }
+      var next = safeNext(new URLSearchParams(window.location.search).get('next'));
+      var redirect = next || (data && typeof data.redirect === 'string' ? data.redirect : '/admin/');
+      window.location.assign(redirect);
+    } catch (err) {
+      setError('登录请求失败，请检查网络或服务状态。');
+    } finally {
+      submitButton.disabled = false;
+    }
+  }
+
+  form.addEventListener('submit', submit);
+})();
+</script>
+</body>
+</html>

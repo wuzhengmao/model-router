@@ -1,8 +1,8 @@
-# model-router
+# 模型智能路由（model-router）
 
-OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理透传。
+模型智能路由（`model-router`）是 OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理透传。
 
-> 当前版本：`0.1.1`（M6 能力申明、M7 协议路径分离、§23 日志三档、gzip 与低速检测等）
+> 当前版本：`0.1.2`（实时监控 M9、统计首页与落盘、Cookie 登录与多页面路由、品牌化等）
 > 需求：[docs/requirements.md](docs/requirements.md) ｜ 设计：[docs/design.md](docs/design.md) ｜ 测试：[docs/tests.md](docs/tests.md) ｜ 变更：[CHANGELOG.md](CHANGELOG.md)
 
 ## 能力范围（M1 ～ M4）
@@ -23,7 +23,8 @@ OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理
 - **请求日志**：每个请求打印 `req_model`（客户端原始模型）、`model`（实际转发模型）、`client`（客户端标识，十一级识别）、`ip`（来源 IP）与 `total`/`ttft`/`in`/`out`/`gen`（`gen` 满足吞吐门槛才显示数值，否则 `n/a`）。
 - **模型列表（路径决定格式）**：`GET /v1/models` 固定返回 OpenAI 格式（含可选能力字段），`GET /anthropic/v1/models` 固定返回 Anthropic 官方 schema；不调上游。
 - **Web 配置页 `/admin`**：可视化模式（回退参数输入框、OpenAI/Anthropic 双 tab、添加实例时先选供应商或自定义、实例卡片可拖动排序、测试连接、查询上游模型、勾选/手动填写）+ JSON 高级模式（含 `fallback` 与分组 `instances`；校验通过才可保存）。
-- **管理 API**：`GET/PUT /api/config`、`POST /api/reload`、`POST /api/config/validate`、`POST /api/probe/test`、`POST /api/probe/models`、`GET /api/providers`；HTTP Basic Auth。
+- **实时请求监控（M9）**：管理页「实时监控」页面通过 WebSocket（`GET /api/ws`）接收 AI 请求的 `start`/`chunk`/`retry`/`end` 事件，以一张表格展示状态、方法/路径、请求模型→实例/上游、token、耗时、TTFT 与速率，**每行**在最右侧绘制自己的 trunk 时间轴（横轴从 0 到该请求结束，块间空隙即 TTFT/卡顿，重试切换点用竖线标注）。连接后先收到 snapshot（已结束 100 条 + 进行中 ≤200 条），因此切页/刷新不会空白；「清空」只移除已完成的行、保留进行中的请求与连接。
+- **管理 API**：`GET/PUT /api/config`、`POST /api/reload`、`POST /api/config/validate`、`POST /api/probe/test`、`POST /api/probe/models`、`GET /api/providers`、`GET /api/stats`、`POST /api/stats/clear`、`GET /api/ws`（WebSocket）；HTTP Basic Auth 或会话 Cookie。
 - **手动重载**：重读 `-config` 文件并原子切换，进程不重启；失败保留旧配置。
 - **环境变量覆盖**：`listen`/`auth_token`/`admin_user`/`admin_password` 可用 `MODEL_ROUTER_*` 覆盖。
 - 版本号单一来源，构建通过 `-ldflags` 注入；`-version` 输出构建版本。
@@ -248,16 +249,22 @@ curl -sS http://127.0.0.1:18080/anthropic/v1/models -H "Authorization: Bearer <a
 
 ## 管理页与管理 API
 
-设置非空 `admin_password` 后启用；否则 `/admin*`、`/api/*` 一律 404。所有管理请求使用 HTTP Basic Auth，失败 401 + `WWW-Authenticate: Basic realm="model-router"`。
+设置非空 `admin_password` 后启用；否则 `/admin*`、`/api/*` 一律 404。管理面优先使用登录后下发的 `mr_session` 会话 Cookie；旧版 `Authorization: Basic` 与 `/api/ws` 的 `?user=&password=` 仍保留给脚本/自动化。未登录访问管理页会 302 到 `/admin/login`，API 未授权返回 401。
 
-页面两种模式：
+管理页是四个独立路由页面（刷新后停留在当前页）：
 
-- **可视化模式**：OpenAI / Anthropic 双 tab；「添加实例」先弹出供应商选择框（内置供应商 + 自定义），选内置会按当前协议自动填 `base_url` 并记录 `provider`，自定义则手动填写；每张实例卡片可「测试连接」「查询模型」（带上 `provider`，自动走 models_override）、勾选/手填模型；保存 → `PUT /api/config`。
-- **JSON 高级模式**：编辑完整配置；「校验」→ `POST /api/config/validate`，通过后才启用「保存」。
+- **统计首页 `/admin/`**：运行与连接、请求统计、实例统计、近期错误四块指标；数据来自 `GET /api/stats` 与全局 WS，缩写数值悬停显示精确值。
+- **实时监控 `/admin/monitor`**：登录后自动建立全局 WebSocket，无需单独的认证栏或连接/断开按钮。快照包含最近 100 条已结束请求与最多 200 条进行中请求（带逐块明细），因此切页/刷新不空白；进行中的行会继续接收 chunk/end 事件。主体是**一张表格**：`#`、状态、方法/路径、客户端、请求模型/实例·上游、入、出、块、耗时、TTFT、t/s、时间轴；每行独立时间轴，等待首包（琥珀）/ trunk（蓝）/ 含内容块（绿）三色、重试虚线、进行中当前游标，所有行共享按最长耗时动态更新的量程，刻度与图例在表头。「清空」只移除已完成行并同时清空后端最近 100 条环形缓冲，列表最多保留最近 500 条已完成请求。无 WS 客户端时仍累计统计并维护快照，只是不广播逐 trunk 事件；现有日志格式不变。
+- **可视化配置 `/admin/config`**：OpenAI / Anthropic 双 tab；「添加实例」先弹出供应商选择框（内置供应商 + 自定义），选内置会按当前协议自动填 `base_url` 并记录 `provider`，自定义则手动填写；每张实例卡片可「测试连接」「查询模型」（带上 `provider`，自动走 models_override）、勾选/手填模型；保存 → `PUT /api/config`。页面底部的统计持久化说明见「统计持久化与卷」。
+- **JSON 高级 `/admin/json`**：编辑完整配置；「校验」→ `POST /api/config/validate`，通过后才启用「保存」；编辑框随视口高度自适应。
 
 | 路径 | 方法 | 行为 |
 |---|---|---|
-| `/admin`、`/admin/` | GET | 内嵌配置页（原生 HTML+JS，无外部 CDN） |
+| `/admin` | GET | 302 → `/admin/` |
+| `/admin/`、`/admin/monitor`、`/admin/config`、`/admin/json` | GET | 四个独立页面（统计首页 / 实时监控 / 可视化配置 / JSON 高级，原生 HTML+JS，无外部 CDN）；未登录 302 到 `/admin/login` |
+| `/admin/login` | GET | 独立登录页 |
+| `/api/login`、`/api/logout` | POST | Cookie 会话登录/登出（`mr_session`；记住我 30 天，否则会话 cookie + 服务端 12 小时） |
+| `/favicon.ico` | GET | 匿名可访问的多尺寸图标（`image/x-icon`）；`/admin/logo.svg` 为需登录的矢量 Logo |
 | `/api/config` | GET | 返回当前**生效**配置（含真实 key） |
 | `/api/config` | PUT | 校验后原子写回 `-config` 文件，**不生效** |
 | `/api/config/validate` | POST | 对请求体做全量校验（dry-run），返回 `{ok}`；不写回 |
@@ -265,6 +272,10 @@ curl -sS http://127.0.0.1:18080/anthropic/v1/models -H "Authorization: Bearer <a
 | `/api/probe/test` | POST | 按协议探测上游：openai `GET {base_url}/v1/models`；anthropic `POST {base_url}/v1/messages` 最小请求。返回 `{ok, latency_ms, message}`（2xx 或认证通过的 4xx 视为可达；401/403/404 视为失败） |
 | `/api/probe/models` | POST | `GET {base_url}/v1/models`（openai Bearer / anthropic x-api-key + version）；`provider` 命中 models_override 时改用 override 的 base_url/auth。返回 `{models:[...]}`；上游未实现该端点（404）时返回友好错误，引导手动输入 |
 | `/api/providers` | GET | 返回内置供应商清单（id/name/base_urls/models_override） |
+| `/api/stats` | GET | 返回统计快照（与 WS `stats` 帧的 `data` 同构，含累计值、分位数、实例与近期错误） |
+| `/api/stats/clear` | POST | 清零累计统计与近期错误并立即落盘；不影响 100 条请求快照 |
+| `/api/monitor/clear` | POST | 清空后端最近 100 条请求快照；不影响累计统计 |
+| `/api/ws` | GET（WebSocket） | 快照 + 统计 + 实时监控事件流（`start`/`chunk`/`retry`/`end`）；认证同管理面，另接受 `?user=&password=` 回退。旧 `/api/monitor` 已删除（404） |
 
 probe 请求体：`{protocol, base_url, api_key, provider?, timeout?}`。`provider` 仅 `probe/models` 使用（通用 override）；`probe/test` 按协议选择端点（openai `GET /v1/models`；anthropic `POST /v1/messages` 最小请求），忽略 `provider`。probe 不修改配置、不缓存。
 
@@ -343,6 +354,14 @@ docker compose logs -f model-router
 - 镜像仓库名：`wuzm219/model-router`（Docker Hub）。CI tag 构建推 `wuzm219/model-router:<version>` 与 `:latest`。
 - 多架构构建：`docker buildx build --platform linux/amd64,linux/arm64 -t wuzm219/model-router:<version> .`（Dockerfile 使用 `TARGETARCH`/`TARGETOS` build args）。
 - 镜像不包含健康检查；生产环境请置于 TLS 反向代理之后。
+
+### 统计持久化与卷
+
+- `stats.json` 与 `config.json` 同目录（`filepath.Dir(configPath)`），只保存累计统计与最近 20 条错误，不保存 100 条请求快照、分位数窗口、QPS 与运行时长。写入为同目录临时文件 + `rename` 原子替换，距上次落盘 ≥5 秒且有变化才写；`SIGINT`/`SIGTERM` 退出时补写一次。文件损坏或 schema 未知时会改名为 `stats.json.bad` 并零值启动，不会阻止服务启动。
+- 镜像声明 `VOLUME ["/home/nonroot/config"]`：不使用显式挂载时，配置与统计保存在匿名卷里；`docker rm` 会连同匿名卷删除，需要跨容器重建保留时请用 bind mount 或具名卷。
+- `docker-compose.yml` 继续挂载 `./.docker`，配置与统计一起持久化；`docker-compose.named.yml` 使用具名卷 `model-router-config`，首次启动会从镜像复制占位 `config.json`。
+- distroless 以 uid/gid 65532（`nonroot`）运行。Linux 宿主使用 bind mount 时，若 `./.docker` 由 root 创建，容器无法写 `stats.json`。正确做法是把目录所有者改为容器用户：`sudo chown -R 65532:65532 ./.docker`（或在部署系统里声明 `fsGroup`/对应属主）；不要使用 `chmod 777`。Docker Desktop（Windows/macOS）的 bind mount 通常已可写。
+- 具名卷首次创建会继承镜像内 `/home/nonroot/config` 的 65532 权限；已有配置可用 `docker cp ./config.json <container>:/home/nonroot/config/config.json` 放入卷中（distroless 无 shell）。
 
 ## 目录结构
 

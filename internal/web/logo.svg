@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="模型智能路由">
+  <defs>
+    <linearGradient id="arc-top" x1="56" y1="92" x2="200" y2="92" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fbbf24"/>
+      <stop offset="1" stop-color="#5b8cff"/>
+    </linearGradient>
+    <linearGradient id="arc-bottom" x1="56" y1="164" x2="200" y2="164" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4ade80"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="58" fill="#1b2130"/>
+  <path d="M56 92 A84 84 0 0 1 200 92" fill="none" stroke="url(#arc-top)" stroke-width="17" stroke-linecap="round"/>
+  <path d="M56 164 A84 84 0 0 0 200 164" fill="none" stroke="url(#arc-bottom)" stroke-width="17" stroke-linecap="round"/>
+  <g fill="none" stroke="#c9d8ff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M70 92 H112 L134 110"/>
+    <path d="M66 128 H145"/>
+    <path d="M70 164 H112 L134 146"/>
+  </g>
+  <path d="M151 96 L198 128 L151 160 Z" fill="#ffffff"/>
+</svg>

@@ -8,7 +8,7 @@ package providers
 
 // Auth schemes usable by models_override.
 const (
-	AuthBearer = "bearer"
+	AuthBearer  = "bearer"
 	AuthXAPIKey = "x-api-key"
 )
 
