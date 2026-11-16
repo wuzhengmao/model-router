@@ -103,7 +103,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
-func newProxyWithOptions(t *testing.T, opts proxy.Options, instances ...config.Instance) *httptest.Server {
+func newProxyWithOptionsAndHandler(t *testing.T, opts proxy.Options, instances ...config.Instance) (*httptest.Server, *proxy.Handler) {
 	t.Helper()
 
 	handler, err := proxy.NewWithOptions(&config.Config{
@@ -116,6 +116,12 @@ func newProxyWithOptions(t *testing.T, opts proxy.Options, instances ...config.I
 	}
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
+	return server, handler
+}
+
+func newProxyWithOptions(t *testing.T, opts proxy.Options, instances ...config.Instance) *httptest.Server {
+	t.Helper()
+	server, _ := newProxyWithOptionsAndHandler(t, opts, instances...)
 	return server
 }
 
@@ -333,7 +339,10 @@ func TestFallbackTemporaryAndSustained(t *testing.T) {
 	}
 }
 
-func TestFallbackRecoveryProbeFailure(t *testing.T) {
+// TestFallbackExpiredWindowRealRequestFails covers §24.17 M36/M38: once the
+// degrade window has elapsed the primary is closed again, so the next real
+// request tries it; its failure re-opens it and re-times the window.
+func TestFallbackExpiredWindowRealRequestFails(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	first, fail, firstCalls, _ := newFlakyBackend(t)
 	fail.Store(true)
@@ -356,19 +365,20 @@ func TestFallbackRecoveryProbeFailure(t *testing.T) {
 	}
 
 	clock.Advance(5*time.Minute + time.Second)
-	// The recovery probe fails: re-degrade for another window.
+	// The window elapsed without any probe. The real request is the trial: the
+	// primary fails again (re-timing its window) and the request falls through.
 	resp := send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions", body, withAuth(config.ProtocolOpenAI, nil))
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("probe request status = %d, want 200", resp.StatusCode)
+		t.Fatalf("recovery request status = %d, want 200", resp.StatusCode)
 	}
 	if got := firstCalls(); got != 4 {
-		t.Errorf("first calls = %d, want 4 (recovery probe attempted)", got)
+		t.Errorf("first calls = %d, want 4 (expired window tried by a real request)", got)
 	}
 	if got := secondCalls(); got != 4 {
 		t.Errorf("second backend calls = %d, want 4", got)
 	}
 
-	// Still inside the new window: skip again.
+	// Still inside the re-timed window: skip again.
 	resp = send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions", body, withAuth(config.ProtocolOpenAI, nil))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
@@ -399,12 +409,14 @@ func TestFallbackSuccessResets(t *testing.T) {
 
 	clock.Advance(5*time.Minute + time.Second)
 	fail.Store(false)
+	// §24.17: recovery is driven by the real request itself — the expired
+	// primary is closed by time and serves it, with no probe traffic.
 	resp := send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions", body, withAuth(config.ProtocolOpenAI, nil))
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 	if got := firstCalls(); got != 4 {
-		t.Errorf("first calls = %d, want 4 (recovered)", got)
+		t.Errorf("first calls = %d, want 4 (recovered primary serves the real request)", got)
 	}
 	if got := secondCalls(); got != 3 {
 		t.Errorf("second backend calls = %d, want 3 (primary recovered)", got)
@@ -419,7 +431,7 @@ func TestFallbackSuccessResets(t *testing.T) {
 	}
 }
 
-func TestFallbackAllDegradedForcesHead(t *testing.T) {
+func TestFallbackAllDegradedUsesFirst(t *testing.T) {
 	clock := &fakeClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	first, failFirst, firstCalls, _ := newFlakyBackend(t)
 	failFirst.Store(true)
@@ -443,16 +455,17 @@ func TestFallbackAllDegradedForcesHead(t *testing.T) {
 		t.Fatalf("calls = %d/%d, want 1/1", firstCalls(), secondCalls())
 	}
 
-	// All degraded: force the chain head once, do not try the rest.
+	// §24.17 M36: all instances are open, so the next request goes to the first
+	// chain entry (not the tail).
 	resp = send(t, http.MethodPost, proxyServer.URL+"/v1/chat/completions", body, withAuth(config.ProtocolOpenAI, nil))
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", resp.StatusCode)
 	}
 	if got := firstCalls(); got != 2 {
-		t.Errorf("first calls = %d, want 2 (forced head)", got)
+		t.Errorf("first calls = %d, want 2 (head used, tail skipped)", got)
 	}
 	if got := secondCalls(); got != 1 {
-		t.Errorf("second calls = %d, want 1 (not tried again)", got)
+		t.Errorf("second calls = %d, want 1 (tail not forced)", got)
 	}
 }
 
@@ -593,7 +606,7 @@ func TestThroughputFailure(t *testing.T) {
 	})
 }
 
-func newServerFromJSON(t *testing.T, configJSON string) *httptest.Server {
+func newHandlerFromJSON(t *testing.T, configJSON string) (*httptest.Server, *proxy.Handler) {
 	t.Helper()
 
 	cfg, err := config.Parse([]byte(configJSON))
@@ -606,6 +619,12 @@ func newServerFromJSON(t *testing.T, configJSON string) *httptest.Server {
 	}
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
+	return server, handler
+}
+
+func newServerFromJSON(t *testing.T, configJSON string) *httptest.Server {
+	t.Helper()
+	server, _ := newHandlerFromJSON(t, configJSON)
 	return server
 }
 
@@ -666,10 +685,11 @@ func TestFallbackFromConfigDegradeDuration(t *testing.T) {
 	}
 
 	time.Sleep(250 * time.Millisecond)
-	// The configured 100ms window has elapsed: probe the primary again.
+	// The configured 100ms window has elapsed: the next real request tries the
+	// primary again (§24.17 M36) and it fails, re-timing the window.
 	send(t, http.MethodPost, server.URL+"/v1/chat/completions", body, withAuth(config.ProtocolOpenAI, nil))
 	if got := firstCalls(); got != 2 {
-		t.Errorf("first calls = %d, want 2 (recovery probe after configured duration)", got)
+		t.Errorf("first calls = %d, want 2 (trial after configured duration)", got)
 	}
 }
 

@@ -26,8 +26,7 @@ import (
 	"model-router/internal/web"
 )
 
-// API paths served by this proxy. PathAnthropic and PathModels are also the
-// upstream paths used by probe requests.
+// API paths served by this proxy.
 const (
 	PathOpenAI    = "/v1/chat/completions"
 	PathAnthropic = "/v1/messages"
@@ -46,6 +45,10 @@ const (
 	PathProbeTest      = "/api/probe/test"
 	PathProbeModels    = "/api/probe/models"
 	PathProviders      = "/api/providers"
+
+	// §24.15.3 per-instance breaker controls.
+	PathInstancesLock   = "/api/instances/lock"
+	PathInstancesUnlock = "/api/instances/unlock"
 )
 
 // MaxRequestBodyBytes caps how much of a request body is buffered for
@@ -85,17 +88,31 @@ const (
 // instanceRuntime is one configured instance plus its in-memory fallback state.
 type instanceRuntime struct {
 	name         string
+	proto        protocol
+	index        int
 	baseURL      *url.URL
 	apiKey       string
+	timeout      time.Duration
 	models       []string
 	roles        map[string]string
 	roleNames    map[string]string
 	capabilities map[string]config.ModelCapability
 	client       *http.Client
 
+	// now is the clock the breaker compares against degradedUntil (§24.17 M35).
+	// A nil clock means time.Now, so literal instances in tests stay usable.
+	now func() time.Time
+
 	mu                  sync.Mutex
 	consecutiveFailures int
 	degradedUntil       time.Time
+	degradedSince       time.Time
+	degradeReason       string
+	// singleInstanceProtocol disables the breaker when the protocol has exactly
+	// one configured instance (§24.16 M32): there is no alternative instance to
+	// fail over to, so opening would only pin a red state without diverting
+	// traffic. Set from len(protocolRuntime.insts) at construction.
+	singleInstanceProtocol bool
 }
 
 // Fallback defaults (kept for compatibility; the effective values come from
@@ -121,6 +138,7 @@ type Options struct {
 type Handler struct {
 	authToken          string
 	byProtocol         map[protocol][]*instanceRuntime
+	protocols          map[protocol]*protocolRuntime
 	monitor            *monitorHub
 	now                func() time.Time
 	failureThreshold   int
@@ -200,8 +218,12 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Handler, error) {
 		}
 		ir := &instanceRuntime{
 			name:    name,
+			proto:   proto,
+			index:   len(h.byProtocol[proto]),
 			baseURL: base,
 			apiKey:  inst.APIKey,
+			timeout: inst.Timeout.Duration(),
+			now:     opts.Now,
 			client:  newClient(inst.Timeout.Duration()),
 		}
 		switch proto {
@@ -242,39 +264,19 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Handler, error) {
 		}
 		h.byProtocol[proto] = append(h.byProtocol[proto], ir)
 	}
+	h.protocols = map[protocol]*protocolRuntime{
+		protocolOpenAI:    newProtocolRuntime(h.byProtocol[protocolOpenAI]),
+		protocolAnthropic: newProtocolRuntime(h.byProtocol[protocolAnthropic]),
+	}
+	// §24.16 M32: the judge is the configured instance count of the protocol, not
+	// the current number of selectable instances. A multi-instance protocol keeps
+	// the breaker even if only one instance is healthy right now.
+	for _, ps := range h.protocols {
+		if len(ps.insts) == 1 {
+			ps.insts[0].singleInstanceProtocol = true
+		}
+	}
 	return h, nil
-}
-
-func (inst *instanceRuntime) isDegraded(now time.Time) bool {
-	inst.mu.Lock()
-	defer inst.mu.Unlock()
-	return now.Before(inst.degradedUntil)
-}
-
-func (inst *instanceRuntime) recordSuccess() {
-	inst.mu.Lock()
-	inst.consecutiveFailures = 0
-	inst.degradedUntil = time.Time{}
-	inst.mu.Unlock()
-}
-
-func (inst *instanceRuntime) recordFailure(now time.Time, threshold int, duration time.Duration) {
-	inst.mu.Lock()
-	defer inst.mu.Unlock()
-	inst.consecutiveFailures++
-	if !inst.degradedUntil.IsZero() && !now.Before(inst.degradedUntil) {
-		// Recovery probe after the degradation window failed: re-time without
-		// waiting for the failure count again.
-		inst.degradedUntil = now.Add(duration)
-		return
-	}
-	if inst.consecutiveFailures >= threshold {
-		inst.degradedUntil = now.Add(duration)
-	}
-}
-
-func (h *Handler) recordFailure(inst *instanceRuntime) {
-	inst.recordFailure(h.now(), h.failureThreshold, h.degradeDuration)
 }
 
 func newClient(timeout time.Duration) *http.Client {
@@ -842,13 +844,42 @@ type candidate struct {
 	rewrite bool
 }
 
-// serveChain runs the fallback state machine: skip degraded instances, try
-// candidates in order, retry on pre-response failures, and record outcomes.
+// serveChain runs the fallback state machine: build the candidate chain for the
+// request, try the first closed instance, retry pre-response failures on the
+// next closed candidate, and record outcomes. §24.17 M36/M37: there is no
+// current pointer — every request starts at the first closed instance on the
+// chain, and an all-open chain sends the request to its first instance. A locked
+// protocol sends everything to the pinned instance (§24.15 M10).
 func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto protocol, insts []*instanceRuntime, body []byte) {
 	start := time.Now()
 	reqModel, _ := requestModel(body)
-	chain := buildChain(proto, insts, body)
-	now := h.now()
+
+	locked := -1
+	if ps := h.protocolRuntime(proto); ps != nil {
+		locked = ps.lockedIndex()
+	}
+	var chain []*candidate
+	switch {
+	case locked >= 0 && locked < len(insts):
+		if cand := lockedCandidate(proto, insts, body, locked); cand != nil {
+			chain = []*candidate{cand}
+		}
+	default:
+		chain = buildChainFrom(proto, insts, body)
+	}
+
+	// §24.17 M36/M39: closed candidates are tried in chain order; open ones are
+	// skipped. When every candidate is open the request goes to the first one on
+	// the chain (not the tail).
+	attempts := make([]*candidate, 0, len(chain))
+	for _, cand := range chain {
+		if !cand.inst.isOpen() {
+			attempts = append(attempts, cand)
+		}
+	}
+	if len(attempts) == 0 && len(chain) > 0 {
+		attempts = append(attempts, chain[0])
+	}
 
 	tracker := h.monitor.trackRequest(r, proto, reqModel)
 	finalStatus := 0
@@ -856,17 +887,12 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 	var finalErr error
 	defer func() { tracker.end(finalStatus, finalErr, finalMetrics) }()
 
-	attempted := false
 	// last is the candidate that failed before any response was written. Its
 	// model information goes into the final log line so that a failed routed
 	// call still shows which instance/model was tried (§23 only drops the
 	// segment for traffic that never reached a route).
 	var last *candidate
-	for i, cand := range chain {
-		if cand.inst.isDegraded(now) {
-			continue
-		}
-		attempted = true
+	for i, cand := range attempts {
 		tracker.begin(cand)
 		committed, status, metrics, err := h.tryCandidate(w, r, proto, cand, body, tracker)
 		if committed {
@@ -881,28 +907,9 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		log.Printf("%s %s candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.name, err)
 		last = cand
 		finalMetrics = metrics
-		if i+1 < len(chain) {
-			tracker.retry(chain[i+1], retryReason(err))
+		if i+1 < len(attempts) {
+			tracker.retry(attempts[i+1], retryReason(err))
 		}
-	}
-
-	if !attempted && len(chain) > 0 {
-		// All candidates are in sustained degradation: force the chain head once.
-		cand := chain[0]
-		tracker.begin(cand)
-		committed, status, metrics, err := h.tryCandidate(w, r, proto, cand, body, tracker)
-		if committed {
-			if err != nil {
-				log.Printf("%s %s forced response committed with error: %v", r.Method, r.URL.Path, err)
-			}
-			metrics.reqModel = reqModel
-			finalStatus, finalMetrics, finalErr = status, metrics, err
-			logRequest(r, metrics, time.Since(start))
-			return
-		}
-		log.Printf("%s %s forced candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.name, err)
-		last = cand
-		finalMetrics = metrics
 	}
 
 	if last != nil {
@@ -920,9 +927,11 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 	writeProtocolError(w, proto, http.StatusBadGateway, "upstream request failed")
 }
 
-// buildChain determines the base instance per §9.2 and collects the fallback
-// candidates from it, each with its upstream model and rewrite flag (§11.2).
-func buildChain(proto protocol, insts []*instanceRuntime, body []byte) []*candidate {
+// buildChainFrom determines the base instance per §9.2 and collects the fallback
+// candidates from there, each with its upstream model and rewrite flag (§11.2).
+// The base is purely the model-capability match; routing no longer truncates
+// the chain at a current pointer (§24.17 M37).
+func buildChainFrom(proto protocol, insts []*instanceRuntime, body []byte) []*candidate {
 	model, usable := requestModel(body)
 	if !usable {
 		return fallbackChain(proto, insts)
@@ -938,7 +947,7 @@ func buildChain(proto protocol, insts []*instanceRuntime, body []byte) []*candid
 	case matchWildcard:
 		return wildcardChain(from)
 	default:
-		return fallbackChain(proto, insts)
+		return fallbackChain(proto, from)
 	}
 }
 
@@ -1429,7 +1438,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 			}
 			// Empty stream: commit the (empty) response and treat as success.
 			writeResponseHead()
-			cand.inst.recordSuccess()
+			h.recordSuccess(cand.inst)
 			return true, resp.StatusCode, m, nil
 		}
 
@@ -1473,7 +1482,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 			h.recordFailure(cand.inst)
 			log.Printf("instance %s slow stream: %st/s", cand.inst.name, formatTPS(m.genTPS))
 		} else {
-			cand.inst.recordSuccess()
+			h.recordSuccess(cand.inst)
 		}
 		return true, resp.StatusCode, m, nil
 	}
@@ -1504,7 +1513,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 		h.recordFailure(cand.inst)
 		log.Printf("instance %s slow: %st/s", cand.inst.name, formatTPS(m.genTPS))
 	} else {
-		cand.inst.recordSuccess()
+		h.recordSuccess(cand.inst)
 	}
 	return true, resp.StatusCode, m, nil
 }
@@ -1547,27 +1556,59 @@ type usageTokens struct {
 	hasOut bool
 }
 
+// sseUsage is the usage subset shared by non-streaming bodies and SSE events,
+// including Anthropic's nested message_start.message.usage object.
+type sseUsage struct {
+	PromptTokens             *int `json:"prompt_tokens"`
+	CompletionTokens         *int `json:"completion_tokens"`
+	InputTokens              *int `json:"input_tokens"`
+	OutputTokens             *int `json:"output_tokens"`
+	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+}
+
+// inputTokens returns the full input count. Anthropic splits input into
+// input_tokens plus cache creation/read counters, so they are summed (§24.15
+// M17); OpenAI-style prompt_tokens already includes cached tokens. The primary
+// counter is required so a cache-only frame cannot clobber a known total.
+func (u sseUsage) inputTokens() (int, bool) {
+	if u.InputTokens != nil {
+		total := *u.InputTokens
+		if u.CacheCreationInputTokens != nil {
+			total += *u.CacheCreationInputTokens
+		}
+		if u.CacheReadInputTokens != nil {
+			total += *u.CacheReadInputTokens
+		}
+		return total, true
+	}
+	if u.PromptTokens != nil {
+		return *u.PromptTokens, true
+	}
+	return 0, false
+}
+
+func (u sseUsage) outputTokens() (int, bool) {
+	if u.OutputTokens != nil {
+		return *u.OutputTokens, true
+	}
+	if u.CompletionTokens != nil {
+		return *u.CompletionTokens, true
+	}
+	return 0, false
+}
+
 // parseUsage extracts prompt/input and completion/output token counts. Missing
 // or unparseable usage yields hasIn/hasOut=false.
 func parseUsage(proto protocol, body []byte) usageTokens {
 	var payload struct {
-		Usage struct {
-			PromptTokens     *int `json:"prompt_tokens"`
-			CompletionTokens *int `json:"completion_tokens"`
-			InputTokens      *int `json:"input_tokens"`
-			OutputTokens     *int `json:"output_tokens"`
-		} `json:"usage"`
+		Usage sseUsage `json:"usage"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return usageTokens{}
 	}
 	var usage usageTokens
-	if payload.Usage.PromptTokens != nil {
-		usage.in, usage.hasIn = *payload.Usage.PromptTokens, true
-	}
-	if payload.Usage.InputTokens != nil {
-		usage.in, usage.hasIn = *payload.Usage.InputTokens, true
-	}
+	usage.in, usage.hasIn = payload.Usage.inputTokens()
 	if proto == protocolAnthropic {
 		if payload.Usage.OutputTokens != nil {
 			usage.out, usage.hasOut = *payload.Usage.OutputTokens, true
@@ -1580,19 +1621,17 @@ func parseUsage(proto protocol, body []byte) usageTokens {
 	return usage
 }
 
-// copyBody streams the upstream body to the client, flushing after each chunk
-// so SSE responses reach the caller without buffering.
+// copyBody copies a non-streaming upstream body to the client. It deliberately
+// does not flush: net/http already drains the write buffer as it fills, and
+// leaving the tail buffered until the handler returns keeps request statistics
+// (recorded in serveChain's defer) ordered before the client sees EOF.
 func copyBody(w http.ResponseWriter, src io.Reader) error {
-	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				return werr
-			}
-			if flusher != nil {
-				flusher.Flush()
 			}
 		}
 		if err == io.EOF {
@@ -1604,9 +1643,8 @@ func copyBody(w http.ResponseWriter, src io.Reader) error {
 	}
 }
 
-// copyBodyTee streams like copyBody while capturing the bytes for usage parsing.
+// copyBodyTee copies like copyBody while capturing the bytes for usage parsing.
 func copyBodyTee(w http.ResponseWriter, src io.Reader, capture io.Writer) error {
-	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := src.Read(buf)
@@ -1616,9 +1654,6 @@ func copyBodyTee(w http.ResponseWriter, src io.Reader, capture io.Writer) error 
 			}
 			if _, cerr := capture.Write(buf[:n]); cerr != nil {
 				return cerr
-			}
-			if flusher != nil {
-				flusher.Flush()
 			}
 		}
 		if err == io.EOF {
@@ -1718,14 +1753,14 @@ func (s *sseState) processLine(line string) {
 		return
 	}
 	var event struct {
-		Type  string `json:"type"`
-		Index *int   `json:"index"`
-		Usage struct {
-			PromptTokens     *int `json:"prompt_tokens"`
-			CompletionTokens *int `json:"completion_tokens"`
-			InputTokens      *int `json:"input_tokens"`
-			OutputTokens     *int `json:"output_tokens"`
-		} `json:"usage"`
+		Type  string   `json:"type"`
+		Index *int     `json:"index"`
+		Usage sseUsage `json:"usage"`
+		// Anthropic's message_start nests usage under message; the input count is
+		// only reported there, while message_delta carries the final output count.
+		Message struct {
+			Usage sseUsage `json:"usage"`
+		} `json:"message"`
 		// §24.9 Z5: OpenAI chat.completion chunks carry no content_block_delta;
 		// any non-empty delta field counts as one content-bearing chunk.
 		Choices []struct {
@@ -1754,21 +1789,14 @@ func (s *sseState) processLine(line string) {
 			}
 		}
 	}
-	if event.Usage.PromptTokens != nil {
-		s.inTokens = *event.Usage.PromptTokens
-		s.hasIn = true
+	if tokens, known := event.Usage.inputTokens(); known {
+		s.inTokens, s.hasIn = tokens, true
 	}
-	if event.Usage.InputTokens != nil {
-		s.inTokens = *event.Usage.InputTokens
-		s.hasIn = true
+	if tokens, known := event.Message.Usage.inputTokens(); known {
+		s.inTokens, s.hasIn = tokens, true
 	}
-	if event.Usage.CompletionTokens != nil {
-		s.tokens = *event.Usage.CompletionTokens
-		s.hasTokens = true
-	}
-	if event.Usage.OutputTokens != nil {
-		s.tokens = *event.Usage.OutputTokens
-		s.hasTokens = true
+	if tokens, known := event.Usage.outputTokens(); known {
+		s.tokens, s.hasTokens = tokens, true
 	}
 	switch event.Type {
 	case "content_block_start":
@@ -2187,7 +2215,8 @@ func (s *Server) StartPersistence() {
 	s.monitor.stats.startPersistence()
 }
 
-// Close flushes pending statistics and stops the writer. It is idempotent.
+// Close flushes pending statistics and stops the background writer. It is
+// idempotent.
 func (s *Server) Close() {
 	s.monitor.stats.stopPersistence()
 }
@@ -2312,6 +2341,10 @@ func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request, st *serverSt
 		s.serveLogout(w, r)
 	case PathStats:
 		s.serveStats(w, r)
+	case PathInstancesLock:
+		s.serveInstanceLock(w, r, st)
+	case PathInstancesUnlock:
+		s.serveInstanceUnlock(w, r, st)
 	case PathStatsClear:
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)

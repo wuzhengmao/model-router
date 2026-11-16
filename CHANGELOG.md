@@ -4,6 +4,37 @@
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-16
+
+### Added
+
+- 锁定 / 解锁（M10–M12）：新增 `POST /api/instances/lock`（`{"protocol","name"}`）与 `POST /api/instances/unlock`（`{"protocol"}`）；锁定后熔断计数与回退全部暂停，该协议所有请求发往被锁定实例，其余实例状态显示为 `-`；解锁后清零该协议所有实例的熔断状态。
+- 统计页（M14/M15）：实例行按 openai → anthropic、组内配置优先级排序；`open` 行变灰并显示 `HH:MM:SS` 降级开始时间，`locked` 显示「已锁定」，其余显示「正常」；每行提供锁定/解锁图标按钮。
+- 实例级 token 两列（M17）：统计页实例行在「平均 t/s」之前新增「输入 token」「输出 token」，数值千分位展示、缺省 `0`；`GET /api/stats` 的 `instances[]` 新增 `inTokens`/`outTokens`（`int64`，缺省 0）。口径为全部已结束请求的 `usage` 全量累加（失败/中断/截断同样计入），输出含 thinking/reasoning，不复用吞吐样本 `genOut`。`stats.json` 同步保存实例 token；schema 仍为 1，旧文件按 0 恢复（历史不可追溯）。
+- 实例统计拆表与排序（M15q/M15r）：统计页实例统计按协议拆成上下两张表（`OpenAI 实例` / `Anthropic 实例`），各含 11 列、独立 `tbody` 与空状态；`GET /api/stats` 的 `instances[]` 统一按 openai → anthropic、组内配置优先级升序、同优先级实例名升序排列，`removed` 行使用同一规则。
+- 实例 token K/M 缩写（M15s）：统计页实例表「输入 token」「输出 token」与顶部磁贴共用 `formatStatCount`（阈值 `1000`，`K` 1 位 / `M` 2 位）；单元格 `title` 保留精确千分位值，缺省/非法值显示 `0`。
+- 数值与单位展示全局统一（M15t）：K/M 计数、时长、百分比与速率各自只有一个共享实现——计数走 `formatStatCount`，时长走 `formatDuration`（ms/s/m/h 按原值分档，秒/分/时均保留 2 位），百分比/速率分别走 `formatPercent` / `formatRate`；删除 `formatMs`、`formatStatDuration` 两套独立实现，`formatInstanceTokenCount` 改为薄封装，`formatUptime` 保留为 d/h/m 复合格式。
+
+### Changed
+
+- 非流式响应不再逐块显式 flush（net/http 自动出队，末尾缓冲在 handler 返回时写出），使请求统计先于客户端读到 EOF 入账；SSE 仍逐块 flush。
+- `docs/design.md` 新增 §34（四态、`current`、探测 tick、锁定接口与前端标识）与 §35（后台周期探测）。两节描述的探测子系统与 `current` 指针已在 §24.17 中删除，原文保留为演进记录并在节首标注，现行语义见 §36；`docs/tests.md` 新增 §33（UT-795～UT-807）。
+- `docs/design.md` §34.5 补充 M17 实例 token 两列的累计口径、落盘兼容与 `genOut` 区分；`docs/tests.md` §33 补充 UT-808～UT-812。
+- 输入 token 解析补齐 M17 口径：Anthropic `input_tokens` 与 `cache_creation_input_tokens`/`cache_read_input_tokens` 求和（含缓存命中），流式 `message_start.message.usage` 也纳入解析；OpenAI `prompt_tokens` 保持不变（缓存字段为其子集）。§23 日志 `↑`、聚合 `inTokens` 与实例列同源。
+- 单实例协议不参与熔断（M32）：协议仅配置 1 个实例时，该实例无论连续失败多少次都保持 `closed`，`degradedUntil` 恒为零、`degradedSince` 恒为 0、`reason` 为空，监控页状态恒为「正常」；失败仍照常计入 `requests`/`failed`/`recentErrors` 与失败日志。判定依据是配置的协议实例总数（`len(protocolRuntime.insts) == 1`），多实例协议（含只剩一个健康实例的情况）行为不变。
+- 熔断改为真实请求驱动的半开语义（§24.17 M33–M40）：删除主动探测子系统与 `current` 指针，状态收窄为 `closed`/`open`（外加展示层 `locked`/`-`）。`isOpen()` 只看向 `degradedUntil`，到期即自动回到 `closed`，无需探测或请求。每次请求按候选链顺序选择第一个 `closed` 实例；链上全部 `open` 时发往链上第一个实例（不再是链尾）。实例真实失败达到阈值转 `open`，已 `open` 的实例再次失败直接把 `degradedUntil` 重置为 `now + degrade_duration`，不加退避；失败重试仍按链顺序跳到下一个 `closed` 候选，全部失败才 502。
+- 默认回退时间由 `1m` 改回 `5m`（§24.18 M41–M44）：`fallback.degrade_duration` 的代码默认值改为 `5 * time.Minute`（§24.15 的 1m 只因它兼作探测周期，§24.17 取消探测后不再成立）；`config.example.json` 示例与 README 的参数总览、配置片段、字段表同步为 `5m` 并删除探测周期表述。显式配置的值不受影响，当前线上 `.docker/config.json` 保持不变。
+- 监控页清理探测展示（§24.17 M40）：删除「探测」徽标、探测行琥珀色背景/竖条、`探测中` 状态、`stat-probe` 状态色与 `current` 行高亮；实例统计表状态列只显示 `正常` / `降级 HH:MM:SS` / `已锁定` / `-`。`/api/stats` 的 `state` 取值域收窄为 `closed`/`open`/`locked`/`-`，`current` 字段保留但恒为 false。
+
+### Removed
+
+- 主动探测子系统（§24.17 M33）：删除 `probeTick`/`probeProtocol`/`sendProbe`/`probeSucceeded`/`probeModel`/`probeWindow`/`probeMonitor` 及 `Server.startProber`/`stopProber` 后台 1s 循环，删除 `instanceRuntime.probing`/`probeAttempted`、`Handler.probe*` 字段与 `stateProbe`；WS 事件与最近请求环形缓冲的 `probe`/`probeResult` 字段一并删除，`statsAggregator.addProbe` 移除。`/api/probe/test`、`/api/probe/models` 是配置页的上游连通性接口，不受影响。
+- `protocolRuntime.current` 指针及其 `setCurrent`/`advanceCurrent`/`noteRealSuccess` 辅助、`buildChainFrom` 的 `start` 参数与 `base = start` 截断（§24.17 M37）。
+
+### Fixed
+
+- 非流式响应统计与客户端 EOF 的顺序（§24.16 M15af）：`copyBody`/`copyBodyTee` 不再逐块 flush，统计入账先于客户端读到 EOF；`copySSE` 仍逐块 flush。补充基于 `Flush` 计数的回归用例。
+
 ## [0.1.3] - 2026-11-16
 
 ### Changed

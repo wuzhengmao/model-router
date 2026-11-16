@@ -27,11 +27,17 @@ type persistedRequests struct {
 	Failed  int64 `json:"failed"`
 }
 
+// persistedInstance keeps the per-instance cumulative counters. InTokens and
+// OutTokens were added in §24.15 M17; older schema-1 files decode them as zero,
+// so the rest of the history survives the upgrade.
 type persistedInstance struct {
 	Name         string `json:"name"`
+	Protocol     string `json:"protocol,omitempty"`
 	Requests     int64  `json:"requests"`
 	Success      int64  `json:"success"`
 	Failed       int64  `json:"failed"`
+	InTokens     int64  `json:"inTokens"`
+	OutTokens    int64  `json:"outTokens"`
 	TTFTCount    int64  `json:"ttftCount"`
 	TTFTSumMs    int64  `json:"ttftSumMs"`
 	GenOutTokens int64  `json:"genOutTokens"`
@@ -73,8 +79,8 @@ func (p persistedStats) valid() bool {
 	}
 	for _, inst := range p.Instances {
 		for _, value := range []int64{
-			inst.Requests, inst.Success, inst.Failed, inst.TTFTCount,
-			inst.TTFTSumMs, inst.GenOutTokens, inst.GenMs,
+			inst.Requests, inst.Success, inst.Failed, inst.InTokens,
+			inst.OutTokens, inst.TTFTCount, inst.TTFTSumMs, inst.GenOutTokens, inst.GenMs,
 		} {
 			if value < 0 {
 				return false
@@ -167,10 +173,14 @@ func (a *statsAggregator) restore(persisted persistedStats) {
 	a.genMs = persisted.GenMs
 	a.retries = persisted.Retries
 	for _, inst := range persisted.Instances {
-		a.instances[inst.Name] = &instanceCounters{
+		a.instances[instanceKey{protocol: inst.Protocol, name: inst.Name}] = &instanceCounters{
+			protocol:  inst.Protocol,
+			name:      inst.Name,
 			requests:  inst.Requests,
 			success:   inst.Success,
 			failure:   inst.Failed,
+			inTokens:  inst.InTokens,
+			outTokens: inst.OutTokens,
 			ttftCount: inst.TTFTCount,
 			ttftSum:   inst.TTFTSumMs,
 			genOut:    inst.GenOutTokens,
@@ -187,12 +197,15 @@ func (a *statsAggregator) restore(persisted persistedStats) {
 
 func (a *statsAggregator) persistedLocked() persistedStats {
 	instances := make([]persistedInstance, 0, len(a.instances))
-	for name, counters := range a.instances {
+	for key, counters := range a.instances {
 		instances = append(instances, persistedInstance{
-			Name:         name,
+			Name:         key.name,
+			Protocol:     key.protocol,
 			Requests:     counters.requests,
 			Success:      counters.success,
 			Failed:       counters.failure,
+			InTokens:     counters.inTokens,
+			OutTokens:    counters.outTokens,
 			TTFTCount:    counters.ttftCount,
 			TTFTSumMs:    counters.ttftSum,
 			GenOutTokens: counters.genOut,
@@ -302,7 +315,7 @@ func (a *statsAggregator) clearCumulative() {
 	a.retries = 0
 	a.ttftSamples = sampleRing{}
 	a.durationSamples = sampleRing{}
-	a.instances = make(map[string]*instanceCounters)
+	a.instances = make(map[instanceKey]*instanceCounters)
 	a.recentErrors = nil
 	a.generation++
 	a.dirty = true
