@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-17
+
+### Changed
+
+- 全 `open` 时改为逐实例向后重试（§24.19 M45–M48）：链上全部实例都 `open` 时，`serveChain` 的尝试列表不再只放链上第一个候选，而是整条候选链按链序全部放入；请求从索引 0 开始逐个向后尝试，第一个成功即返回，后续候选不预发，全部失败才 502。每个失败的 `open` 实例仍照常记录失败并把 `degradedUntil` 重置为 `now + degrade_duration`，不因重试而跳过记账。混合场景（部分 `closed`、部分 `open`）行为不变：`closed` 候选按链序尝试，`open` 候选跳过。M36「全 `open` 只打第一个」的限制随之撤订，`docs/design.md` §36.4/§36.7 更正并新增 §37，`README.md` 熔断策略第 5 条同步。
+- 测试同步：`TestAllOpenUsesFirst`（M15ah）按新语义改写为 `TestAllOpenRetriesEveryInstance`、`TestAllOpenFirstSuccessNoPrefetch`、`TestAllOpenAllFail`、`TestMixedClosedAndOpenSkipsOpen`、`TestAllOpenFailureBookkeeping`；`TestFailureRetimesBackoff` 追加全 open 重试下第二实例的调用与重新计时断言；`TestFallbackAllDegradedUsesFirst` 更名为 `TestFallbackAllOpenRetriesEveryInstance`。`docs/tests.md` 新增 §37（UT-844～UT-849）。
+
 ## [0.1.4] - 2026-11-16
 
 ### Added

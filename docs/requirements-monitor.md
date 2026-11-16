@@ -1091,3 +1091,55 @@
 | M15as | 配置未显式填写 `degrade_duration` 时，解析结果为 `5m`（代码默认值 = `5m`） |
 | M15at | README 中不再出现「同时是半开探测周期」「同时是统一半开探测周期」等探测相关表述；参数默认值表述为 `5m` |
 | M15au | `go build ./...`、`go vet ./...`、`gofmt -l .`（无输出）、`go test ./... -race` 全绿 |
+
+## 24.19 全 open 时逐实例向后重试
+
+### 24.19.1 现状与问题
+
+§24.17 定下「全部实例都 open 时，请求发往链上的**第一个**实例」。但当前实现（`internal/proxy/proxy.go` 的 `serveChain`）在构造尝试列表时，全 open 分支只把链上第一个候选塞进 `attempts`：
+
+```go
+attempts := make([]*candidate, 0, len(chain))
+for _, cand := range chain {
+    if !cand.inst.isOpen() {
+        attempts = append(attempts, cand)
+    }
+}
+if len(attempts) == 0 && len(chain) > 0 {
+    attempts = append(attempts, chain[0])   // 只塞第一个
+}
+```
+
+`attempts` 只有 1 个元素时，重试循环也只跑一次：第一个实例失败就返回 502，**不会继续尝试链上后续实例**。在全部实例都被摘除（例如上游整体抖动）的场景下，这等于整个协议只能打一个实例，可用性显著劣化。
+
+用户原话：
+
+> 「我希望的是 all open 时请求超时依然一个个实例往后重试」
+
+### 24.19.2 M 组决策
+
+| 编号 | 决策 |
+| --- | --- |
+| M45 | 全部候选都 open（或没有 closed 候选）时，尝试列表为**整条链按顺序的全部候选**，而不是只有链上第一个 |
+| M46 | 全 open 时的顺序与 closed 时一致：从链上索引 0 开始依次向后，第一个成功即返回，全部失败才 502 |
+| M47 | 撤订 M36 中「全 open 只打第一个」的限制：§24.17 的「发往链上第一个」仅用于表述**起点**，不再是**唯一尝试对象** |
+| M48 | 混合场景（部分 closed、部分 open）行为不变：closed 候选按链序全部尝试，open 候选依旧跳过 |
+
+### 24.19.3 接口
+
+无新增、无删除。`/api/stats` 的实例 `state` 取值（closed / open / locked / -）与语义均不变。
+
+### 24.19.4 验收
+
+| 编号 | 验收标准 |
+| --- | --- |
+| M15av | 三实例全部 open 时，第一个实例失败后请求继续尝试第二个；第二个失败后继续尝试第三个 |
+| M15av-b | 三实例全部 open 且第一个实例成功时，只调用第一个实例（不预发后续实例的请求） |
+| M15aw | 三实例全部 open 且全部失败时，返回 502，且三个实例各被调用恰好 1 次 |
+| M15ax | 两实例 closed + 一实例 open 时，只尝试两个 closed 实例，open 实例调用次数为 0 |
+| M15ay | 全部 open 时每个失败实例仍按规则记录失败并重置 `degradedUntil`（不因重试而跳过失败记账） |
+| M15az | `go build ./...`、`go vet ./...`、`gofmt -l .`（无输出）、`go test ./... -race` 全绿 |
+
+### 24.19.5 版本
+
+本次改动 bump dev 版本：`0.1.4` → `0.1.5`（`internal/version/version.txt`），CHANGELOG 新增 `[0.1.5]` 段落。
