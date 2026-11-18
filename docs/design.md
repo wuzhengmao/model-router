@@ -1398,3 +1398,50 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 
 - **D-M15-1 沿用同一重试循环**：不为全 open 另写一套重试/记账路径，避免与 closed 候选语义分叉；差异只在 `attempts` 的构造。
 - **未覆盖**：§24.19 未给全 open 重试增加总时长上限——一次请求最多尝试 `len(chain)` 个实例，总耗时受各实例 `timeout` 与上游返回共同约束；实现不引入额外总超时。
+
+## 38. 第十七轮：上游非 2xx 按状态码分类处置（§24.20 M49–M55）
+
+### 38.1 实现
+
+- `internal/proxy/proxy.go` 的 `tryCandidate` 在 `client.Do` 拿到响应、尚未向客户端写出任何字节时先判定状态码：`<200 || >=300` 视为候选失败（M49/M50；Go 客户端已自动跟随重定向，最终仍非 2xx 的按同规则处理，M51）。
+- 失败时调用 `h.recordFailure(cand.inst)`，与连接错误同等记账；随后把响应体读入内存（上限 `upstreamErrorBodyLimit = 4 MiB`）并返回新的 `*upstreamResponseError`，其中保存状态码、响应头与响应体。未提交任何响应头，因此 `serveChain` 可以继续换下一个候选。
+- 响应体前缀（`upstreamBodyExcerptLimit = 512` 字节）进入三条可观测路径：
+  - 错误文本为 `upstream status <code>: <body prefix>`，即使响应体为空也至少是 `upstream status <code>`，保证 `error` 非空（M53）；
+  - `attemptMetrics.upstreamBody` → `requestMonitor.end` → `monitorRequestSnapshot.upstreamBody` → WS `end` 事件与 `/api/stats` 的 `recentErrors[].upstreamBody`（M53、§24.20.3）；
+  - `recentErrors[]` 的 `status`/`instName`/`upstreamModel`/`model` 沿用既有字段，分别来自最终失败候选与上游响应。
+- 若上游强制 gzip（`Content-Encoding: gzip`），转发仍使用原始压缩字节与原始响应头；错误文本里的 body 前缀额外做一次 best-effort 解压，便于阅读。
+- `retryReason()` 识别 `*upstreamResponseError` 并返回 `upstream_status`（M54）；前端未知原因按原文展示。
+- 候选全部失败时，`serveChain` 调 `forwardUpstreamError` 原样转发最后一次观测到的非 2xx 响应：状态码不变（M52），响应头经 `removeHopByHop` 清理，`Content-Length` 按实际缓冲长度重写。若所有候选都停在「未拿到响应头」阶段，则保持既有 502（M59 第二句）。
+- 本地生成响应（models 列表、管理面、鉴权失败、请求体过大等）在进入 `serveChain` 之前返回，不经过状态码分类（M55）。
+
+### 38.2 决策与未覆盖
+
+- **D-M16-1 状态分类只发生在真实转发路径**：`tryCandidate` 是唯一调用上游的位置；本地响应与 probe 接口（`/api/probe/*`）不共享该逻辑。
+- **D-M16-2 3xx 一律判失败**：Go 客户端默认跟随重定向；未被跟随的最终 3xx（如缺少 `Location`、`304`）按 M51 归入非 2xx 失败，而不是透传。
+- **D-M16-3 缓冲上限**：错误响应体最多缓冲 4 MiB 以便原样转发；超限时只转发前缀。正常上游错误体远小于该值，避免故障上游用超大错误体耗尽内存。
+- **未覆盖**：已提交响应后的上游错误（流式首块之后）不属于 M49/M50 的「响应头尚未提交」前提，行为保持既有语义——客户端收到已提交的响应，不再换实例（M15bd）。
+
+## 39. 第十八轮：全候选失败后的补漏尝试与错误透传（§24.21 M56–M62）
+
+### 39.1 实现
+
+- `serveChain` 在首轮尝试列表之后构造 `plan`：
+  1. **首轮**（原语义）：闭包候选按链序；链上全部 open 时整条链按链序（§24.19）。首轮真实调用过的实例记入 `seen`。
+  2. **补漏段**（M56–M58）：按**配置顺序**遍历该协议全部实例，跳过首轮已调用过的实例。未调用实例若在候选链上有候选（混合场景中被 `open` 跳过、但仍属于链的实例），直接复用首轮构造的 `candidate`；否则用 `fallbackCandidate` 按实例自己的映射构造：Anthropic 在请求模型等于实例声明模型时直连，否则依次取请求角色映射、`roles['*']`、`concreteRoles`（sonnet → opus → fable → haiku）顺序的第一个映射；OpenAI 取实例声明的请求模型（直连），未声明时取 `models[0]`。需要换名时通过 `rewrite` 改写请求体 `model`。
+- 没有任何映射的实例（Anthropic 无请求角色、无 `*`、无具体角色映射；OpenAI `models` 为空）不进入补漏段——M58 禁止回退到客户端原始模型名。
+- `seen`（按 `*instanceRuntime` 去重）保证每个实例在一次请求中最多被真实调用一次（M61）；`plan` 长度不超过该协议实例总数，首轮已覆盖全部实例时补漏段为空（M62）。
+- 首轮内部的 retry 原因仍按失败类型记 `error`/`first_token_timeout`/`upstream_status`（M54）；进入补漏段的 retry 记为 `fallback_retry`（M60）。
+- 补漏尝试的失败与成功仍走 `tryCandidate` 内的 `recordFailure`/`recordSuccess`，与首轮一致（M60/M15bm）。
+- 全部失败后：若过程中观测到真实非 2xx 上游响应，转发最后一条（状态码 + 响应体，M59）；只有所有候选都停在「未拿到响应头」阶段才返回 502 `upstream request failed`。
+- 锁定协议保持 §24.15 M10：只打被锁定实例，不进入补漏段（M62）。
+- `/api/stats` 未新增接口字段（`recentErrors[].upstreamBody` 属于 §24.20）；实时监控重试原因枚举增加 `upstream_status` 与 `fallback_retry`。
+
+### 39.2 决策与未覆盖
+
+- **D-M18-1 链内实例复用首轮候选**：混合场景中被 `open` 跳过、但仍属于候选链的实例，补漏段直接使用首轮构造的同一 `candidate`（相同 `model`/`rewrite`），避免重新推导导致与首轮映射分叉（M58「与第 1 段完全一致」）。
+- **D-M18-2 链外实例的映射选择**：Anthropic 实例可能只映射了别的角色（请求 `sonnet`、实例只声明 `opus`）。补漏段仍取该实例自己的映射，顺序为「请求角色 → `*` → `concreteRoles`」；OpenAI 取实例声明的请求模型，否则 `models[0]`。§24.21 未规定链外 Anthropic 实例选哪个角色映射，`concreteRoles` 顺序是实现的确定性选择（`fallbackCandidate`/`firstRoleMapping`）。
+- **D-M18-3 无映射实例跳过**：实例没有任何可用映射时不进入补漏段。M56 只定义「尚未调用过的实例集」，M58 又禁止使用客户端原始模型名；实现取 M58 优先：无映射即跳过。
+- **D-M18-4 无模型名的请求**：`requestModel` 解析不到字符串 `model` 时，补漏段仍按实例自己的映射（Anthropic 的 `*`/首个角色映射、OpenAI 的 `models[0]`）构造候选；§24.21 未覆盖此情况。
+- **D-M18-5 转发最后观测到的上游非 2xx**：M59 第一句写「最后一个候选」；若最后几次尝试是连接失败、但更早的候选拿到过 4xx/5xx，则按第二句「所有候选都停在未拿到响应头才 502」的精神，转发最后一次真实拿到的上游响应。
+- **未覆盖**：§24.21 未给补漏段增加总时长上限；一次请求最坏尝试 `len(insts)` 次，总耗时受各实例 `timeout` 与上游返回共同约束，实现不引入额外总超时。
+- **未覆盖**：补漏段失败后的熔断记账沿用既有 `recordFailure` 语义（达到阈值转 `open`，已 `open` 则重置回退时间），§24.21 未给出额外规则。

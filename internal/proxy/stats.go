@@ -30,6 +30,7 @@ const (
 	statsRecentRequests   = 100
 	statsRecentErrors     = 20
 	statsErrorSummaryRune = 80
+	statsUpstreamBodyRune = 200
 	statsQPSWindow        = 60 * time.Second
 )
 
@@ -106,6 +107,8 @@ type statsError struct {
 	UpstreamModel string `json:"upstreamModel"`
 	Model         string `json:"model"`
 	Error         string `json:"error"`
+	// §24.20.3: excerpt of the non-2xx upstream body that caused the failure.
+	UpstreamBody string `json:"upstreamBody,omitempty"`
 }
 
 // statsSnapshot is the single serialization shape shared by GET /api/stats and
@@ -299,6 +302,7 @@ func (a *statsAggregator) finish(req monitorRequestSnapshot, success bool) {
 			UpstreamModel: req.UpstreamModel,
 			Model:         req.ReqModel,
 			Error:         truncateRunes(req.Error, statsErrorSummaryRune),
+			UpstreamBody:  truncateRunes(req.UpstreamBody, statsUpstreamBodyRune),
 		}}, a.recentErrors...)
 		if len(a.recentErrors) > statsRecentErrors {
 			a.recentErrors = a.recentErrors[:statsRecentErrors]

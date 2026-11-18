@@ -577,6 +577,8 @@ type monitorEndEvent struct {
 	InstName      string  `json:"instName"`
 	UpstreamModel string  `json:"upstreamModel"`
 	Error         string  `json:"error,omitempty"`
+	// §24.20 M53: excerpt of a non-2xx upstream body.
+	UpstreamBody string `json:"upstreamBody,omitempty"`
 }
 
 // monitorChunkSnapshot is the compact per-chunk copy kept in the recent-request
@@ -615,6 +617,7 @@ type monitorRequestSnapshot struct {
 	GenMs         int64                  `json:"genMs"`
 	TPS           float64                `json:"tps"`
 	Error         string                 `json:"error,omitempty"`
+	UpstreamBody  string                 `json:"upstreamBody,omitempty"`
 	Ended         bool                   `json:"ended"`
 }
 
@@ -633,6 +636,12 @@ type monitorStatsEvent struct {
 const (
 	retryReasonError             = "error"
 	retryReasonFirstTokenTimeout = "first_token_timeout"
+	// §24.20 M54: the candidate failed because the upstream answered with a
+	// status outside 2xx.
+	retryReasonUpstreamStatus = "upstream_status"
+	// §24.21 M60: the request entered the fallback round (instances the first
+	// round never called, each with its own mapped model).
+	retryReasonFallbackRetry = "fallback_retry"
 )
 
 // attemptFailure carries the §24.2 F3 retry reason across the tryCandidate
@@ -649,6 +658,10 @@ func retryReason(err error) string {
 	var failure *attemptFailure
 	if errors.As(err, &failure) {
 		return failure.reason
+	}
+	var upstream *upstreamResponseError
+	if errors.As(err, &upstream) {
+		return retryReasonUpstreamStatus
 	}
 	return retryReasonError
 }
@@ -939,6 +952,7 @@ func (m *requestMonitor) end(status int, err error, metrics attemptMetrics) {
 		GenMs:         genMs,
 		TPS:           tps,
 		Error:         message,
+		UpstreamBody:  metrics.upstreamBody,
 		Ended:         true,
 	}
 	m.mu.Unlock()
@@ -965,5 +979,6 @@ func (m *requestMonitor) end(status int, err error, metrics attemptMetrics) {
 		InstName:      snapshot.InstName,
 		UpstreamModel: snapshot.UpstreamModel,
 		Error:         snapshot.Error,
+		UpstreamBody:  snapshot.UpstreamBody,
 	})
 }

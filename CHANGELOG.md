@@ -8,6 +8,14 @@
 
 - `docker-compose.yml` 与 `docker-compose.named.yml` 的镜像标签由固定版本号统一改为 `wuzm219/model-router:latest`，避免 compose 文件里的版本号落后于实际发布版本（此前仍停在 `0.1.1`）。
 
+## [0.1.6] - 2026-11-18
+
+### Changed
+
+- 上游非 2xx 按状态码分类处置（§24.20 M49–M55）：`tryCandidate` 在响应头提交前先判定状态码，`<200` 或 `>=300` 视为候选失败并 `recordFailure`，请求按既有链路换下一个候选；候选耗尽时原样转发最后一次上游响应的状态码与响应体，不再改写成 502。错误文本固定为 `upstream status <code>: <body prefix>`（保证非空），`/api/stats` 的 `recentErrors[]` 新增 `upstreamBody`（响应体前 200 字符），WS `end` 事件同步携带；实时监控重试原因新增 `upstream_status`。本地生成的响应（models 列表、管理面、鉴权失败等）不经过该分类。
+- 全候选失败后的补漏尝试与错误透传（§24.21 M56–M62）：首轮（候选链按 §24.17–§24.19 规则走完）失败后，按配置顺序对本次请求尚未调用过的协议实例各补试一次，模型名一律使用该实例自己的映射（Anthropic `roles`、OpenAI `models`），不再用客户端原始模型名重跑；无可用映射的实例跳过。补漏尝试的重试原因为 `fallback_retry`，失败/成功照常 `recordFailure`/`recordSuccess`；按实例去重，一次请求最多真实调用 `len(insts)` 次，首轮已覆盖全部实例时不产生补漏。全部失败时若拿到过真实非 2xx 上游响应则透传最后一条，全部停在连接失败/超时才返回 502。锁定协议保持只打被锁定实例。
+- 测试同步：新增 `internal/proxy/upstream_fallback_internal_test.go`，覆盖 M15ba–M15bf、M15bh–M15bm；`docs/design.md` 新增 §38/§39，`docs/tests.md` 新增 §38（UT-850～UT-857）与 §39（UT-858～UT-864）。
+
 ## [0.1.5] - 2026-11-17
 
 ### Changed

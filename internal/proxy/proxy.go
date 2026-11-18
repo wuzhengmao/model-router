@@ -844,6 +844,60 @@ type candidate struct {
 	rewrite bool
 }
 
+// §24.20 M49/M50: a status outside 2xx received before anything was written to
+// the client is a retryable candidate failure. The buffered response is kept so
+// the last real rejection can be forwarded verbatim once every candidate has
+// failed (§24.21 M52/M60).
+const (
+	upstreamErrorBodyLimit   = 4 << 20 // bytes buffered for verbatim forwarding
+	upstreamBodyExcerptLimit = 512     // bytes kept for logs and recentErrors
+)
+
+type upstreamResponseError struct {
+	status int
+	header http.Header
+	body   []byte
+}
+
+func (e *upstreamResponseError) Error() string {
+	if excerpt := e.excerpt(); excerpt != "" {
+		return fmt.Sprintf("upstream status %d: %s", e.status, excerpt)
+	}
+	return fmt.Sprintf("upstream status %d", e.status)
+}
+
+// excerpt returns a readable prefix of the response body. A gzip-encoded body
+// (preserved for verbatim forwarding) is decoded best-effort for the log.
+func (e *upstreamResponseError) excerpt() string {
+	body := e.body
+	switch strings.ToLower(strings.TrimSpace(e.header.Get("Content-Encoding"))) {
+	case "gzip", "x-gzip":
+		if zr, err := gzip.NewReader(bytes.NewReader(body)); err == nil {
+			decoded, readErr := io.ReadAll(io.LimitReader(zr, upstreamBodyExcerptLimit))
+			_ = zr.Close()
+			if readErr == nil {
+				body = decoded
+			}
+		}
+	}
+	if len(body) > upstreamBodyExcerptLimit {
+		body = body[:upstreamBodyExcerptLimit]
+	}
+	return strings.TrimSpace(strings.ToValidUTF8(string(body), "�"))
+}
+
+// forwardUpstreamError relays the buffered non-2xx response unchanged
+// (§24.21 M52/M60): same status, headers and body; only the hop-by-hop headers
+// and Content-Length (the body may have been buffered/truncated) are adjusted.
+func forwardUpstreamError(w http.ResponseWriter, e *upstreamResponseError) {
+	copyHeader(w.Header(), e.header)
+	removeHopByHop(w.Header())
+	w.Header().Del("Content-Length")
+	w.Header().Set("Content-Length", strconv.Itoa(len(e.body)))
+	w.WriteHeader(e.status)
+	_, _ = w.Write(e.body)
+}
+
 // serveChain runs the fallback state machine: build the candidate chain for the
 // request, try the first closed instance, retry pre-response failures on the
 // next closed candidate, and record outcomes. §24.17 M36/M37: there is no
@@ -851,6 +905,11 @@ type candidate struct {
 // chain. §24.19 M45–M48: an all-open chain tries every candidate in chain order,
 // starting at index 0. A locked protocol sends everything to the pinned
 // instance (§24.15 M10).
+//
+// §24.21 adds a fallback round after the first round fails: every protocol
+// instance the first round never called is tried in configuration order, with
+// the instance's own mapped model (M56–M58). Each instance is attempted at most
+// once per request (M61/M15bl).
 func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto protocol, insts []*instanceRuntime, body []byte) {
 	start := time.Now()
 	reqModel, _ := requestModel(body)
@@ -860,12 +919,12 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		locked = ps.lockedIndex()
 	}
 	var chain []*candidate
-	switch {
-	case locked >= 0 && locked < len(insts):
+	lockedMode := locked >= 0 && locked < len(insts)
+	if lockedMode {
 		if cand := lockedCandidate(proto, insts, body, locked); cand != nil {
 			chain = []*candidate{cand}
 		}
-	default:
+	} else {
 		chain = buildChainFrom(proto, insts, body)
 	}
 
@@ -882,6 +941,39 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		attempts = append(attempts, chain...)
 	}
 
+	// plan is the first round plus the §24.21 fallback round. fallbackStart
+	// separates the rounds so the monitor reports the right retry reason.
+	plan := attempts
+	fallbackStart := len(attempts)
+	if !lockedMode {
+		seen := make(map[*instanceRuntime]bool, len(insts))
+		for _, cand := range attempts {
+			seen[cand.inst] = true
+		}
+		byInst := make(map[*instanceRuntime]*candidate, len(chain))
+		for _, cand := range chain {
+			byInst[cand.inst] = cand
+		}
+		// M56–M58/M61: every protocol instance the first round never called is
+		// topped up in configuration order. A chain candidate kept its own
+		// mapped model; a chain-external instance is mapped from its own roles
+		// or models, never from the client's original model name.
+		for _, inst := range insts {
+			if seen[inst] {
+				continue
+			}
+			seen[inst] = true
+			cand := byInst[inst]
+			if cand == nil {
+				cand = fallbackCandidate(proto, inst, body)
+				if cand == nil {
+					continue
+				}
+			}
+			plan = append(plan, cand)
+		}
+	}
+
 	tracker := h.monitor.trackRequest(r, proto, reqModel)
 	finalStatus := 0
 	var finalMetrics attemptMetrics
@@ -893,7 +985,12 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 	// call still shows which instance/model was tried (§23 only drops the
 	// segment for traffic that never reached a route).
 	var last *candidate
-	for i, cand := range attempts {
+	// lastUpstream keeps the last real non-2xx upstream response so it can be
+	// forwarded instead of a synthetic 502 (§24.21 M60).
+	var lastUpstream *upstreamResponseError
+	var lastUpstreamCand *candidate
+	var lastUpstreamMetrics attemptMetrics
+	for i, cand := range plan {
 		tracker.begin(cand)
 		committed, status, metrics, err := h.tryCandidate(w, r, proto, cand, body, tracker)
 		if committed {
@@ -908,9 +1005,32 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		log.Printf("%s %s candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.name, err)
 		last = cand
 		finalMetrics = metrics
-		if i+1 < len(attempts) {
-			tracker.retry(attempts[i+1], retryReason(err))
+		var upstream *upstreamResponseError
+		if errors.As(err, &upstream) {
+			lastUpstream, lastUpstreamCand, lastUpstreamMetrics = upstream, cand, metrics
 		}
+		if i+1 < len(plan) {
+			reason := retryReason(err)
+			if i+1 >= fallbackStart {
+				reason = retryReasonFallbackRetry
+			}
+			tracker.retry(plan[i+1], reason)
+		}
+	}
+
+	if lastUpstream != nil && lastUpstreamCand != nil {
+		// M52/M60: with no candidate left, relay the last upstream rejection
+		// unchanged instead of hiding it behind a 502.
+		tracker.begin(lastUpstreamCand)
+		log.Printf("%s %s -> (%s) total=%ss status=%d all candidates failed (forwarding upstream response)",
+			r.Method, r.URL.Path, proto, formatSeconds(time.Since(start)), lastUpstream.status)
+		forwardUpstreamError(w, lastUpstream)
+		lastUpstreamMetrics.reqModel = reqModel
+		finalStatus = lastUpstream.status
+		finalErr = lastUpstream
+		finalMetrics = lastUpstreamMetrics
+		logRequest(r, finalMetrics, time.Since(start))
+		return
 	}
 
 	if last != nil {
@@ -1048,6 +1168,55 @@ func fallbackChain(proto protocol, insts []*instanceRuntime) []*candidate {
 	return out
 }
 
+// fallbackCandidate maps one protocol instance the first round never called
+// onto the request with that instance's own upstream model (§24.21 M58): the
+// requested role or wildcard for Anthropic, the declared model or the first
+// model for OpenAI. It returns nil when the instance has no mapping, so the
+// fallback round never falls back to the client's original model name.
+func fallbackCandidate(proto protocol, inst *instanceRuntime, body []byte) *candidate {
+	model, usable := requestModel(body)
+	switch proto {
+	case protocolAnthropic:
+		if usable {
+			if inst.hasModel(model) {
+				return &candidate{inst: inst, model: model}
+			}
+			if role, ok := requestRole(model); ok {
+				if mapped, ok := inst.roles[role]; ok {
+					return &candidate{inst: inst, model: mapped, rewrite: true}
+				}
+			}
+		}
+		if mapped, ok := inst.roles[config.RoleWildcard]; ok {
+			return &candidate{inst: inst, model: mapped, rewrite: true}
+		}
+		if mapped, ok := firstRoleMapping(inst); ok {
+			return &candidate{inst: inst, model: mapped, rewrite: true}
+		}
+		return nil
+	default:
+		if len(inst.models) == 0 {
+			return nil
+		}
+		if usable && contains(inst.models, model) {
+			return &candidate{inst: inst, model: model}
+		}
+		return &candidate{inst: inst, model: inst.models[0], rewrite: true}
+	}
+}
+
+// firstRoleMapping returns the instance's mapping in canonical role order
+// (wildcard is handled by fallbackCandidate), so an Anthropic instance that
+// maps no requested role still contributes a deterministic own model.
+func firstRoleMapping(inst *instanceRuntime) (string, bool) {
+	for _, role := range concreteRoles {
+		if model, ok := inst.roles[role]; ok {
+			return model, true
+		}
+	}
+	return "", false
+}
+
 func (inst *instanceRuntime) hasModel(model string) bool {
 	for _, declared := range inst.models {
 		if declared == model {
@@ -1169,6 +1338,8 @@ type attemptMetrics struct {
 	hasGen      bool
 	genTPS      float64
 	hasTPS      bool
+	// upstreamBody is the excerpt of a non-2xx upstream body (§24.20 M53).
+	upstreamBody string
 }
 
 const (
@@ -1379,6 +1550,28 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	}
 	defer resp.Body.Close()
 	headersAt := time.Now()
+
+	// §24.20 M49–M51: a final status outside 2xx is a failed candidate. Nothing
+	// has been written to the client yet, so the body is buffered and the chain
+	// may move on; if this turns out to be the last opportunity, serveChain
+	// forwards the buffered response verbatim (M52).
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		h.recordFailure(cand.inst)
+		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorBodyLimit+1))
+		if readErr != nil {
+			return false, 0, m, fmt.Errorf("read upstream status %d body: %w", resp.StatusCode, readErr)
+		}
+		if len(errBody) > upstreamErrorBodyLimit {
+			errBody = errBody[:upstreamErrorBodyLimit]
+		}
+		statusErr := &upstreamResponseError{
+			status: resp.StatusCode,
+			header: resp.Header.Clone(),
+			body:   errBody,
+		}
+		m.upstreamBody = statusErr.excerpt()
+		return false, resp.StatusCode, m, statusErr
+	}
 
 	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
 	decompressGzip := encoding == "gzip" || encoding == "x-gzip"

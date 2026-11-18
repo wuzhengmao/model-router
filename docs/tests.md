@@ -961,3 +961,46 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 - 新增用例全部在 `internal/proxy/circuit_internal_test.go`；公共装置 `cbAllOpenThree` 先用一条请求让三个失败实例全部转 `open`（`failure_threshold = 1`），再发全 `open` 请求验证重试链，避免每个用例重复铺陈。
 - 旧用例处理：`TestAllOpenUsesFirst`（UT-833）的语义已被 §24.19 M47 撤订，用例删除，由 UT-844～UT-848 取代；`TestFailureRetimesBackoff`（UT-835）追加断言全 `open` 重试中第二个实例同样被调用并重新计时；`TestFallbackAllDegradedUsesFirst` 更名为 `TestFallbackAllOpenRetriesEveryInstance`（UT-407），第二次全 `open` 请求的期望由「首实例 +1、次实例 0 次追加调用」改为「两实例各 +1 次追加调用」。
 - `attempts` 的构造与既有重试循环、`tracker.begin`/`tracker.retry` 记账未变，因此监控统计与请求日志的三档格式不受影响。
+
+## 38. 第十七轮：上游非 2xx 分类处置（§24.20 M49–M55）
+
+### 38.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-850 | M15ba 上游 400 换实例并记失败 | `TestUpstream400FailsOverAndRecordsFailure` | 首实例返回 400、响应头未提交：请求改打第二实例并得到 200；两实例各调用 1 次；首实例 `consecutiveFailures = 1` |
+| UT-851 | M15bb 上游 500 换实例并记失败 | `TestUpstream500FailsOverAndRecordsFailure` | 与 UT-850 相同，首实例返回 500 |
+| UT-852 | M15bc 候选耗尽转发原始 400 | `TestUpstream400AllCandidatesFailedForwardsOriginal` | 两实例都返回 400：客户端收到 400 与原始 body；`recentErrors[0]` 的 `status=400`、`error`/`upstreamBody` 非空、`instName` 为最后失败实例 |
+| UT-853 | M15bd 已提交流不换实例 | `TestCommittedStreamIsNotRetried` | 首实例写出首个 SSE 块后断开连接：客户端收到已提交的 200，首实例调用 1 次、第二实例 0 次 |
+| UT-854 | M15be 连续 5xx 打开熔断 | `TestUpstream5xxOpensBreakerAtThreshold` | 阈值 2、两实例持续 500：两次请求后首实例 `consecutiveFailures = 2` 且 `state = open` |
+| UT-855 | M15bf 本地错误不计入实例 | `TestLocalAuthErrorDoesNotCountAgainstInstance` | 未带凭据请求返回 401：上游调用 0 次，所有实例失败计数 0、`degradedUntil` 为零 |
+| UT-856 | M54 重试原因 `upstream_status` | `TestRetryReasonUpstreamStatus` | `retryReason(*upstreamResponseError)` 返回 `upstream_status`；`fallback_retry` 常量值正确；错误文本非空 |
+| UT-857 | M15bg 构建与测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race` | 全部通过 |
+
+### 38.2 场景说明
+
+- 新增用例全部位于 `internal/proxy/upstream_fallback_internal_test.go`（`package proxy`），复用 `circuit_internal_test.go` 的 `cbClock`、`cbBackend`、`cbOpenAIInstance`、`newCBHandler`、`cbSend`/`cbPath` 装置，并额外提供 `instFailureCount` 与 `sendProxyRequest`（可断言响应体）。
+- UT-852 通过手工挂载 `newMonitorHub()` 让处理器记录统计，再从 `stats.snapshot` 读取 `recentErrors`；`upstreamBody` 字段由 `attemptMetrics` → `requestMonitor.end` → `statsAggregator.finish` 传递。
+- UT-853 用 `panic(http.ErrAbortHandler)` 模拟首块之后连接中断；代理端 `copySSE` 判定 `committed=true`，因此第二实例不会被调用。
+
+## 39. 第十八轮：全候选失败后的补漏尝试与错误透传（§24.21 M56–M62）
+
+### 39.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-858 | M15bh 闭包失败后依次尝试开断实例 | `TestOpenInstancesTriedAfterClosedCandidates` | 5 实例（3 closed + 2 open）全部连接失败：5 个实例各被调用 1 次，两个 open 实例按配置顺序被调用 |
+| UT-859 | M15bi 最后一个上游 400 透传 | `TestLastUpstream400ForwardedToClient` | 前两个实例失败（500 / 连接失败），开断的第三实例在补漏段返回 400：客户端收到 400 与原始 body，而不是 502；三者各调用 1 次 |
+| UT-860 | M15bj 全连接失败仍 502 | `TestAllConnectionFailuresReturn502` | 全部实例连接失败：客户端收到 502 且 body 含 `upstream request failed` |
+| UT-861 | M15bk 补漏使用实例映射模型 | `TestFallbackUsesInstanceMappedModel` | 首轮 sonnet 实例收到自身映射 `model-a`；链外 opus 实例在补漏段收到自身映射 `model-opus`，不是客户端原模型 `claude-sonnet-4-5` |
+| UT-862 | M15bl 五实例每实例最多一次 | `TestFiveInstancesCalledAtMostOnce` | 5 实例协议（3 closed + 2 open）全部失败时 5 个实例各调用 1 次；5 个全 closed 全部失败时同样各调用 1 次（首轮已覆盖全部实例，补漏段为空） |
+| UT-863 | M15bm 补漏失败仍记账 | `TestFallbackFailuresStillCount` | 补漏段实例失败计数 3→4；链外实例失败计数 0→1 |
+| UT-864 | M15bn 构建与测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race` | 全部通过 |
+
+### 39.2 场景说明
+
+- 旧用例处理：`TestOriginalModelRerunKeepsRequestBody`（原 M15bk「原模型重跑」）与 `TestFallbackStagesCallEachInstanceOnce`（原三实例）的语义已被改写后的 §24.21 M56–M62 推翻，分别由 UT-861/UT-862 取代；`TestLastUpstream400ForwardedToClient` 扩展为「最后一个实例在补漏段返回 400」。
+- 补漏段只使用「首轮尚未调用过的实例」：`serveChain` 用 `seen` 集合去重；链内实例直接复用首轮候选（映射一致），链外实例用 `fallbackCandidate` 按自身 `roles`/`models` 映射。M15bl 的「每实例 ≤1 次」与 M62 的「首轮已覆盖全部实例时不产生补漏」同时成立。
+- UT-861/UT-863 使用 Anthropic 角色链构造「链内实例 + 链外实例」：请求 `claude-sonnet-4-5` 只把声明 `sonnet` 的实例放进链；声明 `opus` 的实例在补漏段以自身映射（`model-opus`/`model-c`）被尝试，从而可机械区分「首轮映射」与「补漏映射」，并证明补漏没有回退到客户端原始模型名。
+- UT-858/UT-862 用 `handler.recordFailure` 预先把实例置为 `open`（阈值 1），避免依赖请求顺序制造状态。
+- 错误透传：只要任一候选拿到过真实非 2xx 响应，最终失败就转发最后一条（UT-859）；全部停在连接失败/超时才回退到 502（UT-860）。
