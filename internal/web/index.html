@@ -3493,7 +3493,13 @@
       var inst = item.instName || item.instance || '';
       var upstream = item.upstreamModel || item.upstream || '';
       var target = inst + (upstream ? '/' + upstream : '');
-      var summary = String(item.error || item.message || item.summary || '–');
+      var full = String(item.error || item.message || item.summary || '–');
+      var body = item.upstreamBody ? String(item.upstreamBody) : '';
+      var tip = full;
+      if (body && full.indexOf(body) < 0) {
+        tip = full + String.fromCharCode(10, 10) + body;
+      }
+      var summary = full;
       if (summary.length > 80) {
         summary = summary.slice(0, 80) + '…';
       }
@@ -3501,7 +3507,7 @@
       row.appendChild(statCell(item.status ? String(item.status) : '–'));
       row.appendChild(statCell(target || '–'));
       row.appendChild(statCell(String(item.model || item.reqModel || '–')));
-      row.appendChild(statCell(summary, 'stat-err-summary'));
+      row.appendChild(statCell(summary, 'stat-err-summary', tip));
       tbody.appendChild(row);
     });
     table.hidden = list.length === 0;

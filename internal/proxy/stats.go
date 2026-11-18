@@ -109,6 +109,8 @@ type statsError struct {
 	Error         string `json:"error"`
 	// §24.20.3: excerpt of the non-2xx upstream body that caused the failure.
 	UpstreamBody string `json:"upstreamBody,omitempty"`
+	// §24.22.3: structural summary of the failed request's client body.
+	ReqShape string `json:"reqShape,omitempty"`
 }
 
 // statsSnapshot is the single serialization shape shared by GET /api/stats and
@@ -303,6 +305,7 @@ func (a *statsAggregator) finish(req monitorRequestSnapshot, success bool) {
 			Model:         req.ReqModel,
 			Error:         truncateRunes(req.Error, statsErrorSummaryRune),
 			UpstreamBody:  truncateRunes(req.UpstreamBody, statsUpstreamBodyRune),
+			ReqShape:      req.ReqShape,
 		}}, a.recentErrors...)
 		if len(a.recentErrors) > statsRecentErrors {
 			a.recentErrors = a.recentErrors[:statsRecentErrors]

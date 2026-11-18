@@ -1445,3 +1445,137 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 - **D-M18-5 转发最后观测到的上游非 2xx**：M59 第一句写「最后一个候选」；若最后几次尝试是连接失败、但更早的候选拿到过 4xx/5xx，则按第二句「所有候选都停在未拿到响应头才 502」的精神，转发最后一次真实拿到的上游响应。
 - **未覆盖**：§24.21 未给补漏段增加总时长上限；一次请求最坏尝试 `len(insts)` 次，总耗时受各实例 `timeout` 与上游返回共同约束，实现不引入额外总超时。
 - **未覆盖**：补漏段失败后的熔断记账沿用既有 `recordFailure` 语义（达到阈值转 `open`，已 `open` 则重置回退时间），§24.21 未给出额外规则。
+
+## 40. 第十九轮：失败请求的客户端请求体取证（§24.22 M63–M69）
+
+### 40.1 实现
+
+- 采集点：`internal/proxy/proxy.go` 的 `serveChain` 在 defer 中判定 `finalStatus >= 400 || finalStatus == 0`，成立时把 `finalMetrics.reqShape = buildReqShape(proto, body)` 交给 `requestMonitor.end`（M63/M69）。`body` 是客户端**原始**请求体，不是任何候选改写后的 `attemptBody`；计算发生在响应写出之后，且纯函数只读入参（M68）。
+- 构造：`internal/proxy/reqshape.go` 的 `buildReqShape(proto, body)` 是独立的纯函数，便于单测：
+  - 解析顶层 `{"messages":[...]}`；消息元素的 `role` 必须是字符串。
+  - `content` 为字符串时记一个 `text` 块；为块数组时按数组顺序记每个块的 `type`；缺省或 `null` 记空序列。
+  - Anthropic 直接用块 `type`；OpenAI 额外把 `reasoning_content`/`reasoning`（非 null）记作 `thinking`（置于 content 之前）、把非空 `tool_calls` 数组记作 `tool_use`（置于 content 之后），仅作用于 `assistant` 消息（M64、§24.22.2）。
+  - 助手消息同时含 `tool_use` 且不含 `thinking` 时，在 `]` 之后追加 `!!tool_use_without_thinking`。
+  - 文本格式固定为 `msgs=N | <i>:<role>[<type,...>] | ...`。
+- 上限：`reqShapeLimit = 1024` 字节（摘要内容全为 ASCII，字节数即字符数上限）。构造时先预留省略标记 `…` 的 3 字节，按整条消息段追加，放不下即停止并追加 `…`（M65）。`unparsable:` 分支最多 64 个 rune，恒小于上限。
+- 解析失败（非 JSON、无 `messages` 数组、消息/块结构不符）时返回 `unparsable: ` + 前 64 个 rune（M67）；非法 UTF-8 以 `�` 替换，保证可打印。该路径不返回错误、不重试、不改变状态码。
+- 下发：`attemptMetrics.reqShape` → `monitorRequestSnapshot.reqShape` → `statsError.reqShape` 与 WS `end` 事件（`omitempty`）。`/api/stats` 的 `recentErrors[]` 只在失败时新增条目，因此成功请求不会出现该字段（M66/M69）。
+
+### 40.2 决策与未覆盖
+
+- **D-M19-1 失败判据取 M63 的字面定义**：`status >= 400 || status == 0`。已提交响应（如流式首块后断开）的 `status` 是上游 2xx，即便 `error` 非空也不写 `reqShape`；§24.22 未覆盖该情形。
+- **D-M19-2 OpenAI 摘要顺序**：`thinking` 在前、`tool_use` 在后，与 Anthropic 示例的 `[thinking,text,tool_use]` 生成顺序一致；§24.22 未规定 OpenAI 的块顺序。
+- **D-M19-3 非聊天结构一律 unparsable**：合法 JSON 但不是 `{"messages":[...]}`（或消息/块字段类型不符）按 M67 的精神记 `unparsable:`，不尝试猜测；仅非 JSON 在 M67 中有明文。
+- **未覆盖**：`redacted_thinking` 块按字面只作为块类型记录，不计入「含 `thinking`」，因此带 `tool_use` + `redacted_thinking` 的助手消息仍会带标记；§24.22 只提到 `thinking`。
+- **未覆盖**：OpenAI 非 `assistant` 消息即使带 `tool_calls`/`reasoning` 也不计入（§24.22.2 限定 `assistant` 消息）。
+- **未覆盖**：进入 `serveChain` 之前返回的本地错误（401、413 等）没有 `reqShape`；§24.22 的取证对象是转发请求。
+- **未覆盖**：`"messages": null` 视为缺失，记 `unparsable:`。
+
+## 41. 第二十轮：流式「无内容」超时与流阶段可观测性（§24.23 M70–M80）
+
+### 41.1 实现
+
+- 新增第二个流内定时器：`internal/proxy/proxy.go` 的 `copySSE` 现在维护 `phaseTimer`（首块/空闲共用，语义不变）与 `contentTimer`（无内容超时，§24.23 M70）。两者独立重置、独立触发，先到者通过 `timeoutReason.CompareAndSwap` 记录原因，保证 M78 的原因行与客户端处置一致。
+- 计时锚点与重置条件：
+  - `contentTimer` 在第一块数据到达时启动（此时响应头已提交），此后只有 `sseState.contentDeltas` 增量大于 0 的块才重置它；`event: ping`、空 delta、`message_start`/`content_block_start`/`content_block_stop`、`[DONE]` 等非内容事件一律不重置（M70/M71）。
+  - 内容判定直接复用 `sseState` 已在统计的 `contentDeltas`（Anthropic `content_block_delta`、OpenAI 非空 `content`/`reasoning_content`/`tool_calls.arguments`），没有第二套解析（M71）。
+- 超时时长取 `cand.inst.timeout`（默认 15s）：`tryCandidate` 把它作为 `contentIdle` 参数传给 `copySSE`。没有新增 `Options` 字段、没有新增 `fallback` 配置项（M72）。选择从 `instanceRuntime.timeout` 取值而不是扩充 `Options`，是因为实例超时本来就随实例配置存在，`config.Duration.Duration()` 保证正值（默认 15s），这是最小侵入且语义最贴近「实例 timeout 对已提交的流也生效」。
+- 触发后的处置完全复用既有 `outcome.idle` 分支（`tryCandidate` 中 `outcome.idle || outcome.contentIdle`）：Anthropic 未 `finished` 时写 `pause_turn` 尾巴、OpenAI 走 `truncateClientConnection`、`recordFailure` 计一次失败、`return true`（已 committed 不再降级），没有新增分支（M73）。
+- 既有 `idle_timeout` 保持「每块重置」不变（M74），`min_tokens_per_second` 的判定逻辑与阈值均未调整（M75）。
+- `parse == false`（§20.2 不可解码压缩编码）时不启动无内容定时器：这类流无法识别内容，启动会误杀健康流；其行为保持改动前。
+- 可观测性（只加日志，M76–M78）：
+  - `tryCandidate` 在每次 `copySSE` 返回后调用 `logStreamPhases`，固定打印一行：`stream <实例> hdr=<到响应头> first_block=<头→首块> first_content=<头→首内容块> blocks=<读块数> pings=<非内容事件数> content=<内容事件数> last_gap=<最后一块距结束>`；未到达的相位打印 `-`。`hdr` 从本次尝试开始（`tryCandidate` 入口）计到响应头；其余相位从 `copySSE` 起点（≈响应头）计。
+  - 超时触发时额外打印一行原因行：`instance <实例> timeout: content-idle for <实例 timeout> (no content block); stream terminated`、`instance <实例> timeout: first-token for <阈值>; stream terminated`、`instance <实例> timeout: slow for <实测>B/s (min <阈值>t/s); stream ...`；`idle` 沿用既有 `instance <实例> idle for <阈值>; stream terminated` 行。
+  - 阶段计数口径：`blocks` 等于 `outcome.chunks`（32 KiB 读块数），`content` 等于 `sseState.contentDeltas`（内容事件数），`pings` 等于「成功解析的数据事件数 − 内容事件数」。SSE 注释行（`: keepalive`）不属于数据事件，只计入 `blocks`（与既有 `idle_timeout` 的重置口径一致）。
+  - 日志不进 `/api/stats`、不进 WS 事件（M77）。
+- 转发行为零改变（M79）：写客户端、写上游、状态机迁移、定时器阈值均未改动；新增代码只在 `copySSE` 返回后读 `sseOutcome` 并 `log.Printf`。
+
+### 41.2 决策与未覆盖
+
+- **D-M20-1 无内容定时器以第一块数据为锚点**：若从响应头起算，一个完全静默的上游会同时命中 `first_token_timeout` 与无内容定时器，改变 M15by 要求的既有语义。以第一块数据为锚点后，静默上游仍只由 `first_token_timeout` 处置；一旦上游开始发数据（哪怕是心跳），无内容保护即接管。
+- **D-M20-2 首块即启动、无内容不重置**：第一块数据即使本身是心跳也会启动计时，这覆盖了生产事故中「持续 ping、零内容」的形态；SSE 注释流同样被约束，代价是既有 §19 慢流测试的 fixture 需要把实例 `timeout` 提高到 30s 才能在 10s 慢窗口之前保持原行为（只改 fixture，不改断言）。
+- **D-M20-3 先到者优先**：两个 idle 定时器可能在上游读阻塞期间先后触发；用 CAS 记录第一个触发者，避免 `contentHit` 与 `idleHit` 同时为真时把原因归错。
+- **未覆盖**：不可解码编码（`parse == false`）的流没有无内容保护，仍只受 `idle_timeout` 约束；§24.23 未要求此类流可解析。
+- **未覆盖**：一次请求若在多个候选上各发生一次流式尝试（首块超时后重试），每次尝试各打印一行阶段摘要；M76 的「每个流式请求」按上游流式尝试解释。
+- **未覆盖**：M80 明确不修「确定 4xx 后继续降级」，§24.21 语义保持不变。
+
+## 42. 第二十一轮：流式空 signature 归一化（§24.24 M81–M91）
+
+### 42.1 实现
+
+- 触发位置：`internal/proxy/proxy.go` 的 `copySSE`。`tryCandidate` 只在 `proto == protocolAnthropic && parseable` 时传入 `normalizeSignature=true`；OpenAI 流式、非流式与不可解码编码（`parse == false`）一律走原路径（M81）。
+- 事件切分：新增 `internal/proxy/signature_normalize.go` 的 `sseSignatureNormalizer`。它按空行（LF/CRLF）切分完整事件，单事件缓冲上限 32 KiB（与 `copySSE` 现有读块一致）；事件超限、非 JSON、多行 `data:` 或结构不符时整段原样转发，并在下一个事件边界后恢复判定（M86/M88）。流结束、超时或写失败时，未形成完整事件的尾字节由 `flush` 原样补写，不丢字节。
+- 判定与改写：只处理恰好一条 `data:` 行的事件；JSON 顶层 `type == "content_block_start"` 且 `content_block.type == "thinking"`、`signature` 为 `""` 或字段缺失时，仅替换/插入 `signature` 的值，固定为 `model-router-placeholder`。改写采用字节级拼接：已有字段的顺序、空白、其它字段与事件其它行全部保持不变；缺失 `signature` 时插入在 `content_block` 对象开头，字段集合只增加 `signature` 本身（M82/M83/M84/M87）。
+- 统计隔离：`sseState.feed`、`tracker.chunk`、usage 解析与吞吐计算继续使用上游读到的**原始** chunk；改写只作用于 `w.Write` 的客户端字节（M85/M90）。
+- 日志：`sseSignatureNormalizer.blocks` 统计本次流式尝试改写的块数，`copySSE` 返回时若 `blocks > 0` 打印恰好一行 `thinking signature normalized: blocks=%d inst=<实例名>`；未改写不打印（M89）。
+- 版本：不 bump，CHANGELOG 并入 `[0.1.6]`（M91）。
+
+### 42.2 决策与未覆盖
+
+- **D-M21-1 单事件上限**：M88 只要求“沿用 §20.2 的流式缓冲策略”，未给具体字节数；实现取 `copySSE` 现有的 32 KiB 读块作为单事件缓冲上限。超限事件整段透传，不截断；下一事件恢复判定。
+- **D-M21-2 缺失 signature 的插入位置**：M87 要求不引入额外字段且保留原字段顺序；缺失字段没有原位置，实现插在 `content_block` 对象开头，因此原有字段相对顺序不变，字段集合只增加 `signature`。
+- **D-M21-3 多行 data 一律透传**：按任务约束与 M86，事件含多于一条 `data:` 行时不做拼接解析，整段逐字节转发。
+- **未覆盖**：`signature` 存在但为 `null`、非字符串、非空串或仅空白串时，M82 未定义；实现按“不命中”原样透传。
+- **未覆盖**：§24.24.3 中 M15cn 编号缺失（验收表从 M15cm 直接到 M15co）；本轮不猜测其语义。
+- **未覆盖**：同一事件含重复 `signature` 键时按键值最后一次出现判定；JSON 重复键语义未在 §24.24 规定。
+- **未覆盖**：`parse == false`（不可解码压缩编码）的 Anthropic 流不做归一化，因无法解析 SSE 文本；§24.24 未要求。
+
+## 43. 第二十二轮：锁定实例超时豁免、无内容转交与映射统一（§24.25 M92–M102）
+
+### 43.1 实现
+
+- **锁定专用 client（M95）**：`instanceRuntime` 在构造时同时创建 `client`（按实例 `timeout`）与 `lockedClient`（`newClient(0)`，`DialContext` 连接超时、`TLSHandshakeTimeout`、`ResponseHeaderTimeout` 全为 0）。`serveChain` 每次尝试前按当前 `lockedIndex()` 计算 `lockedExempt`，`tryCandidate` 据此选择 client。锁/解锁因此在下一次尝试立即生效，不需要重建 Handler，也不会把 0 超时写回未锁定路径。两个 client 各自持有独立连接池，解锁后恢复正常超时与连接池。
+- **锁定链（M93）**：`lockedMode` 下候选链为「锁定实例（`lockedCandidate`）+ 其余实例按配置顺序（`mappedCandidate`）」。锁定候选**恒排第一且不因 open 被跳过**（延续 M15ao）；其余实例仍按 §24.17 规则先试 closed，全部 open 时整组兜底。旧语义「锁定实例失败即 502」被替换为「锁定失败后继续尝试其余实例，最后一次真实上游响应按 §24.20 透传」（M96/M15da）。
+- **熔断豁免（M92）**：新增 `Handler.isLockedInstance(inst)`，按 `protocolRuntime.lockedIndex()` 与实例指针比较。`recordFailure` 只对**锁定实例**跳过记账；锁定期间非锁定实例的失败照常累加（M94b 的「只对非锁定实例计数」）。`recordSuccess` 保持原有「协议锁定时跳过」行为不变。
+- **无内容转交（M94/M94a–M94d）**：
+  - `copySSE` 新增 `handoffBeforeContent`（锁定存在且当前不是锁定实例）与 `exemptLocked`（当前是锁定实例）两个参数。
+  - `sseState` 新增 `realContentDeltas`，只统计携带实际负载的增量：Anthropic `text_delta`/`thinking_delta`/`input_json_delta` 的文本非空，OpenAI 非空 `content`/`reasoning_content`/非空 tool arguments。`signature_delta` 不计入。该计数与 §24.23 的 `contentDeltas` **分开维护**，避免改变既有无内容定时器与阶段日志口径（M94a）。
+  - 判定点在读循环内、`sseState.feed` 之后、`commit()` 之前：每次读入的 chunk 解析后，若 `handoffBeforeContent && parse && realContentDeltas == 0`，立即 `body.Close()`、置 `outcome.handoff=true` 并返回。由于尚未 `commit()`，客户端没有收到响应头或任何字节；§24.24 的签名归一化器在 handoff 时也跳过尾块补写，防止未提交的缓冲字节泄漏（M94c）。
+  - `tryCandidate` 在 handoff 时对非锁定实例执行 `recordFailure` 并返回哨兵错误 `errLockedHandoff`；`serveChain` 用 `handoffUsed` 保证只转交一次：把计划截断为「当前失败项 + 锁定候选」，随后若锁定候选也失败则结束，不再回到非锁定实例（M94d）。
+  - 若计划的尾部全部是非锁定实例、且它们都在提交前失败（连接错误或非 2xx），`serveChain` 在循环结束后给锁定实例一次最终尝试，从而覆盖 M15de「非锁定实例首字节阶段失败 → 改发锁定实例」；这次重试同样受 `handoffUsed` 与「只打一次」约束。
+- **提交后不掐断（M97）**：锁定实例的流式尝试把 `idle`、`firstToken`、`contentIdle`、`minTokensPerSecond` 全部传 0，并关闭 `slowInterrupt`。因此 first-token/idle/无内容/实时慢流都不会关闭锁定流；客户端拿到上游真实流直到自然结束。非 2xx 仍走 §24.20 的候选失败与透传逻辑（M96）。
+- **日志（M101）**：`copySSE` 的 defer 中，仅当 `exemptLocked && outcome.committed` 时打印一次 `instance <name> locked; stream not interrupted`；锁定流不再打印 `timeout: content-idle`/`first-token`/`idle`/`slow` 原因行。未提交（连接失败/非 2xx）的锁定尝试不打该行。
+- **映射统一（M99/M100）**：新增 `resolveInstanceModel(proto, inst, body) (model, rewrite, ok)`，承载「精确模型 → 请求角色 → `*` → 首个角色映射（Anthropic）／精确模型 → `models[0]`（OpenAI）」的完整解析。`fallbackCandidate` 复用它并在 `ok=false` 时返回 nil（§24.21 禁止使用客户端原始模型名）；`lockedCandidate` 通过 `mappedCandidate` 复用它，在 `ok=false` 时保持客户端原模型名且 `rewrite=false`（M99 不猜）。`lockedCandidate` 不再先走 `buildChainFrom`，避免命中 R5 兜底/链外候选时拿到无 model/rewrite 的 candidate 而跳过角色映射。
+- **版本（M102）**：`internal/version/version.txt` 保持 `0.1.6`，CHANGELOG 并入已有 `[0.1.6]` 段落。
+
+### 43.2 决策与未覆盖
+
+- **D-M22-1 锁定 client 独立而非改字段**：M95 要求锁/解锁可来回切换且立刻生效。若在锁定/解锁时修改 `instanceRuntime.client`，会与并发中的 `tryCandidate` 竞争，也会污染未锁定路径。独立 `lockedClient` 让选择成为每次尝试的只读判断，锁状态切换天然即时。
+- **D-M22-2 转交判定按读块而非按解析后的 SSE 事件**：实现沿用「每次 chunk 解析后判一次」。同一 chunk 若同时含非内容事件与真实内容事件，`realContentDeltas` 已大于 0，不会中断——这与 M94「已产出内容后绝不中断」一致，也避免把同一 chunk 中已到达的内容丢掉。完全静默（零字节）的上游没有判定点，仍由既有 `first_token_timeout` 处置；M94 的「不设时间预算」在首个字节到达后生效。
+- **D-M22-3 独立 realContentDeltas**：§24.23 M71 明确把 `contentDeltas` 用于无内容定时器与阶段日志，且当前 `contentDeltas` 会把 `signature_delta` 计为内容事件；M94a 明确 `signature_delta` 不算「有 token」。复用同一个计数器会改变 §24.23 行为，因此新增独立字段，`contentDeltas` 语义保持不变。
+- **D-M22-4 锁定失败后的最终重试**：M93 的 `[锁定, 其余...]` 在其余实例也失败时已经包含锁定实例的一次尝试；M15de 仍要求「非锁定实例首字节阶段失败 → 改发锁定实例」，因此保留循环结束后的最终锁定重试。`handoffUsed` 保证该重试最多一次，之后不再回到非锁定实例（M94d）。
+- **D-M22-5 锁定日志的触发条件**：M101 的「仅在确实因锁定而豁免时有内容才打」未定义精确判据。实现按「本次锁定流式尝试已提交（`outcome.committed`）」打印一次；未提交的 400/连接失败不打。快速自然结束的锁定流也会打印，因为其计时器确实处于豁免状态。
+- **未覆盖**：锁定实例若在解锁前一直 open，`lockedExempt` 仍使其不参与 open 跳过（M93/M15ao）；解锁后该状态按 `unlock` 清零。
+- **未覆盖**：非锁定实例在锁定期间被转交中断时，`recordFailure` 会累计其失败；当协议只有 1 个实例时 `singleInstanceProtocol` 仍阻止其转 open，沿用 §24.16 M32。
+- **未覆盖**：非流式响应不参与 M94 转交（没有「内容块」概念），锁定实例的非 2xx 仍按 M93/M96 继续尝试其余实例。
+- **未覆盖**：`parse == false`（不可解码压缩编码）的非锁定流无法识别内容，`handoffBeforeContent` 判定被 `parse` 条件关闭，保持原透传行为；§24.25 未要求此类流可转交。
+
+## 44. 第二十三轮：thinking 补位、响应头前总预算与诊断埋点（§24.26 M103–M120）
+
+### 44.1 实现
+
+- **thinking 补位（M103–M109）**：新增 `internal/proxy/thinking_inject.go` 的 `sseThinkingInjector`，只在 Anthropic 流式且 `parseable=true` 时创建。它在客户端字节副本上按空行切分完整事件，复用 `findSSEEventEnd`；事件超过 32 KiB 时进入透传模式到下一个事件边界，避免为改写把整条流读入内存。判定依据是 `sseState` 已消费的**原始**字节：`toolUseBlocks > 0 && thinkingBlocks == 0` 且当前事件是 `message_delta` 或 `message_stop` 时，在该事件**之前**插入一对 `content_block_start`/`content_block_stop`（`content_block` 为 `{"type":"thinking","thinking":"","signature":""}`，`index` 取流中出现过的最大 index + 1）。既有事件字节原样转发，不重排、不重新序列化。注入后本轮不再注入（`injected`）。
+- **与 §24.24 的分层**：`sseState.feed(原始 chunk)` 先执行，token/usage/吞吐/响应形态都基于原始字节；签名归一化与注入只作用于写给客户端的副本。注入在签名归一化之后执行（注入块 signature 固定为空串，不经过 §24.24 改写）。两者是独立开关（加入 `copySSE` 的 `injectThinking` 参数），任一单独开启都不改变另一条路径；当前调用点两者都取 `proto == protocolAnthropic && parseable`。
+- **注入日志（M108）**：`sseThinkingInjector` 在实际插入时打印一次 `thinking block injected: inst=<名> tool_use=<n> index=<i>`；`tool_use` 为本次流已见的 tool_use 块数。
+- **响应头前总预算（M110–M113）**：`tryCandidate` 在非锁定且实例 `timeout > 0` 时，用 `context.WithCancel(r.Context())` 派生请求上下文，并用 `time.AfterFunc(remaining, cancel)` 实现「从 `attemptStart` 起、到 `client.Do()` 返回为止」的预算；`remaining = attemptStart + timeout - now`。`client.Do()` 返回后立即 `budgetTimer.Stop()`，**不调用 cancel**，因此 deadline 不会继续作用于 SSE body；函数返回时再 `cancel()` 做清理。`budgetFired` 原子标记区分预算超时与客户端取消：前者返回 `response header budget exceeded after <d>: ...` 并走既有 `recordFailure`/换候选路径，后者保持原 `upstream request: ... context canceled` 文本。锁定实例（`lockedExempt`）完全不建预算（M112）。没有使用 `http.Client.Timeout`。
+- **诊断埋点（M114–M120）**：
+  - `reqShape` 统计段改为 `tool_use_msgs`/`paired_msgs`/`unpaired_idx`；`paired_msgs` 把 `redacted_thinking` 计入配对，段列表里的 `!!tool_use_without_thinking` 同样不再标记 redacted 块。`unpaired_idx` 最多列 10 个下标，超出追加 `+`；无未配对时为 `-`。
+  - `serveChain` 的 defer 在失败或 `requestMayHaveToolUse(body)` 时计算一次 `reqShapeSummary`：失败时写入 `finalMetrics.reqShape`（沿用 §24.22）；含 tool_use 的成功请求只打印 M116 日志，不写 stats。`requestMayHaveToolUse` 用 `bytes.Contains` 做廉价负向预检（`"tool_use"`/`"tool_calls"`），避免普通请求每次全量解析 body。
+  - M116 行：`reqshape msgs=<n> tool_use_msgs=<n> paired_msgs=<n> unpaired_idx=<...> thinking=<declared> last=<类型> session=<8hex>`。`session` 对 `metadata.user_id` 做两层解析（外层对象 → user_id 字符串 → 内层 JSON 的 `session_id`），sha256 前 4 字节转 8 位小写十六进制；任一层失败打 `-`。`last` 对 Anthropic 取最后一个 content 块是否 `tool_result`，对 OpenAI 取 `role:"tool"`，否则取消息 role。
+  - M117 行紧随 §24.23 M76 阶段摘要：`resp_shape thinking_blocks=<n> tool_use_blocks=<n> signature_empty=<n> injected=<0|1>`。`thinking_blocks`/`tool_use_blocks` 按 `content_block_start` 的 `content_block.type` 统计（仅 `thinking`，不含 `redacted_thinking`）；`signature_empty` 统计 start 时 signature 为空/缺失、且该 index 之后没有收到非空 `signature_delta` 的 thinking 块。
+  - M118 行由 `internal/proxy/hdr_profile.go` 的 `headerProfile` 采集：`httptrace.ClientTrace` 记录 `ConnectDone`、`TLSHandshakeDone`、`WroteHeaders`、`WroteRequest`、`GotFirstResponseByte`、`GotConn`，回调与读取都用互斥锁保护。只有 `hdr > instance timeout/2` 时打印 `hdrprof inst=<名> connect=<d> tls=<d> upload=<d> server_wait=<d> body_bytes=<n> reused=<0|1> remote=<addr> budget=<d>`；未到达的阶段打印 `-`；锁定实例的 `budget` 打印 `0s`。阶段定义严格按 M118：connect=ConnectDone−attemptStart、tls=TLSHandshakeDone−ConnectDone、upload=WroteRequest−WroteHeaders、server_wait=GotFirstResponseByte−WroteRequest。
+  - 所有新增日志只写进程日志，不进 `/api/stats`、不进 WS 事件；成功请求不写 `reqShape`（M119）。版本保持 `0.1.6`（M102 沿用）。
+
+### 44.2 决策与未覆盖
+
+- **D-M23-1 注入判定按原始 `sseState`**：注入器只负责事件边界与 `message_delta`/`message_stop` 定位，是否注入由 `sseState` 的块计数决定，避免维护第二套流解析而与统计/定时器口径分叉。
+- **D-M23-2 注入只在看到尾部事件时发生**：没有 `message_delta`/`message_stop` 的截断流（客户端断开、超时、EOF）不注入，避免产生没有 message_stop 的非法尾块。§24.26 未覆盖此情形。
+- **D-M23-3 `redacted_thinking` 不抑制注入**：M103 的措辞是「从未出现任何 `thinking` 块」，实现按字面只统计 `type=="thinking"`；`redacted_thinking` 只按 M114 计入请求侧 paired。若上游返回 redacted_thinking + tool_use，DeepSeek 会先以 422 拒绝（unknown variant），注入也不能修复该 422。
+- **D-M23-4 预算用可停止的 timer 而非 context deadline**：直接 `context.WithDeadline` 在 `Do` 返回后无法「只取消 deadline、保留 body」，调用 cancel 会杀死 SSE 流。实现用 `WithCancel` + `AfterFunc`，`Do` 返回后停表、函数返回时再 cancel；`budgetFired` 区分预算与客户端取消。极小竞态窗口内 timer 与 `Do` 返回同时发生时，body 可能被取消，表现为一次可重试的读错误。
+- **D-M23-5 `last` 的取值**：M116 只写「消息类型」，未定义枚举；实现取最有诊断价值的 `tool_result`（Anthropic 块 / OpenAI role tool），否则取 role。
+- **D-M23-6 `unpaired_idx` 空值**：M114 未规定零个未配对时的表示；实现打印 `-`，与阶段日志的未到达标记一致。
+- **未覆盖**：`parse=false`（br/zstd 等不可解码编码）不做注入、不做响应形态统计；M105 只要求不注入，响应形态行仍会打印全 0。
+- **未覆盖**：`signature` 为 `null` 或非字符串时按缺失处理（计入 signature_empty）；M117 只写「空串或缺失」。
+- **未覆盖**：预算不覆盖 `rewriteModel` 之外的本地处理？实现从 `attemptStart` 起算，因此包含 `rewriteModel` 的 CPU 时间；M110 的「从 attemptStart 起」按字面执行。
+- **未覆盖**：平台生成的 `pause_turn` 尾巴（idle/content-idle/slow）由 `writePauseTurnTail` 直接写出，不经过注入器；这类被中断的流不注入 thinking 块。
+- **未覆盖**：实例 `timeout=0` 时不设预算（无正数预算），`hdrprof` 也不打印；配置默认 15s。

@@ -208,8 +208,27 @@ func (h *Handler) isProtocolLocked(proto protocol) bool {
 	return ps != nil && ps.isLocked()
 }
 
+// isLockedInstance reports whether inst is the protocol's pinned instance.
+// §24.25 M92 exempts only that instance from breaker bookkeeping; other
+// instances of a locked protocol still count their failures.
+func (h *Handler) isLockedInstance(inst *instanceRuntime) bool {
+	if inst == nil {
+		return false
+	}
+	ps := h.protocolRuntime(inst.proto)
+	if ps == nil {
+		return false
+	}
+	idx := ps.lockedIndex()
+	if idx < 0 || idx >= len(ps.insts) {
+		return false
+	}
+	return ps.insts[idx] == inst
+}
+
 func (h *Handler) recordFailure(inst *instanceRuntime) {
-	if h.isProtocolLocked(inst.proto) {
+	// §24.25 M92: a failure on the pinned instance never touches the breaker.
+	if h.isLockedInstance(inst) {
 		return
 	}
 	inst.recordFailure(h.now(), h.failureThreshold, h.degradeDuration)
@@ -222,42 +241,15 @@ func (h *Handler) recordSuccess(inst *instanceRuntime) {
 	inst.recordSuccess()
 }
 
-// lockedCandidate maps a request onto the pinned instance (§24.15 M10): the
-// model rewrite follows the regular chain when possible, otherwise the
-// instance's default mapping is used.
+// lockedCandidate maps a request onto the pinned instance (§24.15 M10).
+// §24.25 M99/M100: the model rewrite goes through the same resolver as
+// fallbackCandidate; when the instance declares no usable mapping the client
+// model stays untouched (no guessing).
 func lockedCandidate(proto protocol, insts []*instanceRuntime, body []byte, index int) *candidate {
 	if index < 0 || index >= len(insts) {
 		return nil
 	}
-	inst := insts[index]
-	for _, cand := range buildChainFrom(proto, insts, body) {
-		if cand.inst == inst {
-			return cand
-		}
-	}
-	cand := &candidate{inst: inst}
-	model, usable := requestModel(body)
-	if !usable {
-		return cand
-	}
-	switch proto {
-	case protocolOpenAI:
-		if len(inst.models) > 0 {
-			cand.model = inst.models[0]
-			cand.rewrite = cand.model != model
-		}
-	case protocolAnthropic:
-		role, hasRole := requestRole(model)
-		if !hasRole {
-			return cand
-		}
-		if mapped, ok := inst.roles[role]; ok {
-			cand.model, cand.rewrite = mapped, true
-		} else if mapped, ok := inst.roles[config.RoleWildcard]; ok {
-			cand.model, cand.rewrite = mapped, true
-		}
-	}
-	return cand
+	return mappedCandidate(proto, insts[index], body)
 }
 
 // normalizeLockProtocol validates the protocol field of the lock APIs.

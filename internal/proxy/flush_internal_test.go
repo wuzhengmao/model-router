@@ -82,7 +82,7 @@ func TestStreamingCopyStillFlushes(t *testing.T) {
 	rec := newFlushRecorder()
 	body := io.NopCloser(strings.NewReader(payload))
 
-	outcome, err := (&Handler{}).copySSE(rec, body, 0, 0, 0, false, false, func() {}, nil)
+	outcome, err := (&Handler{}).copySSE(rec, body, 0, 0, 0, 0, false, false, "test", false, false, false, false, func() {}, nil)
 	if err != nil {
 		t.Fatalf("copySSE: %v", err)
 	}

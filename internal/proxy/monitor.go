@@ -579,6 +579,8 @@ type monitorEndEvent struct {
 	Error         string  `json:"error,omitempty"`
 	// §24.20 M53: excerpt of a non-2xx upstream body.
 	UpstreamBody string `json:"upstreamBody,omitempty"`
+	// §24.22 M66: structural summary of the client body, failed requests only.
+	ReqShape string `json:"reqShape,omitempty"`
 }
 
 // monitorChunkSnapshot is the compact per-chunk copy kept in the recent-request
@@ -618,6 +620,7 @@ type monitorRequestSnapshot struct {
 	TPS           float64                `json:"tps"`
 	Error         string                 `json:"error,omitempty"`
 	UpstreamBody  string                 `json:"upstreamBody,omitempty"`
+	ReqShape      string                 `json:"reqShape,omitempty"`
 	Ended         bool                   `json:"ended"`
 }
 
@@ -953,6 +956,7 @@ func (m *requestMonitor) end(status int, err error, metrics attemptMetrics) {
 		TPS:           tps,
 		Error:         message,
 		UpstreamBody:  metrics.upstreamBody,
+		ReqShape:      metrics.reqShape,
 		Ended:         true,
 	}
 	m.mu.Unlock()
@@ -980,5 +984,6 @@ func (m *requestMonitor) end(status int, err error, metrics attemptMetrics) {
 		UpstreamModel: snapshot.UpstreamModel,
 		Error:         snapshot.Error,
 		UpstreamBody:  snapshot.UpstreamBody,
+		ReqShape:      snapshot.ReqShape,
 	})
 }
