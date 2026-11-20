@@ -35,6 +35,9 @@ const (
 	// reasonQuotaExhausted marks an instance disabled by its balance check
 	// (§24.31 M160).
 	reasonQuotaExhausted = "quota_exhausted"
+	// reasonTestFailed marks an instance opened by a failed connectivity test
+	// (§24.32 M180).
+	reasonTestFailed = "test_failed"
 )
 
 // isOpen reports whether the breaker is open. §24.17 M35: the only input is the
@@ -119,6 +122,34 @@ func (inst *instanceRuntime) recordFailure(now time.Time, threshold int, duratio
 	if !inst.degradedUntil.IsZero() || inst.consecutiveFailures >= threshold {
 		inst.markOpenLocked(now, duration, reasonFailureThreshold)
 	}
+}
+
+// markTestFailure opens the breaker from a connectivity test (§24.32 M180):
+// the operator just observed the failure, so degradedSince restarts at now even
+// when the instance was already open. consecutiveFailures is not touched. A
+// single-instance protocol never opens (§24.16 M32).
+func (inst *instanceRuntime) markTestFailure(now time.Time, duration time.Duration) {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	if inst.singleInstanceProtocol {
+		return
+	}
+	inst.degradedSince = now
+	inst.markOpenLocked(now, duration, reasonTestFailed)
+}
+
+// resetTestSuccess restores the instance after a successful connectivity test
+// (§24.32 M180): the breaker counters reset and the quota exhaustion flag is
+// cleared, unlike resetState/recordSuccess which leave the quota alone.
+func (inst *instanceRuntime) resetTestSuccess() {
+	inst.mu.Lock()
+	inst.consecutiveFailures = 0
+	inst.degradedUntil = time.Time{}
+	inst.degradedSince = time.Time{}
+	inst.degradeReason = ""
+	inst.quotaExhausted = false
+	inst.quotaExhaustedSince = time.Time{}
+	inst.mu.Unlock()
 }
 
 func (inst *instanceRuntime) displayState() (state string, since time.Time, reason string) {

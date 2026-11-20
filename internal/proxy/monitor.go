@@ -55,6 +55,9 @@ const (
 	wsMaxFrameSize = 1 << 20
 )
 
+// §24.32 M183: the client-column marker of a connectivity test row.
+const monitorTagTest = "TEST"
+
 // Stats push cadence (§24.7 D7): changed data at most once per 2 seconds, an
 // unchanged heartbeat every 10 seconds.
 const (
@@ -558,6 +561,9 @@ type monitorStartEvent struct {
 	UserAgent     string `json:"userAgent"`
 	InstName      string `json:"instName"`
 	UpstreamModel string `json:"upstreamModel"`
+	// Tag marks a diagnostic-only row; "TEST" for connectivity tests (§24.32
+	// M183). Ordinary requests leave it empty.
+	Tag string `json:"tag,omitempty"`
 }
 
 type monitorChunkEvent struct {
@@ -601,6 +607,8 @@ type monitorEndEvent struct {
 	UpstreamBody string `json:"upstreamBody,omitempty"`
 	// §24.22 M66: structural summary of the client body, failed requests only.
 	ReqShape string `json:"reqShape,omitempty"`
+	// §24.32 M183: diagnostic tag, "TEST" for connectivity tests.
+	Tag string `json:"tag,omitempty"`
 }
 
 // monitorChunkSnapshot is the compact per-chunk copy kept in the recent-request
@@ -642,6 +650,8 @@ type monitorRequestSnapshot struct {
 	UpstreamBody  string                 `json:"upstreamBody,omitempty"`
 	ReqShape      string                 `json:"reqShape,omitempty"`
 	Ended         bool                   `json:"ended"`
+	// §24.32 M183: diagnostic tag, "TEST" for connectivity tests.
+	Tag string `json:"tag,omitempty"`
 }
 
 type monitorSnapshotEvent struct {
@@ -702,6 +712,8 @@ type requestMonitor struct {
 	reqModel  string
 	clientIP  string
 	userAgent string
+	// tag marks a diagnostic-only row (§24.32 M183); immutable after creation.
+	tag string
 
 	// mu guards the mutable fields below; snapshotInProgress reads them from a
 	// WebSocket handler goroutine while the request goroutine updates them.
@@ -804,6 +816,31 @@ func (h *monitorHub) trackRequest(r *http.Request, proto protocol, reqModel stri
 	return monitor
 }
 
+// trackTestRequest creates the §24.32 M183 diagnostic row of a connectivity
+// test: method POST, the real upstream path and the TEST tag, which the client
+// column renders. It follows the ordinary request path, so the test is counted
+// in the cumulative statistics (M182); clientIP and userAgent stay empty.
+func (h *monitorHub) trackTestRequest(proto protocol, path, reqModel string) *requestMonitor {
+	if h == nil {
+		return nil
+	}
+	now := time.Now()
+	h.stats.begin(now)
+	monitor := &requestMonitor{
+		hub:      h,
+		stats:    h.stats,
+		id:       h.nextID(),
+		start:    now,
+		method:   http.MethodPost,
+		path:     path,
+		protocol: string(proto),
+		reqModel: reqModel,
+		tag:      monitorTagTest,
+	}
+	h.registerActive(monitor)
+	return monitor
+}
+
 // newRequest keeps the §24.2 contract: no tracker is created while no monitor
 // client is connected. The proxy itself uses trackRequest (§24.7 D9).
 func (h *monitorHub) newRequest(r *http.Request, proto protocol, reqModel string) *requestMonitor {
@@ -836,6 +873,7 @@ func (m *requestMonitor) begin(cand *candidate) {
 		UserAgent:     m.userAgent,
 		InstName:      m.instName,
 		UpstreamModel: m.upstreamModel,
+		Tag:           m.tag,
 	}
 	m.mu.Unlock()
 	if !first || !m.hub.hasClients() {
@@ -984,6 +1022,7 @@ func (m *requestMonitor) snapshotInProgress(now time.Time) (monitorRequestSnapsh
 		GenMs:         genMs,
 		TPS:           tps,
 		Ended:         false,
+		Tag:           m.tag,
 	}, true
 }
 
@@ -1042,6 +1081,7 @@ func (m *requestMonitor) end(status int, err error, metrics attemptMetrics) {
 		UpstreamBody:  metrics.upstreamBody,
 		ReqShape:      metrics.reqShape,
 		Ended:         true,
+		Tag:           m.tag,
 	}
 	m.mu.Unlock()
 
@@ -1069,5 +1109,6 @@ func (m *requestMonitor) end(status int, err error, metrics attemptMetrics) {
 		Error:         snapshot.Error,
 		UpstreamBody:  snapshot.UpstreamBody,
 		ReqShape:      snapshot.ReqShape,
+		Tag:           snapshot.Tag,
 	})
 }
