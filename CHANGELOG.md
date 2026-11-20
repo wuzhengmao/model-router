@@ -4,6 +4,16 @@
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-20
+
+### Added
+
+- 实例连通性测试（§24.32 M173–M186a）：新增管理接口 `POST /api/instances/test`（`{"protocol","name"}`，鉴权与 lock/unlock 同一套；非法 protocol 400、实例不存在 404，同步执行同步返回 `{name,protocol,ok,status,durationMs,state,balance?,error}`）。测试请求直连目标实例（Anthropic `POST <base_url>/v1/messages`、OpenAI `POST <base_url>/v1/chat/completions`），请求体为 `max_tokens` 32、`stream:true`、单条 user 消息，`content` 是固定可复现的约 40,000 字符（≈10K token）填充加 `reply with OK` 指令，用于复现大请求体慢路径；填充不含随机数/时间戳，同一实例连续两次测试的请求体逐字节相同。**不经过候选链**：不改写、不降级、不补漏、不进重试链。成功要求 HTTP 2xx 且流正常结束（`message_stop`/`[DONE]`，或干净 EOF 且至少一个事件）；整体超时取该实例 `timeout`（默认 15s，覆盖建连到读流，锁定实例也不豁免），超时错误以 `test timeout after` 开头。结论写回熔断：锁定实例只测不改；未锁定成功则清零连续失败/退避/原因并清除 `quotaExhausted`；未锁定失败则以 `test_failed` 立即置为 `open`（单实例协议沿用「永不 open」）。测试在实时监控列表里作为一条完整的 `POST` 诊断行出现：`path` 与同协议真实请求的入站路径完全一致（Anthropic 恒 `/anthropic/v1/messages`、OpenAI 恒 `/v1/chat/completions`，与实例 `base_url` 无关），方法列只显示 `POST`，`TEST` 以圆角徽标样式显示在客户端列，客户端缺值留空不再用 `–` 占位；该行有正常 start/chunk/end 与时间轴，并按普通请求的同一套路径计入业务统计：`/api/stats` 的 `requests.total` +1，按结果计入 `success`/`failed`，失败写入 `recentErrors`，实例行的 `requests`/`success`/`failed`/`inTokens`/`outTokens`/`avgTTFT`/`avgTps` 同步更新（探测流返回 Anthropic `message_start`/`message_delta` 或 OpenAI chunk 的 usage 时，入/出 token 如实累计；缺失时按 0 处理且不影响成功判定）；响应里的 `state` 与 `/api/stats` 同口径（`locked` > `exhausted` > `open` > `closed`）。管理页两张实例表在「状态」列之后、「锁定」列之前新增闪电按钮（tooltip「测试连通性」），点击后立即跳转到实时监控页，结果由监控页的 TEST 行呈现（页面跳走后请求仍会跑完并写回状态），进行中按钮禁用。
+
+### Changed
+
+- 测试同步：新增 `internal/proxy/instance_test_internal_test.go`（UT-973～UT-994）覆盖 §24.32 的成功/非 2xx/不可达/超时/流中断、open 与 exhausted 恢复、锁定不改状态、单实例协议、无模型可测、模型名解析优先级、监控 TEST 行（入站路径与客户端 TEST 徽标）、业务统计计入（成功/失败计数、`recentErrors` 与 usage token 记账）、10K 上下文可复现性、客户端列缺值留空与前端列结构；`docs/design.md` 新增 §50，`docs/tests.md` 新增 §50；`README.md` 补充管理接口与实例表说明。既有断言未改，全量 `go test ./... -race -count=1` 通过。
+
 ## [0.1.7] - 2026-11-20
 
 ### Added

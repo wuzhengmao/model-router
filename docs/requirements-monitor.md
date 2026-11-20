@@ -1826,3 +1826,69 @@ M Plan 额度机制（官方文档 `platform.minimax.cn/docs/m-plan/usage-rules`
 - 只内置 MiniMax 国内站与国际站 DeepSeek 两种检查方式；其它供应商的余额/配额查询需自行扩展 `kind`。
 - `exhausted` 节点不做主动恢复探测：只能等下一次余额查询（周期轮询或手动点击刷新）判定有余额后恢复。
 - M Plan 官方说明「额度充足仍可能因速率限制被限流」，因此余额充足不代表调用一定成功；本功能只覆盖配额/余额维度。
+
+---
+
+## §24.32 实例连通性测试（并入 0.1.8）
+
+**版本**：本条并入 0.1.8（用户 2026-11-20 明确要求「bump dev 版本」）。
+
+### §24.32.0 背景与目标
+
+联调和排障时经常需要回答一个问题：**这个实例现在到底能不能用**。现有手段只有两种——发真实流量等结果，或者看历史统计推断，两者都有延迟且不精确。
+
+本条提供一个一次性的主动探测：在实例表上点一下闪电，向该实例直连发一个最小的流式请求，立刻得到「通 / 不通」，并把结论**直接写回熔断状态**——通了就当它恢复正常，不通就当它立即失效。整个过程要能在实时监控里被看见（带 `TEST` 标记），因为它既是诊断也是演示。
+
+### §24.32.1 决策
+
+| 编号 | 决策 |
+| --- | --- |
+| M173 | 本条并入 0.1.8，`internal/version/version.txt` 为 `0.1.8`；CHANGELOG 新增 `[0.1.8]` 段；README 的「当前版本」同步。 |
+| M174 | 新增管理接口 `POST /api/instances/test`，请求体 `{"protocol","name"}`，两字段必填。鉴权与 lock/unlock 完全同一套（管理面 Basic / 会话）；非法 `protocol` → **400**；该协议下不存在该 `name` → **404**。**同步执行、同步返回**（不接受异步任务语义）。 |
+| M175 | 响应结构 `{name, protocol, ok, status, durationMs, state, balance, error}`：`ok` 表示测试是否成功；`status` 为上游 HTTP 状态码（拿不到填 `0`）；`durationMs` 为本次测试耗时；`state` 为测试**之后**该实例的状态，口径必须与 `/api/stats` 的 `instances[].state` 完全一致（优先级 `locked` > `exhausted` > `open` > `closed`；注意 `instanceRuntime.state()` 只反映熔断状态，不含锁定与配额耗尽，不能直接用）；`balance` 沿用既有余额结构，仅声明了 `balance` 的实例才出现；`error` 为失败原因，成功时为空串。 |
+| M176 | 测试请求**直连该实例**（用该实例自己的 `base_url` / `api_key` / 协议路径），**不经过候选链**：不改写模型、不降级、不补漏、不进入重试链、不参与锁定转交。Anthropic 实例打 `POST <base_url>/v1/messages`，OpenAI 实例打 `POST <base_url>/v1/chat/completions`；上游路径映射沿用 `upstreamPath` 的既有语义。 |
+| M177 | 测试请求体为**带 10K 上下文的最小流式探测**：`model`（见 M181）、`max_tokens` ≤ 32、`stream: true`、`messages` 只有一条 user 消息，其 `content` 由一段**固定可复现的填充文本**构成，总长度约 40,000 字符（按 4 字符/token 估算 ≈ 10K token），末尾附一句明确指令（如 `reply with OK`）。填充文本必须是常量拼接、不含随机数，保证同样配置下每次测试的 token 量一致。请求头 `Content-Type: application/json`、`Accept: text/event-stream`，认证头沿用该协议的上游认证约定（Anthropic `x-api-key`、OpenAI `Authorization: Bearer`）。<br>**为什么要 10K 上下文**（用户 m05488 定）：32 token 的裸 ping 测不出「大请求体在等响应头阶段卡死」这类真实故障（生产上曾出现 58 万字节请求在 `10.168.4.230:30000` 上 2ms 发完却 15s 不回响应头），带上下文才能复现真实链路压力。 |
+| M178 | 判定成功的条件是 **HTTP 2xx 且流式响应正常结束**：读到 `message_stop` / `[DONE]`，或读到 EOF 且至少解析出一个事件。只拿到响应头就断、读到一半 EOF 或读错误，一律算失败。 |
+| M179 | 测试的整体超时上限 = 该实例的 `timeout`（默认 15s），覆盖**建连 + 上传 + 等响应头 + 读流**全过程。测试**不允许无限挂起**——锁定实例也不例外（否则点击后页面会永远转圈）。超时算失败，`error` 以 `test timeout after <d>` 开头。 |
+| M180 | 状态改写（测试结论写回熔断）：①目标实例**被锁定** → **不改变任何状态**，只在响应里如实返回测试结果与当前状态；②未锁定 + **成功** → 立即恢复正常：清零 `consecutiveFailures`、`degradedUntil`、`degradedSince`、`degradeReason`，并清除 `quotaExhausted`；③未锁定 + **失败** → 立即失效：`degradedUntil = now + degrade_duration`、`degradedSince = now`、`degradeReason = "test_failed"`（新增取值），`consecutiveFailures` 不因测试累加。**例外**：单实例协议沿用 §24.16 M32，失败时状态不变（与锁定同一条路径），只有响应与日志如实报告失败原因。 |
+| M181 | 测试使用的模型名：优先取该实例 `models` 的第一项；`models` 为空时按固定优先级从 `roles` 取第一个可用值（`*` → `sonnet` → `fable` → `opus` → `haiku` → 任一键）；两者都拿不到则**不发起请求**、不改状态，响应 `ok=false` 且 `error` 为 `instance has no model to test`。 |
+| M182 | 测试**计入业务统计**（用户 m05401 拍板）：按普通请求的同一套路径收尾——增加 `/api/stats` 的 `requests.total`，按结果计入 `success` 或 `failed`，失败时写入 `recentErrors`，并更新实例行的 `requests`/`success`/`failed`/`inTokens`/`outTokens`/`avgTTFT`/`avgTps`。同时**必须在实时监控列表里作为一条完整记录出现**。取消「监控专用、只进环形缓冲」的旁路。 |
+| M183 | 测试记录在监控页的可视标记（用户 m05488 / m05590 两次定稿）：①该行 `method` 为 `POST`，**方法列不再追加任何标记**；②`path` 与**同协议真实请求的入站路径完全一致**——Anthropic 恒为 `/anthropic/v1/messages`、OpenAI 恒为 `/v1/chat/completions`；**不得显示上游经 `base_url` 拼接后的路径**（如 `/v1/messages`），否则同一实例的测试行与真实行 URL 不一致（用户 m05590：「2是真实的，1是测试的，两者url不一样」）；③`TEST` 以**标签徽标样式**显示在「客户端」列（小号圆角 tag，与既有的请求标记视觉一致），不是纯文本；④客户端列不再显示 `operator`。 |
+| M184 | 日志：成功 `instance <名> test ok in <d>s`；失败 `instance <名> test failed in <d>s: <原因>`；锁定实例的行尾追加 ` (locked, state unchanged)`；状态被改写时追加 ` → closed` 或 ` → open`。 |
+| M185 | 前端：两张实例表在「状态」列之后、「锁定」列之前新增一列；单元格为闪电按钮（`⚡` 字形或等价内联 SVG），tooltip「测试连通性」。点击后**立即跳转到实时监控页**（`/admin/monitor`），让用户看见这条 TEST 请求在跑。因为页面已经跳走，结果不再回写统计页 UI——测试结果由监控页那条 `POST TEST` 请求行的 `end` 事件呈现；请求进行中按钮置 `disabled`，不可重复点击。 |
+| M186 | 不改动既有语义：不新增 WS 事件类型（测试记录复用既有 `start`/`chunk`/`end`），不新增配置项，`/api/stats` 结构与实例状态取值集合不变，普通请求的路由、熔断、超时、统计行为与本条之前完全一致。 |
+| M186a | **客户端列缺值留空**：监控页「客户端」列的主文本与 tooltip 在缺值（无 `clientIP`、无 `userAgent`）时**留空**，不再用 `–` 占位；这是对所有请求行生效的展示口径调整（用户 m05488：「operator和-都不要显示了」）。 |
+
+### §24.32.2 验收
+
+| 编号 | 验收标准 |
+| --- | --- |
+| M15gj | 版本号 `internal/version/version.txt` = `0.1.8`，`-version` 输出 `0.1.8`；CHANGELOG 有 `[0.1.8]` 段；README「当前版本」为 `0.1.8`。 |
+| M15gk | `POST /api/instances/test` 带合法 `protocol`+`name` → 200，响应含 `name`/`protocol`/`ok`/`status`/`durationMs`/`state`/`error` 七个字段；声明了 `balance` 的实例另带 `balance`。 |
+| M15gl | 非法 `protocol` → 400；不存在的 `name` → 404；未通过管理面鉴权 → 401/403（与 lock/unlock 同一套）。 |
+| M15gm | 目标实例可达且正常返回流式响应 → `ok=true`、`status=200`、`error` 为空；随后一次 `/api/stats` 显示该实例 `state=closed`。 |
+| M15gn | 目标实例返回非 2xx → `ok=false`、`status` 为该状态码、`error` 非空；该实例 `state=open`、`reason=test_failed`。 |
+| M15go | 目标实例不可达（连接被拒 / DNS 失败）→ `ok=false`、`status=0`、`error` 非空；该实例 `state=open`。 |
+| M15gp | 目标实例接了 TCP 但**永不回响应头** → 测试在该实例 `timeout` 后返回 `ok=false`，`error` 以 `test timeout after` 开头；**不无限挂起**。 |
+| M15gq | 上游回 2xx 但流读到一半中断 → `ok=false`，该实例 `state=open`。 |
+| M15gr | 目标实例此前为 `open`（有 `degradedUntil`），测试成功后 `state=closed` 且 `degradedUntil`、`degradedSince`、`degradeReason`、`consecutiveFailures` 全部清零。 |
+| M15gs | 目标实例此前为 `exhausted`（`quotaExhausted=true`），测试成功后 `state` 不再为 `exhausted`、`reason` 为空；下一次余额轮询仍按真实余额重新判定（可能变回 `exhausted`，属预期）。**注**：配额真耗尽时测试请求本身也会失败（上游拒收），只有配额已恢复但轮询尚未跟上时才会出现「测试成功清掉 exhausted」，属正向提前恢复。 |
+| M15gt | 目标实例所在协议处于**锁定**状态且锁的就是它 → 测试照常执行并返回结果，但该实例的 `consecutiveFailures`/`degradedUntil`/`degradedSince`/`degradeReason`/`quotaExhausted` **一个都不变**；日志行含 `(locked, state unchanged)`。 |
+| M15gu | 目标实例所属协议是**单实例协议** → 沿用 §24.16 M32「永不 open」：测试失败时状态不变，响应 `error` 如实说明失败原因；仍返回 200（接口本身成功执行了测试）。 |
+| M15gv | `models` 与 `roles` 都为空、无法确定模型名 → 不发起任何上游请求，`ok=false`、`error=instance has no model to test`，状态不变。 |
+| M15gw | 测试请求在实时监控列表中可见：`method=POST`；`path` 为 `/anthropic/v1/messages`（Anthropic）或 `/v1/chat/completions`（OpenAI），**与同实例真实请求所显示的 URL 完全一致**；方法列只有 `POST` 没有额外标记；**客户端列的 `TEST` 以徽标 tag 样式呈现**（不是裸文本）；该行有正常的 start/chunk/end 生命周期与时间轴。 |
+| M15gx | 测试**影响业务统计**：测试前后 `/api/stats` 的 `requests.total` +1；成功时 `success` +1、失败时 `failed` +1 且 `recentErrors` 新增一条；该实例行的 `requests`/`success`/`failed` 同步增加。 |
+| M15gy | 前端：两张实例表都有该列且排在「状态」与「锁定」之间；点击后页面立即跳到 `/admin/monitor`（请求用 `keepalive` 发出，页面卸载不影响后端完成探测）；结果由监控页的 `POST TEST` 行呈现，不回写统计页 UI。 |
+| M15gz | 非测试请求的监控展示完全不变（方法列只有 `POST`，没有 `TEST`），普通请求的路由、熔断、超时、统计行为与改动前一致（**回归**）。 |
+| M15gz-1 | 测试请求体带 10K 上下文：抓取实际发出的 body，`messages[0].content` 长度 ≥ 40,000 字符；同一实例连续两次测试的 body **逐字节相同**（填充文本是常量，不含随机值）。 |
+| M15gz-2 | 客户端列缺值留空：构造一条既无 `clientIP` 也无 `userAgent` 的请求记录，监控页该行的客户端单元格与其 tooltip **不出现 `–`**；有值的行展示不变。 |
+| M15ha | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` 全绿；新增测试覆盖 M15gm–M15gx 的关键分支。 |
+
+### §24.32.3 已知限制
+
+- 单实例协议不因测试失败而 `open`（沿用 §24.16 M32），只能靠日志与响应里的 `error` 判断。
+- 测试会真实消耗该实例的一次最小调用额度（`max_tokens` ≤ 32），频繁点击会产生真实 token 成本。
+- 测试是同步接口，最坏要等满该实例的 `timeout` 才返回；前端在此期间只有一个禁用按钮，没有进度百分比。
+- 测试成功清除 `exhausted` 只是「临时手动恢复」，它不改变余额事实——下一轮余额轮询仍会按真实余额把它打回 `exhausted`。真实配额耗尽时测试本身也会失败，所以不会出现「靠测试把耗尽实例一直留着用」的漏洞。
+- 测试计入业务统计后，每次测试会带入约 10K 输入 token，这些额度**真实计费并计入 `/api/stats` 的 `inTokens`**；频繁点击会增加费用并拉高输入 token 统计。
+- 带 10K 上下文后，测试更容易命中大请求慢路径，单次测试耗时可能明显高于 32 token 的裸 ping（最坏仍受 M179 的实例 `timeout` 限制）。

@@ -53,6 +53,9 @@ const (
 
 	// §24.31 M159: manual balance refresh of one or all instances.
 	PathInstancesBalance = "/api/instances/balance"
+
+	// §24.32 M174: one synchronous connectivity test of one instance.
+	PathInstancesTest = "/api/instances/test"
 )
 
 // MaxRequestBodyBytes caps how much of a request body is buffered for
@@ -3274,6 +3277,8 @@ func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request, st *serverSt
 		s.serveInstanceUnlock(w, r, st)
 	case PathInstancesBalance:
 		s.serveInstanceBalance(w, r, st)
+	case PathInstancesTest:
+		s.serveInstanceTest(w, r, st)
 	case PathStatsClear:
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)

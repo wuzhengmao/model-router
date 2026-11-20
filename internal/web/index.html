@@ -286,6 +286,20 @@
     stroke-linecap: round;
     stroke-linejoin: round;
   }
+  /* §24.32 M185：连通性测试闪电按钮。 */
+  .test-col, .stat-test-cell { text-align: center; }
+  .test-button {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    border-radius: 5px;
+    padding: 1px 5px;
+    line-height: 1.2;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .test-button:hover { color: var(--text); border-color: var(--accent); }
+  .test-button:disabled { cursor: progress; opacity: .45; }
   /* §24.12 J1：JSON 高级页编辑框弹性填满 header 以下剩余高度。 */
   body.json-mode {
     min-height: 100vh;
@@ -437,6 +451,19 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* §24.32 M183：测试行的客户端列用圆角 tag 徽标，而不是裸文本。 */
+  .req-client-tag {
+    display: inline-block;
+    padding: 0 5px;
+    border-radius: 4px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    line-height: 1.5;
+    vertical-align: 1px;
   }
   .req-client-id {
     display: block;
@@ -607,18 +634,19 @@
       <div class="stat-table-wrap">
         <table class="stat-table" id="stat-instances-openai-table">
           <colgroup>
-            <col style="width:16%">
+            <col style="width:15%">
             <col style="width:6%">
             <col style="width:5%">
             <col style="width:5%">
             <col style="width:5%">
+            <col style="width:8%">
             <col style="width:9%">
             <col style="width:10%">
-            <col style="width:10%">
-            <col style="width:7%">
-            <col style="width:11%">
-            <col style="width:10%">
             <col style="width:6%">
+            <col style="width:10%">
+            <col style="width:9%">
+            <col style="width:7%">
+            <col style="width:5%">
           </colgroup>
           <thead>
             <tr>
@@ -633,6 +661,7 @@
               <th class="num">平均 t/s</th>
               <th>余额</th>
               <th>状态</th>
+              <th class="test-col" title="测试连通性">测试</th>
               <th class="lock-col" title="锁定 / 解锁">锁定</th>
             </tr>
           </thead>
@@ -644,18 +673,19 @@
       <div class="stat-table-wrap">
         <table class="stat-table" id="stat-instances-anthropic-table">
           <colgroup>
-            <col style="width:16%">
+            <col style="width:15%">
             <col style="width:6%">
             <col style="width:5%">
             <col style="width:5%">
             <col style="width:5%">
+            <col style="width:8%">
             <col style="width:9%">
             <col style="width:10%">
-            <col style="width:10%">
-            <col style="width:7%">
-            <col style="width:11%">
-            <col style="width:10%">
             <col style="width:6%">
+            <col style="width:10%">
+            <col style="width:9%">
+            <col style="width:7%">
+            <col style="width:5%">
           </colgroup>
           <thead>
             <tr>
@@ -670,6 +700,7 @@
               <th class="num">平均 t/s</th>
               <th>余额</th>
               <th>状态</th>
+              <th class="test-col" title="测试连通性">测试</th>
               <th class="lock-col" title="锁定 / 解锁">锁定</th>
             </tr>
           </thead>
@@ -1024,7 +1055,12 @@
     Object.assign(headers, opts.headers || {});
     var res;
     try {
-      res = await fetch(path, { method: opts.method || 'GET', headers: headers, body: opts.body });
+      res = await fetch(path, {
+        method: opts.method || 'GET',
+        headers: headers,
+        body: opts.body,
+        keepalive: !!opts.keepalive
+      });
     } catch (err) {
       // URL 内嵌凭据时 fetch 会抛 credentials 类 TypeError；打标记供 load() 静默降级。
       if (isCredentialURLError(err) && err && typeof err === 'object') {
@@ -2334,6 +2370,18 @@
     return truncateClientLabel(token);
   }
 
+  // §24.32 M183：测试行返回 tag 徽标；M186a：缺值留空，不再用 – 占位。
+  // title 只拼接实际存在的 IP/UA。
+  function clientCellText(req) {
+    if (req.tag === 'TEST') {
+      return { tag: 'TEST', ip: '', ua: '', uaTitle: '', title: 'TEST' };
+    }
+    var ip = req.clientIP || '';
+    var rawUA = req.userAgent || '';
+    var ua = rawUA ? userAgentLabel(rawUA) : '';
+    return { tag: '', ip: ip, ua: ua, uaTitle: rawUA, title: [ip, rawUA].filter(Boolean).join(' ') };
+  }
+
   function refreshMonitorRow(req) {
     if (!req || !req.cells) {
       return;
@@ -2352,14 +2400,23 @@
     req.cells.methodText.title = pathTitle;
     req.cells.url.title = path;
 
-    var ip = req.clientIP || '–';
-    var rawUA = req.userAgent || '';
-    var uaLabel = userAgentLabel(rawUA);
-    req.cells.clientIp.textContent = ip;
-    req.cells.clientIp.title = ip;
-    req.cells.clientUa.textContent = uaLabel;
-    req.cells.clientUa.title = rawUA || '–';
-    req.cells.client.title = ip + ' ' + (rawUA || '–');
+    // §24.32 M183/M186a：客户端列——测试行渲染 tag 徽标，缺值留空，不用 – 占位。
+    var client = clientCellText(req);
+    // 先清空再渲染：行被复用刷新时不会不断累积 tag span。
+    req.cells.clientIp.textContent = '';
+    req.cells.clientUa.textContent = '';
+    if (client.tag) {
+      var clientTag = document.createElement('span');
+      clientTag.className = 'req-client-tag';
+      clientTag.textContent = client.tag;
+      req.cells.clientIp.appendChild(clientTag);
+    } else {
+      req.cells.clientIp.textContent = client.ip;
+    }
+    req.cells.clientIp.title = client.tag || client.ip;
+    req.cells.clientUa.textContent = client.ua;
+    req.cells.clientUa.title = client.uaTitle;
+    req.cells.client.title = client.title;
 
     var model = req.reqModel || 'n/a';
     var target = (req.instName || '…') + (req.upstreamModel ? '/' + req.upstreamModel : '');
@@ -2693,6 +2750,7 @@
       userAgent: event.userAgent || '',
       instName: event.instName || '',
       upstreamModel: event.upstreamModel || '',
+      tag: event.tag || '',
       chunks: 0,
       chunksList: [],
       baseDurationMs: 0,
@@ -2793,6 +2851,7 @@
     req.tps = event.tps || 0;
     req.instName = event.instName || req.instName;
     req.upstreamModel = event.upstreamModel || req.upstreamModel;
+    req.tag = event.tag || req.tag;
     req.error = event.error || '';
   }
 
@@ -2866,6 +2925,7 @@
       userAgent: snapshotValue(item, 'userAgent') || '',
       instName: snapshotValue(item, 'instName') || '',
       upstreamModel: snapshotValue(item, 'upstreamModel') || '',
+      tag: snapshotValue(item, 'tag') || '',
     };
     var req = buildMonitorRequest(start);
     req.recvAt = Date.now();
@@ -3565,6 +3625,23 @@
     });
   }
 
+  // §24.32 M185：点击闪电立即跳转到实时监控页查看这条 TEST 请求。结果由监控页
+  // 的那条 TEST 行呈现（服务端探测不依赖调用方连接，页面跳走也会跑完并写回
+  // 状态），因此本页不再等待/渲染响应；keepalive 让 POST 在页面卸载后仍能到达
+  // 服务端。请求进行中按钮禁用，避免重复点击。
+  function testInstanceConnectivity(protocol, name, button) {
+    if (!button || button.disabled) {
+      return;
+    }
+    button.disabled = true;
+    button.setAttribute('data-testing', '1');
+    var body = JSON.stringify({ protocol: String(protocol), name: String(name) });
+    api('/api/instances/test', { method: 'POST', body: body, keepalive: true }).catch(function () {
+      // 页面已经跳走，不再更新本页 UI；空 catch 避免未处理的 Promise 拒绝。
+    });
+    location.href = '/admin/monitor';
+  }
+
   function appendStatInstanceRow(tbody, raw) {
     var item = raw && typeof raw === 'object' ? raw : {};
     var row = document.createElement('tr');
@@ -3633,6 +3710,22 @@
         refreshInstanceBalance(item.protocol, item.name, balanceCell, stateCell, balance);
       });
     }
+    // §24.32 M185：状态列之后、锁定列之前是连通性测试列。
+    var testCell = document.createElement('td');
+    testCell.className = 'stat-test-cell';
+    if (!removed && item.protocol && item.name) {
+      var testButton = document.createElement('button');
+      testButton.type = 'button';
+      testButton.className = 'test-button';
+      testButton.title = '测试连通性';
+      testButton.setAttribute('aria-label', '测试连通性');
+      testButton.textContent = '⚡';
+      testButton.addEventListener('click', function () {
+        testInstanceConnectivity(String(item.protocol), String(item.name), testButton);
+      });
+      testCell.appendChild(testButton);
+    }
+    row.appendChild(testCell);
     var lockCell = document.createElement('td');
     lockCell.className = 'stat-lock-cell';
     if (!removed && item.protocol && item.name) {

@@ -947,7 +947,7 @@ JSON 形状：
 
 口径：
 
-- **累计**：进程启动起累积，重启清零；`requests.total = requests.success + requests.failed`，只统计已结束的 AI 请求（`serveChain` 粒度），`/v1/models`、favicon、401 不计入。
+- **累计**：进程启动起累积，重启清零；`requests.total = requests.success + requests.failed`，只统计已结束的 AI 请求（`serveChain` 与 §24.32 连通性测试的 `end` 粒度），`/v1/models`、favicon、401 不计入。
 - **成功/失败**：`status` 为 2xx/3xx 且 `end.error == ""` 记成功；其余（含“2xx 但流式错误”）记失败。
 - **分位数**：TTFT（`ttftMs`）与总耗时（`durationMs`）各保留最近 1000 个样本的环形窗口；样本 < 10 时 `p50`/`p95` 输出 `null`。采用 nearest-rank，单位 ms。
 - **QPS**：最近 60 秒内开始的 AI 请求数 ÷ 60，保留 1 位小数。
@@ -1702,3 +1702,40 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 - **未覆盖**：`interval` 没有下限校验，配置成极小值（如 `1ms`）会按该周期持续查询，由使用者自行控制。
 - **未覆盖**：MiniMax 的 `current_interval_status` / `current_weekly_status` 未参与判定，只按 M156 的百分比规则；官方状态字段语义未在需求中定义。
 - **未覆盖**：余额充足不代表调用一定成功（M Plan 官方说明「额度充足仍可能因速率限制被限流」），本功能只覆盖配额/余额维度。
+
+## 50. 第二十九轮：实例连通性测试（§24.32 M173–M186a）
+
+### 50.1 接口与探测（M174–M179、M181）
+
+- **M174 接口**：`internal/proxy/proxy.go` 新增路由常量 `PathInstancesTest = "/api/instances/test"`，`serveAdmin` 增加对应分支调用 `internal/proxy/connectivity.go`（新建）的 `(*Server).serveInstanceTest`。鉴权沿用 `/api/**` 的管理面门禁（会话 Cookie / Basic），与 lock/unlock 完全一致；只接受 POST（其它方法 405）。请求体用 `decodeInstanceRequest` 严格解码 `{"protocol","name"}`，`normalizeLockProtocol` 校验协议（非法 400），`name` 为空 400，该协议下找不到实例 404。接口同步执行、同步返回，响应固定为 200 + `instanceTestResult`。
+- **M175 响应**：`instanceTestResult` 含 `name`/`protocol`/`ok`/`status`/`durationMs`/`state`/`balance?`/`error`。`status` 是上游 HTTP 状态码，拿不到为 0；`state` 与 `/api/stats` 的 `instances[].state` 同口径，由 `testInstanceState(inst, locked)` 给出：锁定优先（`locked`），否则取 `inst.displayState()` 的首个返回值（`exhausted` 优先于熔断状态，再到 `open`/`closed`）；`balance` 仅在实例声明了 `balance` 时出现（`balanceSnapshot()`）；`error` 成功时为空串。
+- **M176 直连**：`probeInstance` 用 `url.JoinPath(inst.baseURL, upstreamPath(entry))` 直接构造目标地址（Anthropic `/v1/messages`、OpenAI `/v1/chat/completions`），不复用 `serveChain`、`candidate` 或任何重试/锁定转交逻辑，也不改写模型。每次测试用 `newClient(inst.timeout)` 新建独立 client，不复用 `inst.client`/`inst.lockedClient`，避免锁定实例的零超时 client 污染探测预算。
+- **M177 请求**：`instanceTestBody` 固定 `model`（M181 解析）、`max_tokens: 32`、`stream: true`、`messages` 一条 user 消息；`content` 由常量 `instanceTestFillerChunk`（45 字符）重复 900 次得到 40,500 字符，再拼接固定指令 `\n\nreply with OK`。填充只依赖常量、不含随机数与时间戳，因此同一实例连续两次测试的请求体逐字节相同（约 10K token 的真实链路压力，用于复现大请求体在等响应头阶段卡死）。请求头 `Content-Type: application/json`、`Accept: text/event-stream`，Anthropic 带 `x-api-key`，OpenAI 带 `Authorization: Bearer`。
+- **M179 超时**：`context.WithTimeout(context.Background(), inst.timeout)` 覆盖建连、上传、等响应头和读流全过程，client 的连接/握手/响应头超时也取同一值；锁定实例不豁免。判定超时同时检查 `ctx.Err() == context.DeadlineExceeded`、`errors.Is(err, context.DeadlineExceeded)` 与 `net.Error.Timeout()`，错误文本固定以 `test timeout after <duration>` 开头。
+- **M181 模型解析**：`instanceTestModel` 先取 `inst.models[0]`，再按 `*` → `sonnet` → `fable` → `opus` → `haiku` 取第一个非空 `roles` 值，最后对剩余角色键排序后取第一个；全部为空时直接返回 `ok=false, error="instance has no model to test"`，不创建监控行、不发请求、不改状态。
+
+### 50.2 成功判定、状态改写与统计计入（M178、M180、M182）
+
+- **M178 流判定**：`consumeTestStream` 逐行读取 SSE；`data: [DONE]`、`event: message_stop` 或含 `"message_stop"` 的 `data:` 负载直接判成功；读到干净 `io.EOF` 且至少解析出一个非空 `data:` 负载也判成功；`io.ErrUnexpectedEOF`/其它读错误、或 EOF 时一个事件都没有，判失败。只拿到响应头就断（零事件 EOF）因此是失败。
+- **M180 写回**：`runInstanceTest` 在测试前用 `testInstanceState(inst, locked)` 记录锁定优先的状态，测试后按锁定与否处理。① `h.isLockedInstance(inst)` 为真时完全不碰状态，只返回结果；② 未锁定 + 成功 → `resetTestSuccess()` 清零 `consecutiveFailures`/`degradedUntil`/`degradedSince`/`degradeReason` 并清 `quotaExhausted`/`quotaExhaustedSince`（新增方法，`resetState`/`recordSuccess` 都不清配额）；③ 未锁定 + 失败 → `markTestFailure()` 先把 `degradedSince` 置为 now，再调用既有的 `markOpenLocked(now, degrade_duration, "test_failed")`；后者对 `singleInstanceProtocol` 直接返回（§24.16 M32），因此单实例协议不会因测试失败而 `open`。`consecutiveFailures` 在两条失败路径都不累加。`reasonTestFailed = "test_failed"` 是新增原因取值。
+- **M182 统计计入**：`trackTestRequest` 与 `trackRequest` 一样先调 `stats.begin(now)`；测试行 `end()` 不再走旁路，统一调 `stats.finish(snapshot, 状态为 2xx 且无错误)`。因此测试增加 `requests.total`，成功计入 `success`、失败计入 `failed`，失败同时写入 `recentErrors`（`instName` 为被测实例、`reqModel`/`upstreamModel` 为测试模型），并更新实例行的 `requests`/`success`/`failed`/`inTokens`/`outTokens`/`avgTTFT`/`avgTps`。监控行仍照常进入最近请求环形缓冲。`monitorOnly` 字段与 `statsAggregator.recordMonitorOnly` 已删除。
+- **usage 记账**：`consumeTestStream` 在判定流结束的同时逐行调用 `usageTokens.parseTestUsageLine`，把解析结果填入 `attemptMetrics` 的 `inTokens/hasIn` 与 `outTokens/hasOut`，由 `stats.finish` 累加到全局与实例行。Anthropic 读 `message_start.message.usage.input_tokens`/`output_tokens` 与 `message_delta.usage.output_tokens`（后到者覆盖）；OpenAI 读 chunk 的 `usage.prompt_tokens`/`completion_tokens`。JSON 非法、字段缺失或类型不符一律忽略，`hasIn`/`hasOut` 保持 false，且 usage 不参与 M178 成功判定。
+
+### 50.3 监控与前端（M183–M186a）
+
+- **M183 监控行**：`monitor.go` 的 `requestMonitor` 新增 `tag` 字段；`trackTestRequest` 构造 `method=POST`、`path=该协议的入站路径`、`tag="TEST"` 的行（`clientIP`/`userAgent` 留空），其余统计路径与普通请求一致（M182）。入站路径由 `connectivity.go` 的 `instanceTestMonitorPath(proto)` 给出：Anthropic 恒为 `PathAnthropicMessages`（`/anthropic/v1/messages`），OpenAI 恒为 `PathOpenAI`（`/v1/chat/completions`），**与实例 `base_url` 无关**；真正发请求的 URL 仍由 `instanceTestURL(inst)` 计算，但不用于监控展示，因此测试行与同实例真实请求行的 URL 完全一致。`monitorStartEvent`/`monitorRequestSnapshot`/`monitorEndEvent` 都增加 `tag`（`omitempty`，普通请求不带）。读流时 `testStreamReader` 把每次上游 Read 记成一个 `chunk` 事件（字节数、起止时间；token 计 0/unknown），因此监控页有 start/chunk/end 与时间轴。未新增 WS 事件类型。
+- **M186a 客户端列**：`refreshMonitorRow` 通过纯函数 `clientCellText(req)` 计算客户端列：`tag === 'TEST'` 返回 `tag: 'TEST'`，渲染时清空 `clientIp` 单元格后 append 一个 `<span class="req-client-tag">TEST</span>` 徽标（小号圆角 tag，不是裸文本）；其余行 `clientIP`/`userAgent` 缺值一律用空串，UA 标签只在有原始 UA 时计算，tooltip 用 `[ip, rawUA].filter(Boolean).join(' ')` 只拼接实际存在的值，不再出现 `–` 占位。每次刷新先清空 `clientIp`/`clientUa` 再渲染，行复用时不会累积 span。方法列不再追加任何标记，只显示 `POST`。该缺值口径对所有请求行生效。
+- **M185 前端**：`internal/web/index.html` 两张实例表 `colgroup` 由 12 列改为 13 列（新增 7%，其余等比微调），`<thead>` 在「状态」与「锁定」之间插入 `<th class="test-col" title="测试连通性">测试</th>`；`appendStatInstanceRow` 在状态单元格之后、锁定单元格之前插入闪电按钮（`⚡`，`title="测试连通性"`）。点击后按钮立即 `disabled`，用 `api(..., {keepalive:true})` 发起测试并立刻 `location.href='/admin/monitor'`；结果与失败原因由监控页的 `POST` 行（客户端列显示 `TEST` 徽标）呈现，统计页不再等待或渲染响应（`keepalive` 保证 POST 在页面卸载后仍到达服务端）。监控页 `refreshMonitorRow` 不再改方法列，TEST 标记由 `clientCellText` 渲染在客户端列，普通请求的显示不变（缺值口径见 M186a）。
+- **M186 兼容**：`/api/stats` 结构与实例状态取值集合未变；普通请求只多了一个 `omitempty` 的 `tag` 字段（空值不出现），路由、熔断、超时、统计路径与改动前一致。
+
+### 50.4 决策与未覆盖
+
+- **D-M30-1 探测不继承请求上下文**：`probeInstance` 使用 `context.Background()` 派生带超时的 context，而不是 `r.Context()`。前端点击后会立即整页跳转到监控页，浏览器若中断原请求，`r.Context()` 会取消，测试就无法完成状态写回；独立 context 保证测试始终按实例 `timeout` 收尾。
+- **D-M30-2 失败写回刷新 `degradedSince`**：M180 明确要求失败时 `degradedSince = now`，因此 `markTestFailure` 在调用 `markOpenLocked` 前先重置 `degradedSince`；这也意味着实例原本已 `open` 时，测试失败会刷新降级开始时间（与普通失败「保留首次降级时间」的约定不同，按 M180 字面口径执行）。
+- **D-M30-3 测试与普通请求同一套统计收尾**：M182 反转后不再有「监控专用」旁路；测试行通过 `stats.begin`/`stats.finish` 与普通请求完全同源，因此 `activeRequests`、QPS 窗口、成功率、TTFT/吞吐样本池都会看到这次带 ~10K 上下文的测试请求（§24.32 已知限制：频繁点击会增加真实费用并拉低平均 TTFT/吞吐样本的代表性）。
+- **D-M30-4 统计页只负责发起与跳转**：整页跳转会销毁统计页的 JS，因此点击闪电后不再保留「响应回来再改本页 DOM」的分支（那是死代码）。产品上的结果呈现完全交给实时监控页的 TEST 行；服务端探测用 `context.Background()`，页面跳走也会跑完并按 M180 写回状态。
+- **D-M30-5 10K 上下文用常量重复而非随机填充**：`instanceTestFillerChunk` × 900 + 固定指令在编译/初始化期确定，两次测试的 body 逐字节相同；这样既复现「大请求体慢路径」，又能把两次测试的差异归因于链路而不是请求内容。代价是每次测试真实消耗约 10K 输入 token（§24.32 已知限制）。
+- **以独立 client 探测**：不复用实例的 `client`/`lockedClient`，因此锁定实例的零超时豁免不会让测试无限挂起（M179）。
+- **未覆盖**：2xx 但不是 SSE 的响应按「零事件 EOF」判失败，符合 M178 的流式前提，但没有额外提示内容类型不符。
+- **未覆盖**：usage 是 best-effort——上游完全不返回 usage 时（部分 OpenAI 兼容实现不会在流末尾发送 usage chunk），测试仍按 M178 判成功，但 token 统计保持 0。
+- **未覆盖**：项目没有浏览器自动化测试，M15gy 的列位置、跳转、按钮禁用与 TEST 标记由静态 HTML 契约断言覆盖。

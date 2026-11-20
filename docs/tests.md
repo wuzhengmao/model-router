@@ -1256,3 +1256,45 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 - `TestBalanceLogs` 复用 `stream_content_idle_internal_test.go` 的 `captureStreamLogs`（同一 package）捕获标准 logger，断言 M164 的三行日志；日志捕获期间其它测试不并行运行。
 - `TestBalanceUI` 读取 `../web/index.html` 做静态契约断言（列位置、文案、类名、刷新接口）；项目暂无浏览器自动化测试，M15gg 的「刷新中禁用重复点击」由 `data-refreshing` 属性与 `刷新中…` 文案间接覆盖。
 - `TestBalancePeriodicPoll` 用 50ms 周期验证 M157 的重复查询；`balancePoller.stop()` 在 `Server.Close` 中取消并等待 goroutine，测试结束不泄漏。
+
+## 50. 第二十九轮：实例连通性测试（§24.32 M173–M186）
+
+### 50.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-973 | M15gj/M173 版本与文档 | `internal/version/version.txt`、`CHANGELOG.md`、`README.md` | 版本为 `0.1.8`，CHANGELOG 有 `[0.1.8]` 段，README「当前版本」为 `0.1.8` |
+| UT-974 | M15gk 成功响应字段 | `TestInstanceTestSuccess` | 200；响应含 `name`/`protocol`/`ok`/`status`/`durationMs`/`state`/`error` 七字段；未声明 balance 的实例不带 `balance`；声明了 balance 的实例带 `balance.kind` |
+| UT-975 | M15gl 参数与鉴权 | `TestInstanceTestRejectsBadRequests` | 非法 protocol 400；不存在的 name 404；缺少 name 400；未鉴权 401；GET 405 |
+| UT-976 | M15gm 成功判定与状态 | `TestInstanceTestSuccess`、`TestConsumeTestStream` | OpenAI 打 `POST /v1/chat/completions`、Anthropic 打 `POST /v1/messages`；认证头分别为 Bearer / x-api-key；请求体 `model`/`max_tokens<=32`/`stream:true`/`messages=[user,ping]`；`ok=true,status=200,error=""`；响应 `state=closed`；`[DONE]`、`message_stop` 与「干净 EOF 且至少一个事件」判成功 |
+| UT-977 | M15gn 非 2xx | `TestInstanceTestUpstreamFailure/non-2xx` | `ok=false`、`status=500`、`error` 含 `upstream status 500`；响应与 `/api/stats` 均为 `state=open`、`reason=test_failed` |
+| UT-978 | M15go 不可达 | `TestInstanceTestUpstreamFailure/connection refused` | `ok=false`、`status=0`、`error` 非空、`state=open` |
+| UT-979 | M15gp 超时 | `TestInstanceTestTimeout` | 接 TCP 但不回响应头；150ms 实例超时后返回 `ok=false`，`error` 以 `test timeout after` 开头，整体耗时 <3s（不无限挂起） |
+| UT-980 | M15gq 流中断 | `TestInstanceTestStreamTruncated` | 2xx + `Content-Length` 大于实际流 → `ok=false`、`error` 含 `unexpected EOF`、`state=open` |
+| UT-981 | M15gr open→closed | `TestInstanceTestRestoresOpenInstance` | 预置 `open` 后成功测试：`state=closed`，`consecutiveFailures`/`degradedUntil`/`degradedSince`/`degradeReason` 全部清零 |
+| UT-982 | M15gs exhausted→closed | `TestInstanceTestRestoresExhausted` | 预置 `quotaExhausted` 后成功测试：`state=closed`、配额标志与时间戳清零、`/api/stats` 的 `reason` 为空 |
+| UT-983 | M15gt 锁定不改状态 | `TestInstanceTestLockedUnchanged` | 锁定实例失败测试照常执行并返回失败；响应 `state=locked`（与 `/api/stats` 同口径，锁定优先于熔断/配额）；五个状态字段（含 `quotaExhausted`/`quotaExhaustedSince`）逐项不变；日志含 `(locked, state unchanged)` |
+| UT-984 | M15gu 单实例协议 | `TestInstanceTestSingleInstanceProtocol` | 单实例协议失败测试仍返回 HTTP 200，`error` 如实说明 503；`state=closed`，熔断字段不变 |
+| UT-985 | M15gv 无模型可测 | `TestInstanceTestNoModel` | 不发起上游请求（调用数 0）；`ok=false`、`error=instance has no model to test`、`status=0`、状态不变 |
+| UT-986 | M15gw 监控 TEST 行 | `TestInstanceTestMonitorRow` | 环形缓冲与 WS snapshot 均有 `tag=TEST`、`method=POST`、**入站路径**（Anthropic 恒 `/anthropic/v1/messages`，与 `base_url` 前缀无关；OpenAI `/v1/chat/completions`）、`clientIP`/`userAgent` 为空、`ended=true`、`status=200`、`chunks>=1`；带前缀时上游实际收到 `/anthropic/v1/messages`，无前缀时上游收到 `/v1/messages` 但监控行仍显示 `/anthropic/v1/messages`；结束后无活跃行 |
+| UT-987 | M15gx 计入业务统计 | `TestInstanceTestCountsInStats` | 成功测试后 `requests.total` +1、`success` +1、`failed` 不变，该实例行 `requests/success/failed` 同步；失败测试后 `total` +1、`failed` +1、`success` 不变，实例行同步，`recentErrors` 新增一条（`instName` 为被测实例、`error` 非空） |
+| UT-988 | M15gy 前端列与交互 | `TestInstanceTestUI` | 两张表都是 13 列；`<th>测试</th>` 位于「状态」与「锁定」之间；页面含 `⚡`、`测试连通性`、`/api/instances/test`、`location.href = '/admin/monitor'`、`button.disabled = true`、`keepalive: true`、`clientCellText`、`req-client-tag` 徽标与 `clientTag.className = 'req-client-tag'`；不再包含方法列 TEST 标记（`req-test-tag`/`appendChild(testTag)`）、`operator` 或 `–` 缺值占位；不含已删除的 `applyInstanceTestResult` 死代码 |
+| UT-989 | M181 模型名解析优先级 | `TestInstanceTestModelResolution` | `models[0]` 优先；`roles` 按 `*`→`sonnet`→`fable`→`opus`→`haiku`→任一键（排序取首）解析；全空返回 false |
+| UT-990 | M15gz 回归：普通请求展示不变 | 全量既有用例 + `TestInstanceTestMonitorRow` | 普通请求的 `start`/`snapshot`/`end` 不带 `tag`，方法列只有 `POST`；路由、熔断、超时、统计既有断言全部未改并通过 |
+| UT-991 | M15ha 构建与全量测试 | `gofmt -l .`、`go build ./...`、`go vet ./...`、`go test ./... -race -count=1` | 四条命令全部通过 |
+| UT-992 | M15gz-1 10K 上下文与可复现性 | `TestInstanceTestTenKContext` | 抓取实际发出的两次请求体：`messages[0].content` 长度 ≥40,000 且以 `reply with OK` 结尾；两次 body 逐字节相同；`max_tokens<=32`、`stream=true` |
+| UT-993 | M15gz-2 客户端列缺值留空 | `TestInstanceTestClientCellBlank` | 服务端构造的无 clientIP/UA 快照序列化后为空串且不含 `–`/`operator`；前端 `clientCellText` 对缺值返回空串、tooltip 用 `filter(Boolean)` 拼接、TEST 行返回 `tag: 'TEST'`；渲染时先清空 `clientIp` 再 append `req-client-tag` 徽标（不会累积 span），代码块内不含 `–`/`operator` |
+| UT-994 | M182 usage 真实记账 | `TestInstanceTestUsageAccounting` | Anthropic `message_start.message.usage`（input 10000/output 1）+ `message_delta.usage.output_tokens=5`：`/api/stats` 全局与实例行 `inTokens` +10000、`outTokens` +5（后到的 delta 覆盖）；OpenAI chunk `usage.prompt_tokens=10000/completion_tokens=5` 同样累计；无 usage 的上游测试仍 `ok=true` 且 token 不变 |
+
+### 50.2 场景说明
+
+- 新增用例全部位于 `internal/proxy/instance_test_internal_test.go`（`package proxy`）。`itestBackend` 是可编程的假上游，记录每次请求的方法、路径、正文与请求头；`itestSSEHandler` 给出 OpenAI（`data: [DONE]`）与 Anthropic（`event: message_stop`）两种正常流。
+- 需要验证熔断 `open` 的用例都配置了同协议第二个实例，避免命中 §24.16 M32「单实例协议永不 open」；单实例行为由 `TestInstanceTestSingleInstanceProtocol` 单独覆盖。
+- 超时用例的上游 handler 阻塞在 channel 上，客户端在实例 `timeout` 到期后返回；清理顺序保证先释放 handler 再关闭 `httptest.Server`。
+- 流中断用例用 hijack 写出 `Content-Length: 500` 但只发送一个事件，Go 的 body reader 返回 `io.ErrUnexpectedEOF`，与 §24.32 M178「读到一半 EOF 算失败」对应。
+- `TestInstanceTestLockedUnchanged` 复用 `captureStreamLogs` 捕获标准 logger，断言 `instance <名> test failed in` 与 `(locked, state unchanged)`。
+- `TestInstanceTestCountsInStats` 用成功/失败两个实例分别验证统计：`trackTestRequest` 与普通请求一样 `stats.begin`，`end()` 统一 `stats.finish`；成功判定沿用「状态 2xx 且无错误」，失败同时进入 `recentErrors`。测试行的 TTFT 来自首/末 chunk，输出 token 为 0，因此实例 `avgTps` 的分子不增加、只增加生成时长样本。
+- `TestInstanceTestTenKContext` 对同一实例连续发起两次测试，直接比较假上游记录的两份原始 body 字节，验证 `messages[0].content` 的常量填充（45 字符 × 900 + 指令）既达到 40,000 字符下限又完全可复现。
+- `TestInstanceTestClientCellBlank` 分两层：Go 侧构造无 clientIP/UA 的 `monitorRequestSnapshot`，断言序列化后为空串且不含 `–`/`operator`；HTML 侧提取 `clientCellText` 与 `refreshMonitorRow` 的客户端渲染块，断言缺值回落空串、tooltip 用 `filter(Boolean)` 拼接、TEST 行返回 `tag: 'TEST'`，且渲染前先清空 `clientIp` 再 append `req-client-tag` 徽标（行复用不累积 span）。项目暂无浏览器自动化测试，DOM 渲染由该静态契约覆盖。
+- `TestInstanceTestUsageAccounting` 用三个假上游覆盖 usage 解析：Anthropic 的 `message_start.message.usage` + `message_delta.usage`（验证后到者覆盖）、OpenAI 末尾 chunk 的 `usage`、以及完全不返回 usage 的流。断言全局与实例行的 `inTokens`/`outTokens` 增量，且无 usage 时测试仍成功、token 不变。
+- `TestInstanceTestUI` 读取 `../web/index.html` 做静态契约断言（13 列、列位置、按钮文案/标题、跳转与禁用逻辑、TEST 标记类名）；项目暂无浏览器自动化测试，M15gy 的「请求进行中禁用」由代码契约覆盖。统计页在点击后只负责发起请求并跳转，结果呈现由监控页的 TEST 行承担，因此不再断言就地刷新辅助函数。
