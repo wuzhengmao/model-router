@@ -1579,3 +1579,65 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 - **未覆盖**：预算不覆盖 `rewriteModel` 之外的本地处理？实现从 `attemptStart` 起算，因此包含 `rewriteModel` 的 CPU 时间；M110 的「从 attemptStart 起」按字面执行。
 - **未覆盖**：平台生成的 `pause_turn` 尾巴（idle/content-idle/slow）由 `writePauseTurnTail` 直接写出，不经过注入器；这类被中断的流不注入 thinking 块。
 - **未覆盖**：实例 `timeout=0` 时不设预算（无正数预算），`hdrprof` 也不打印；配置默认 15s。
+
+## 45. 第二十四轮：预算触发时补打 hdrprof（§24.27 M121–M126）
+
+### 45.1 实现
+
+- `tryCandidate` 的 `client.Do` 错误分支先判断 `budgetHit`：命中时在返回前调用 `trace.log(cand.inst.name, attemptStart, time.Now(), cand.inst.timeout, len(attemptBody), budget)`。观测点取预算触发时刻，`hdr` 约为实例 `timeout`，因此必然通过 §24.26 M118 的 `hdr > timeout/2` 门槛（M121/M122）。
+- 补打行字段与 M118 完全一致，不新增字段；正常拿到响应头的路径仍以 `headersAt` 判定并沿用原门槛（M123）。
+- 补打只写日志：`recordFailure`、错误文本 `response header budget exceeded after <d>: <err>`、重试链、候选计数与转发字节均不变（M124）。
+- 锁定实例（`lockedExempt`）没有预算，`budgetHit` 恒为 false，不会补打（M125）。版本保持 `0.1.6`（M126）。
+
+### 45.2 决策与未覆盖
+
+- **D-M24-1 观测点用 `time.Now()`**：M122 指定触发时刻而非 `attemptStart+budget`；两者只差调度延迟，都大于 `timeout/2`。`hdrprof` 本身不输出原始 `hdr`，门槛由补打入口的可达性保证。
+- **未覆盖**：`client.Do` 返回非预算错误（`budgetHit=false`）时不补打，保持 §24.26 原行为。
+- **未覆盖**：timer 与 `Do` 返回的极小竞态导致 `budgetHit=true` 但错误并非 budget cancel 引起时，仍按预算错误处理并补打（M124 要求错误文本不变）。
+
+## 46. 第二十五轮：连接标识观测（§24.28 M127–M134）
+
+### 46.1 实现
+
+- `headerProfile` 新增 `localPort int`（零值表示未知）。`GotConn` 回调在既有互斥锁内从 `info.Conn.LocalAddr()` 断言 `*net.TCPAddr` 取 `.Port`；`RemoteAddr()` 为空时不写 `remote`。没有扩大锁范围，也没有新增阻塞。
+- 新增 `connID()`（加锁读一次）与 `connLabel()`（调用方已持锁）：只返回十进制端口或 `-`，不输出 IP、指针或任何连接对象信息（M131）。
+- `hdrprof` 在 `remote=` 与 `budget=` 之间插入 `conn=%s`，其余字段名称、顺序与取值口径不变（M128/M129）。
+- `logStreamPhases` 增加 `conn string` 参数，在 `last_gap=` 之后追加 ` conn=%s`；唯一调用点 `tryCandidate` 传入同一次尝试的 `trace.connID()`（M130）。`GotConn` 未触发（连接尚未取得）时两处都打印 `-`。
+- 只改日志：预算、候选链、熔断计数、转发字节、`/api/stats` 与 WS 事件均未改变；未新增配置；版本保持 `0.1.6`（M132–M134）。
+
+### 46.2 决策与未覆盖
+
+- **D-M26-1 端口而非连接对象**：M131 明确禁止输出指针或可反推进程内存布局的信息。端口数字足以回答「慢请求是否集中在少数连接」，且在并发连接同时存活时唯一。
+- **D-M26-2 未知用 `-`**：`GotConn` 未触发（预算在取得连接前触发、DNS/TCP 失败）时 `localPort` 为零值，两处日志都打印 `conn=-`；`remote` 同样为 `-`。
+- **未覆盖**：端口在连接关闭后可被操作系统复用；本观测不能区分不同时刻复用同一端口的两条连接。M15eh 只要求同时存活的不同连接取值不同。
+- **未覆盖**：HTTP/2 下 `GotConn` 的本地端口是底层 TCP 连接端口，多条逻辑流共享同一值——这正是本条要观测的「是否集中在少数连接」。
+- **未覆盖**：配置了 HTTP 代理时，`LocalAddr` 是到代理的连接端口，不是到上游的端口。
+
+## 47. 第二十六轮：监控页强行取消活跃请求（§24.29 M135–M149）
+
+### 47.1 实现
+
+- **请求级 context**：`serveChain` 在 `trackRequest` 之后派生 `context.WithCancel(r.Context())`，用 `r.WithContext` 替换请求，并把 `cancelRequest` 注册到该请求的 `requestMonitor`；`defer cancelRequest()` 在请求结束时释放。`tryCandidate` 里的上游请求、响应体读取都继承这个 context，因此取消只影响目标请求，不关闭共享的 transport 连接（M137/M138）。
+- **取消入口与生命周期**：`requestMonitor` 在既有 `mu` 下保存 `cancel` 与 `cancelledByOperator`；`setCancel` 注册，`cancelByOperator` 对未结束且有 cancel 的请求置位并调用 cancel，`operatorCancelled` 供转发链查询。`end` 在 `finished=true` 的同一临界区把 `cancel` 置空，保证取消能力只存在于进行中的请求（M137）。
+- **按 id 定位**：`monitorHub.cancelRequest(id)` 在 `activeMu` 下复制 `h.active` 后释放锁，再逐个匹配 id 调用 `cancelByOperator`。复制是必要的：取消会同步结束请求并触发 `removeActive`，持锁调用会死锁。未知/已结束 id 静默返回 false（M136）。
+- **WebSocket 命令**：`monitorClient.readLoop` 新增 `0x1` 文本帧分支，`handleTextCommand` 解析 `{"type":"cancel","id":"..."}`；JSON 非法、type 非 `cancel`、id 为空一律忽略，不写回包、不断开连接。取消本身是非阻塞的（M135/M136）。
+- **取消后的转发链**：
+  - `tryCandidate` 内定义 `recordFailure()`，先查 `operatorCancelled`，命中则跳过 `h.recordFailure`；tryCandidate 内所有实例失败记账都走它（M142）。
+  - `client.Do` 返回错误时优先判取消并返回 `errRequestCancelledByOperator`；非 2xx 错误体读取后、流式 `copySSE` 返回后、非流式 body 复制后都检查取消。
+  - 流式检查放在 `outcome.handoff`、first-token、idle/content-idle、slow 分支**之前**；idle/slow 分支内部再查一次，确保即便定时器与取消同时发生也不会写 `pause_turn` 尾巴（M141）。
+  - `serveChain` 在每次 `tryCandidate` 返回后、候选循环结束后都检查 `operatorCancelled`；命中即调用 `finishCancelled` 并返回，不再尝试后续候选或补漏（M139）。
+- **终止语义（M140/M141/M143/M144）**：`finishCancelled` 按 `committed` 分流：
+  - 未提交：写 502，正文用 `writeProtocolError` 生成该协议的错误格式，文本 `request cancelled by operator`；
+  - 已提交：先打印日志再 `truncateClientConnection(w)` 关闭客户端连接，不追加 `pause_turn`；
+  - 两种路径都记录 `finalStatus`（502 或已提交的上游状态码）与 `finalErr=errRequestCancelledByOperator`，`tracker.end` 照常执行；日志固定为 `request <id> cancelled by operator inst=<名|-> phase=<pre-header|streaming>`，先于任何客户端可见的关闭/写响应，避免客户端先观察到结束而日志尚未落盘。
+- **前端（M145/M146）**：`colgroup`/`thead` 在 `col-timeline` 之后新增 32px 的 `col-cancel`（时间线列是自动剩余宽度，因此从时间线让出 32px，不改其他固定列）；`addMonitorRow` 在时间线后追加 `td.req-cancel`，内含 `×` 按钮，`cancelBtn.hidden = !!req.ended`。仅进行中的行显示按钮；点击后不确认，立即置 `req.cancelSent`、按钮变禁用并显示「已取消」，通过现有 `monitor.ws` 发送文本帧，不自行改行状态，等待既有 `end` 事件收尾。快照恢复的进行中行与实时行共用 `addMonitorRow`，id 不变（M15eq）。
+- 不新增 HTTP 路由、配置项或 WS 事件字段；`/api/stats` 与既有事件结构不变；版本保持 `0.1.6`（M147–M149）。
+
+### 47.2 决策与未覆盖
+
+- **D-M27-1 取消的是 context 而非连接**：这是 §24.29 的核心约束。HTTP/2 下 `Close()` transport 连接会连带其他请求；request context 取消由 Go transport 转为对应 stream 的取消。
+- **D-M27-2 `committed` 判定**：使用 `copySSE` 的 `outcome.committed`（首个数据块写入前调用 commit）。非流式在 `writeResponseHead` 后即视为已提交，取消时同样截断客户端连接。
+- **D-M27-3 日志先于客户端可见动作**：已提交路径先 log 再 hijack/close，未提交路径先 log 再写 502；否则客户端（尤其测试）可能在日志落盘前观察到 EOF/响应，形成竞态。
+- **未覆盖**：M15eo「同一 HTTP/2 连接上的其他请求不受影响」没有直接的 h2+TLS 端到端测试（网关实例 client 使用默认证书校验，测试需自签证书注入），但实现没有关闭 transport 连接，取消只作用于 request context。
+- **未覆盖**：`cancel` 到达时请求已结束（`end` 已置 `finished` 并清空 cancel）会被忽略，符合 M137；此时不会有取消日志。
+- **未覆盖**：WebSocket 文本帧不支持分片（沿用现有 `readClientFrame` 限制）；浏览器正常发送的取消命令是单帧。

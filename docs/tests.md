@@ -1139,3 +1139,65 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 - 诊断用例位于 `internal/proxy/reqshape_diag_internal_test.go`：挂载 `newMonitorHub()` 以断言成功请求不进入 `recentErrors`；会话哈希在测试内用 `sha256` 复算。
 - 既有断言按 M114 改为 `tool_use_msgs`/`paired_msgs`/`unpaired_idx`；`TestReqShapeToolUseWithoutThinking` 等块级标记用例未改语义，仅 redacted 块不再产生标记。
 - 既有 `copySSE` 调用新增 `injectThinking=false` 实参；`flush_internal_test.go` 与 `signature_normalize_internal_test.go` 只做签名适配，断言未改。
+
+## 45. 第二十四轮：预算触发时补打 hdrprof（§24.27 M121–M126）
+
+### 45.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-924 | M15dz 预算触发时补打一行 hdrprof | `TestHeaderBudgetExceeded` | 慢上传 + 实例 timeout 200ms：日志含且仅含 1 行 `hdrprof inst=slow-inst`，含 `connect=`/`tls=`/`upload=`/`server_wait=`/`body_bytes=`/`reused=`/`remote=`/`budget=200ms` |
+| UT-925 | M15ea 补打不受 half-timeout 门槛影响 | `TestHeaderBudgetExceeded` | 请求耗时 ≥200ms（预算到点才返回），`hdrprof` 行仍出现 |
+| UT-926 | M15eb 快速响应头不补打（回归） | `TestHeaderBudgetFastRequestUnaffected`、`TestHeaderProfileSlowHeaders`（快速分支） | 小请求与快速上游均不打印 `hdrprof` |
+| UT-927 | M15ec 错误文本/计数/链路不变（回归） | `TestHeaderBudgetExceeded`、`TestHeaderBudgetFallsThrough` | 错误文本含 `response header budget exceeded after 200ms:`；慢实例失败计数 1；下一候选返回 200、客户端状态码不变 |
+| UT-928 | M15ed 锁定实例不补打（回归） | `TestHeaderBudgetLockedExempt` | 锁定慢实例 600ms 内不返回、无预算错误、无 `hdrprof` |
+| UT-929 | 构建与全量测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` | 全部通过 |
+
+### 45.2 场景说明
+
+- 复用 §44 的 `newSlowUploadListener`、`hbBigBody`、`lxAnthropicInstance`；`TestHeaderBudgetExceeded` 在原有断言上增加 `hdrprof` 行数/字段、错误文本与 `elapsed ≥ timeout` 断言。
+- `TestHeaderBudgetLockedExempt` 增加「无 `hdrprof`」断言；其余既有断言未改。
+
+## 46. 第二十五轮：连接标识观测（§24.28 M127–M134）
+
+### 46.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-930 | M15ee hdrprof 的 conn 与 remote 属于同一连接 | `TestHdrProfConnMatchesConnection` | 300ms 延迟 + 500ms 实例 timeout 触发 hdrprof：行含 `remote=127.0.0.1:<port>`、`conn=<port>`，且 `conn` 等于后端 `r.RemoteAddr` 的客户端端口；响应 200 且字节不变 |
+| UT-931 | M15ef GotConn 未触发时 conn=- | `TestHdrProfConnUnknown` | 零值 `headerProfile` 直接调用 `log`：`conn=-`、`remote=-`、`body_bytes=0`、`reused=0`、`budget=1s`，字段顺序完整，无数字端口 |
+| UT-932 | M15eg stream 行 conn 在 last_gap 后 | `TestStreamPhaseConnField` | `stream ... last_gap=<d> conn=<port>`，`conn` 等于后端看到的客户端端口；客户端字节逐字节不变、`recentErrors` 为空 |
+| UT-933 | M15eh 同连接相同、不同连接不同 | `TestConnIdentityStableAndDistinct` | 同一 handler 连续两次请求 `conn` 相同且后端两次 `RemoteAddr` 端口相同；新 handler 的 `conn` 不同且后端端口不同；conn 与后端端口一一对应 |
+| UT-934 | M15ei 回归：转发与统计不变 | `TestHdrProfConnMatchesConnection`、`TestStreamPhaseConnField`、全量既有测试 | 状态码、响应字节、超时判定、熔断计数与 `/api/stats` 结构未变 |
+| UT-935 | 构建与全量测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` | 全部通过 |
+
+### 46.2 场景说明
+
+- 新用例位于 `internal/proxy/conn_identity_internal_test.go`（`package proxy`）。`connTestBackend` 记录每个请求的 `r.RemoteAddr`，用来证明日志里的 `conn` 就是该连接在服务端看到的客户端端口。
+- hdrprof 用例用 300ms 延迟 + 500ms 实例 timeout 触发 §24.26 M118 的 half-timeout 门槛；stream 用例复用 `thinking_inject_internal_test.go` 的 SSE 构造器与 `newStreamHandler`/`doStreamRequest`/`captureStreamLogs`。
+- `TestConnIdentityStableAndDistinct` 通过同一 handler（同一 Transport）与新 handler（新 Transport）验证连接复用与区分；端口复用跨时间的情形无法稳定构造，未覆盖。
+- 既有 `TestHeaderProfileSlowHeaders`、`TestHeaderBudgetExceeded` 的字段断言不含 `conn`，新增字段不影响；`TestStreamPhaseSummaryOncePerStream` 只校验 `last_gap=` 之前的字段顺序。
+
+## 47. 第二十六轮：监控页强行取消活跃请求（§24.29 M135–M149）
+
+### 47.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-936 | M15ej/M15eq 前端取消列与按钮 | `TestMonitorCancelUI` | `index.html` 的 `colgroup` 在 `col-timeline` 后含 `col-cancel`，thead 有对应空表头；行构造在时间线后追加 `cancelCell`；仅未结束行显示 `×`，快照/已结束行隐藏；点击发送 `{"type":"cancel","id":...}` 文本帧并显示「已取消」 |
+| UT-937 | M15ek 响应头未提交时取消 → 502 | `TestOperatorCancelPreHeader` | 慢上游（不返回响应头）取消后客户端收到 502，正文含 `request cancelled by operator` |
+| UT-938 | M15el 已提交流取消 → 截断且无 pause_turn | `TestOperatorCancelCommittedStream` | 上游先发 SSE 头与内容后挂起；取消后客户端读到连接错误、状态 200、body 不含 `pause_turn` |
+| UT-939 | M15em 取消后不再发起后续候选 | `TestOperatorCancelPreHeader` | 取消后第二个实例调用计数为 0，无补漏尝试 |
+| UT-940 | M15en 取消不计入实例失败 | `TestOperatorCancelPreHeader`、`TestOperatorCancelCommittedStream` | 目标实例 `consecutiveFailures=0`、`degradedUntil` 为零 |
+| UT-941 | M15eo 同一连接其他请求不受影响 | 设计保证（见 design §47.2） | 取消只作用于 request context，不 Close transport 连接；未做 h2+TLS 端到端用例 |
+| UT-942 | M15ep 未知 id 与非法命令被忽略 | `TestMonitorCancelWebSocketCommands` | 非法 JSON/缺失字段/未知 type 后 ping 仍收到 pong；未知 id 不终止活动请求；随后正确 id 仍可取消 |
+| UT-943 | M15eq 快照恢复行的取消能力 | `TestMonitorCancelUI` | 快照行与实时行共用 `addMonitorRow`，id 不变，未结束行按钮可见 |
+| UT-944 | M15er 取消日志格式与唯一性 | `TestOperatorCancelPreHeader`、`TestOperatorCancelCommittedStream` | 每个请求恰好一行 `request <id> cancelled by operator inst=<名> phase=<pre-header\|streaming>`；日志先于客户端可见的关闭/502 |
+| UT-945 | M15es 回归：不点取消时行为不变 | `go test ./... -race -count=1` 全量既有用例 | 转发字节、超时、熔断、`/api/stats` 与 WS 事件结构未变 |
+
+### 47.2 场景说明
+
+- 新增用例位于 `internal/proxy/operator_cancel_internal_test.go`（`package proxy`）。`blockedHeaderBackend` 读取请求体后挂起不返回响应头；`waitActiveID` 轮询 `hub.active` 取当前请求 id；取消通过 `hub.cancelRequest(id)` 或 WebSocket 文本帧触发。
+- `TestMonitorCancelWebSocketCommands` 直接以 `hub.serveWS` 启动 WS 端，使用一个最小 RFC 6455 客户端完成握手、带掩码文本/控制帧发送与服务器帧读取；非法命令后用 ping/pong 证明连接未断。
+- `TestOperatorCancelCommittedStream` 的上游先写 `message_start`+text 事件并 flush，再阻塞；取消后断言客户端读取错误、状态码仍为已提交的 200、body 中无 `pause_turn`。
+- `TestMonitorCancelUI` 读取 `../web/index.html` 做静态契约断言（列位置、按钮文案、隐藏条件、WS 文本帧内容）；项目暂无浏览器自动化测试。

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"cmp"
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
@@ -346,6 +347,8 @@ func (c *monitorClient) readLoop() {
 			return
 		}
 		switch opcode {
+		case 0x1: // text command (§24.29 M135)
+			c.handleTextCommand(payload)
 		case 0x8: // close
 			_ = c.writeFrame(0x8, payload)
 			return
@@ -355,6 +358,23 @@ func (c *monitorClient) readLoop() {
 			}
 		}
 	}
+}
+
+// handleTextCommand parses one browser command. Malformed payloads, unknown
+// types and empty ids are ignored without dropping the connection (§24.29
+// M136); cancellation itself is non-blocking.
+func (c *monitorClient) handleTextCommand(payload []byte) {
+	var command struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+	}
+	if err := json.Unmarshal(payload, &command); err != nil {
+		return
+	}
+	if command.Type != "cancel" || command.ID == "" {
+		return
+	}
+	c.hub.cancelRequest(command.ID)
 }
 
 func (c *monitorClient) writeFrame(opcode byte, payload []byte) error {
@@ -695,6 +715,68 @@ type requestMonitor struct {
 	cumTokens     int
 	firstChunkAt  time.Time
 	lastChunkAt   time.Time
+	// §24.29 M137: cancel is registered for the request lifetime and cleared by
+	// end, so only in-progress requests can be cancelled.
+	cancel              context.CancelFunc
+	cancelledByOperator bool
+}
+
+// setCancel registers the per-request cancel entry (§24.29 M137).
+func (m *requestMonitor) setCancel(cancel context.CancelFunc) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.cancel = cancel
+	m.mu.Unlock()
+}
+
+// cancelByOperator cancels the request once and reports whether this call was
+// the one that did it. Finished requests and repeated cancels are ignored.
+func (m *requestMonitor) cancelByOperator() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	if m.finished || m.cancel == nil {
+		m.mu.Unlock()
+		return false
+	}
+	cancel := m.cancel
+	m.cancelledByOperator = true
+	m.mu.Unlock()
+	cancel()
+	return true
+}
+
+// operatorCancelled reports whether an operator cancelled this request.
+func (m *requestMonitor) operatorCancelled() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cancelledByOperator
+}
+
+// cancelRequest finds an in-progress request by id and cancels it (§24.29
+// M136). Unknown or finished ids are silently ignored. The active slice is
+// copied before calling cancel: cancellation can synchronously finish the
+// request and take activeMu through removeActive.
+func (h *monitorHub) cancelRequest(id string) bool {
+	if h == nil || id == "" {
+		return false
+	}
+	h.activeMu.Lock()
+	active := make([]*requestMonitor, len(h.active))
+	copy(active, h.active)
+	h.activeMu.Unlock()
+	for _, monitor := range active {
+		if monitor.id == id {
+			return monitor.cancelByOperator()
+		}
+	}
+	return false
 }
 
 // trackRequest always returns a tracker so cumulative statistics and the recent
@@ -934,6 +1016,8 @@ func (m *requestMonitor) end(status int, err error, metrics attemptMetrics) {
 		tps = math.Round(float64(outTokens)*1000/float64(genMs)*10) / 10
 	}
 	m.finished = true
+	// §24.29 M137: the cancel entry exists only while the request is active.
+	m.cancel = nil
 	snapshot := monitorRequestSnapshot{
 		ID:            m.id,
 		TS:            m.start.UnixMilli(),

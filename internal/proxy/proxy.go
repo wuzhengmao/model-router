@@ -91,6 +91,10 @@ const (
 // to route the request back to the locked instance.
 var errLockedHandoff = errors.New("handoff to locked instance")
 
+// errRequestCancelledByOperator marks a request terminated from the monitor
+// page (§24.29). It is never treated as an upstream failure.
+var errRequestCancelledByOperator = errors.New("request cancelled by operator")
+
 // instanceRuntime is one configured instance plus its in-memory fallback state.
 type instanceRuntime struct {
 	name         string
@@ -1023,9 +1027,40 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 	}
 
 	tracker := h.monitor.trackRequest(r, proto, reqModel)
+	// §24.29 M137: derive a request-scoped cancellable context. Every upstream
+	// attempt inherits it, so an operator cancel interrupts in-flight header
+	// waits and body reads without touching the shared transport connection.
+	ctx, cancelRequest := context.WithCancel(r.Context())
+	r = r.WithContext(ctx)
+	tracker.setCancel(cancelRequest)
+	defer cancelRequest()
+
 	finalStatus := 0
 	var finalMetrics attemptMetrics
 	var finalErr error
+	// §24.29 M139–M144: cancellation stops the chain, skips breaker accounting
+	// and maps to 502 (pre-header) or a truncated connection (committed).
+	finishCancelled := func(committed bool, status int, m attemptMetrics) {
+		m.reqModel = reqModel
+		finalMetrics = m
+		finalErr = errRequestCancelledByOperator
+		inst := m.instName
+		if inst == "" {
+			inst = "-"
+		}
+		if committed {
+			finalStatus = status
+			// Log before closing the client connection: the client observes the
+			// truncation immediately, and the reason line must not race it.
+			log.Printf("request %s cancelled by operator inst=%s phase=streaming", tracker.id, inst)
+			truncateClientConnection(w)
+		} else {
+			finalStatus = http.StatusBadGateway
+			log.Printf("request %s cancelled by operator inst=%s phase=pre-header", tracker.id, inst)
+			writeProtocolError(w, proto, http.StatusBadGateway, errRequestCancelledByOperator.Error())
+		}
+		logRequest(r, m, time.Since(start))
+	}
 	// §24.22 M63/M69 and §24.26 M115/M116: the summary is computed for failed
 	// requests and for requests that carry tool_use. A successful request only
 	// gets the log line; reqShape is written to stats on failure alone (M119).
@@ -1062,6 +1097,12 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		handoffBeforeContent := lockedMode && !lockedExempt
 		tracker.begin(cand)
 		committed, status, metrics, err := h.tryCandidate(w, r, proto, cand, body, tracker, lockedExempt, handoffBeforeContent)
+		// §24.29 M139: an operator cancel terminates the request immediately;
+		// no later candidate or §24.21 fallback round may start.
+		if tracker.operatorCancelled() {
+			finishCancelled(committed, status, metrics)
+			return
+		}
 		if committed {
 			if err != nil {
 				log.Printf("%s %s response committed with error: %v", r.Method, r.URL.Path, err)
@@ -1103,6 +1144,10 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		handoffUsed = true
 		tracker.begin(lockedCand)
 		committed, status, metrics, err := h.tryCandidate(w, r, proto, lockedCand, body, tracker, true, false)
+		if tracker.operatorCancelled() {
+			finishCancelled(committed, status, metrics)
+			return
+		}
 		if committed {
 			if err != nil {
 				log.Printf("%s %s response committed with error: %v", r.Method, r.URL.Path, err)
@@ -1119,6 +1164,13 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		if errors.As(err, &upstream) {
 			lastUpstream, lastUpstreamCand, lastUpstreamMetrics = upstream, lockedCand, metrics
 		}
+	}
+
+	// §24.29 M139: a cancel between the last attempt and the final response
+	// must still terminate without forwarding a candidate response.
+	if tracker.operatorCancelled() {
+		finishCancelled(false, 0, finalMetrics)
+		return
 	}
 
 	if lastUpstream != nil && lastUpstreamCand != nil {
@@ -1637,6 +1689,14 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	m.instName = cand.inst.name
 	m.model = cand.model
 	m.hasModel = true
+	// §24.29 M142: an operator cancel is not an upstream failure and must not
+	// touch the breaker, even when a timer/error path also fires.
+	recordFailure := func() {
+		if tracker.operatorCancelled() {
+			return
+		}
+		h.recordFailure(cand.inst)
+	}
 	attemptBody := body
 	if cand.rewrite {
 		attemptBody = rewriteModel(body, cand.model)
@@ -1644,7 +1704,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 
 	target, err := url.JoinPath(cand.inst.baseURL.String(), upstreamPath(r.URL.Path))
 	if err != nil {
-		h.recordFailure(cand.inst)
+		recordFailure()
 		return false, 0, m, fmt.Errorf("join upstream URL: %w", err)
 	}
 	if r.URL.RawQuery != "" {
@@ -1680,7 +1740,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 
 	outReq, err := http.NewRequestWithContext(requestCtx, r.Method, target, bytes.NewReader(attemptBody))
 	if err != nil {
-		h.recordFailure(cand.inst)
+		recordFailure()
 		return false, 0, m, fmt.Errorf("build upstream request: %w", err)
 	}
 	outReq.ContentLength = int64(len(attemptBody))
@@ -1713,8 +1773,17 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	}
 	budgetHit := budgetFired.Load()
 	if err != nil {
-		h.recordFailure(cand.inst)
+		// §24.29: an operator cancel wins over budget/upstream errors and never
+		// counts as an instance failure.
+		if tracker.operatorCancelled() {
+			return false, 0, m, errRequestCancelledByOperator
+		}
+		recordFailure()
 		if budgetHit {
+			// §24.27 M121/M122: the budget fired exactly when the diagnostic is
+			// needed. Use the trigger moment as the observation point so hdr is
+			// about the instance timeout and passes M118's half-timeout gate.
+			trace.log(cand.inst.name, attemptStart, time.Now(), cand.inst.timeout, len(attemptBody), budget)
 			// §24.26 M111: the pre-header budget fired before any response.
 			return false, 0, m, fmt.Errorf("response header budget exceeded after %s: %w", formatProfileDuration(budget), err)
 		}
@@ -1730,8 +1799,13 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	// may move on; if this turns out to be the last opportunity, serveChain
 	// forwards the buffered response verbatim (M52).
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		h.recordFailure(cand.inst)
 		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorBodyLimit+1))
+		// §24.29 M142: a cancel during the error-body read is still not an
+		// upstream failure.
+		if tracker.operatorCancelled() {
+			return false, resp.StatusCode, m, errRequestCancelledByOperator
+		}
+		recordFailure()
 		if readErr != nil {
 			return false, 0, m, fmt.Errorf("read upstream status %d body: %w", resp.StatusCode, readErr)
 		}
@@ -1761,7 +1835,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 		// first_token_timeout still covers a silent upstream.
 		gz, gzErr := newGzipBody(resp.Body, streaming)
 		if gzErr != nil {
-			h.recordFailure(cand.inst)
+			recordFailure()
 			return false, 0, m, fmt.Errorf("decompress upstream gzip body: %w", gzErr)
 		}
 		respBody = gz
@@ -1805,7 +1879,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 			proto == protocolAnthropic && parseable, proto == protocolAnthropic && parseable,
 			lockedExempt, handoffBeforeContent, writeResponseHead, tracker)
 		// §24.23 M76: exactly one stage summary per streaming attempt.
-		logStreamPhases(cand.inst.name, headersAt.Sub(attemptStart), outcome)
+		logStreamPhases(cand.inst.name, headersAt.Sub(attemptStart), outcome, trace.connID())
 		// §24.26 M117: response shape sits next to the stage summary.
 		injected := 0
 		if outcome.injected {
@@ -1813,23 +1887,35 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 		}
 		log.Printf("resp_shape thinking_blocks=%d tool_use_blocks=%d signature_empty=%d injected=%d",
 			outcome.thinkingBlocks, outcome.toolUseBlocks, outcome.signatureEmpty, injected)
+		// §24.29 M141: cancellation is checked before the idle/slow branches so
+		// a concurrent content-idle timer cannot append a pause_turn tail. The
+		// committed state decides whether serveChain truncates or returns 502.
+		if tracker.operatorCancelled() {
+			if outcome.committed {
+				return true, resp.StatusCode, m, errRequestCancelledByOperator
+			}
+			return false, 0, m, errRequestCancelledByOperator
+		}
 		if outcome.handoff {
 			// §24.25 M94b: the aborted non-locked attempt counts as a failure
 			// (M92 exempts only the locked instance).
-			h.recordFailure(cand.inst)
+			recordFailure()
 			return false, 0, m, errLockedHandoff
 		}
 		if outcome.firstTokenTimeout {
 			log.Printf("instance %s timeout: first-token for %s; stream terminated", cand.inst.name, h.firstTokenTimeout)
-			h.recordFailure(cand.inst)
+			recordFailure()
 			return false, 0, m, &attemptFailure{
 				reason: retryReasonFirstTokenTimeout,
 				err:    fmt.Errorf("first token timeout after %s", h.firstTokenTimeout),
 			}
 		}
 		if !outcome.committed {
+			if tracker.operatorCancelled() {
+				return false, 0, m, errRequestCancelledByOperator
+			}
 			if streamErr != nil {
-				h.recordFailure(cand.inst)
+				recordFailure()
 				return false, 0, m, fmt.Errorf("read stream: %w", streamErr)
 			}
 			// Empty stream: commit the (empty) response and treat as success.
@@ -1846,12 +1932,17 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 		m.outTokens, m.hasOut = outcome.state.tokens, outcome.state.hasTokens
 
 		if outcome.idle || outcome.contentIdle {
+			// §24.29 M141: even if a timer won the race, an operator cancel must
+			// not append the pause_turn tail.
+			if tracker.operatorCancelled() {
+				return true, resp.StatusCode, m, errRequestCancelledByOperator
+			}
 			// §24.23 M73: the content-idle verdict shares this branch verbatim,
 			// so the client-visible bytes match an idle_timeout exactly.
 			// Record and log before truncating: an OpenAI truncation closes the
 			// client connection immediately, and the reason line must not race
 			// the client's EOF.
-			h.recordFailure(cand.inst)
+			recordFailure()
 			if outcome.contentIdle {
 				log.Printf("instance %s timeout: content-idle for %s (no content block); stream terminated", cand.inst.name, cand.inst.timeout)
 			} else {
@@ -1867,9 +1958,13 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 			return true, resp.StatusCode, m, nil
 		}
 		if outcome.slow {
+			// §24.29 M141: same guard for the slow-stream pause_turn tail.
+			if tracker.operatorCancelled() {
+				return true, resp.StatusCode, m, errRequestCancelledByOperator
+			}
 			// §19 real-time low throughput: the verdict already implies a failed
 			// attempt, so the post-hoc throughput judgement is skipped.
-			h.recordFailure(cand.inst)
+			recordFailure()
 			log.Printf("instance %s slow stream (realtime): %.0fB/s", cand.inst.name, outcome.slowBytesPerSecond)
 			log.Printf("instance %s timeout: slow for %.0fB/s (min %st/s); stream %s", cand.inst.name,
 				outcome.slowBytesPerSecond, formatTPS(h.minTokensPerSecond), slowStreamState(proto))
@@ -1881,11 +1976,11 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 			return true, resp.StatusCode, m, nil
 		}
 		if streamErr != nil {
-			h.recordFailure(cand.inst)
+			recordFailure()
 			return true, resp.StatusCode, m, fmt.Errorf("copy response body: %w", streamErr)
 		}
 		if !lockedExempt && h.judgeThroughput(&m) {
-			h.recordFailure(cand.inst)
+			recordFailure()
 			log.Printf("instance %s slow stream: %st/s", cand.inst.name, formatTPS(m.genTPS))
 		} else {
 			h.recordSuccess(cand.inst)
@@ -1912,11 +2007,17 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	}
 
 	if copyErr != nil {
-		h.recordFailure(cand.inst)
+		if tracker.operatorCancelled() {
+			return true, resp.StatusCode, m, errRequestCancelledByOperator
+		}
+		recordFailure()
 		return true, resp.StatusCode, m, fmt.Errorf("copy response body: %w", copyErr)
 	}
+	if tracker.operatorCancelled() {
+		return true, resp.StatusCode, m, errRequestCancelledByOperator
+	}
 	if !lockedExempt && h.judgeThroughput(&m) {
-		h.recordFailure(cand.inst)
+		recordFailure()
 		log.Printf("instance %s slow: %st/s", cand.inst.name, formatTPS(m.genTPS))
 	} else {
 		h.recordSuccess(cand.inst)
@@ -2661,7 +2762,7 @@ func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, first
 
 // §24.23 M76: one stage-summary line per streaming attempt, fixed field order.
 // Unreached phases print "-". The line is log-only and never feeds statistics.
-func logStreamPhases(instName string, hdr time.Duration, outcome sseOutcome) {
+func logStreamPhases(instName string, hdr time.Duration, outcome sseOutcome, conn string) {
 	firstBlock, firstContent, lastGap := "-", "-", "-"
 	if outcome.blockCount > 0 {
 		firstBlock = formatStreamPhase(outcome.firstBlockDelay)
@@ -2670,9 +2771,9 @@ func logStreamPhases(instName string, hdr time.Duration, outcome sseOutcome) {
 	if outcome.contentCount > 0 {
 		firstContent = formatStreamPhase(outcome.firstContentDelay)
 	}
-	log.Printf("stream %s hdr=%s first_block=%s first_content=%s blocks=%d pings=%d content=%d last_gap=%s",
+	log.Printf("stream %s hdr=%s first_block=%s first_content=%s blocks=%d pings=%d content=%d last_gap=%s conn=%s",
 		instName, formatStreamPhase(hdr), firstBlock, firstContent,
-		outcome.blockCount, outcome.pingCount, outcome.contentCount, lastGap)
+		outcome.blockCount, outcome.pingCount, outcome.contentCount, lastGap, conn)
 }
 
 // formatStreamPhase renders a phase duration with the sample's precision:

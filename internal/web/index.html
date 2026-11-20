@@ -375,6 +375,34 @@
   .req-table .col-chunks { width: 40px; }
   .req-table .col-duration, .req-table .col-ttft { width: 60px; }
   .req-table .col-tps { width: 52px; }
+  .req-table .col-cancel { width: 32px; }
+  .req-table td.req-cancel { text-align: center; padding: 0 2px; }
+  .req-cancel-btn {
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .req-cancel-btn:hover {
+    color: var(--danger);
+    border-color: var(--border);
+    background: var(--panel-2);
+  }
+  .req-cancel-btn:disabled {
+    width: 32px;
+    color: var(--muted);
+    opacity: .55;
+    cursor: default;
+    font-size: 11px;
+  }
+  .req-cancel-btn[hidden] { display: none; }
   .req-table td.req-idx { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
   /* 两行文本必须完整落在单元格内：32px 行高 + 宽松行高，且不靠 overflow:hidden 裁切。 */
   .req-table td.req-path, .req-table td.req-route {
@@ -766,6 +794,7 @@
             <col class="col-ttft">
             <col class="col-tps">
             <col class="col-timeline">
+            <col class="col-cancel">
           </colgroup>
           <thead>
             <tr>
@@ -792,6 +821,7 @@
                 </div>
                 <div id="monitor-axis" class="row-axis"></div>
               </th>
+              <th class="col-cancel"></th>
             </tr>
           </thead>
           <tbody id="monitor-rows"></tbody>
@@ -2326,6 +2356,16 @@
       formatDuration(req.ended ? req.durationMs : (req.baseDurationMs || 0) + (Date.now() - req.recvAt)));
     setMonitorCellText(req.cells.ttft, monitorTTFT(req) ? formatDuration(monitorTTFT(req)) : '–');
     setMonitorCellText(req.cells.tps, formatRate(req.tps));
+
+    if (req.cells.cancelBtn) {
+      if (req.ended) {
+        req.cells.cancelBtn.hidden = true;
+      } else {
+        req.cells.cancelBtn.hidden = false;
+        req.cells.cancelBtn.disabled = !!req.cancelSent;
+        req.cells.cancelBtn.textContent = req.cancelSent ? '已取消' : '×';
+      }
+    }
   }
 
   function addMonitorRow(req, append) {
@@ -2345,6 +2385,28 @@
     timelineEl.appendChild(waitEl);
     timelineCell.appendChild(timelineEl);
 
+    var cancelCell = document.createElement('td');
+    cancelCell.className = 'req-cancel';
+    var cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'req-cancel-btn';
+    cancelBtn.textContent = '×';
+    cancelBtn.title = '取消请求';
+    cancelBtn.hidden = !!req.ended;
+    cancelBtn.addEventListener('click', function () {
+      if (req.ended || req.cancelSent) {
+        return;
+      }
+      req.cancelSent = true;
+      cancelBtn.disabled = true;
+      cancelBtn.textContent = '已取消';
+      var socket = monitor.ws;
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'cancel', id: req.id }));
+      }
+    });
+    cancelCell.appendChild(cancelBtn);
+
     var cells = {
       index: monitorCell('', 'num req-idx'),
       status: monitorCell('', 'req-status'),
@@ -2363,9 +2425,10 @@
       duration: monitorCell('–', 'num'),
       ttft: monitorCell('–', 'num'),
       tps: monitorCell('–', 'num'),
+      cancelBtn: cancelBtn,
     };
     [cells.index, cells.status, cells.method, cells.client, cells.route, cells.inTokens,
-      cells.outTokens, cells.chunks, cells.duration, cells.ttft, cells.tps, timelineCell]
+      cells.outTokens, cells.chunks, cells.duration, cells.ttft, cells.tps, timelineCell, cancelCell]
       .forEach(function (cell) {
         row.appendChild(cell);
       });

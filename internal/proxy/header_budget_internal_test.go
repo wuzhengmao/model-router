@@ -60,8 +60,9 @@ func hbBigBody(t *testing.T, size int) string {
 		strings.Repeat("x", size) + `"}]}]}`
 }
 
-// TestHeaderBudgetExceeded covers M15dq: a slow upload is cut at the instance
-// timeout with the dedicated error text.
+// TestHeaderBudgetExceeded covers M15dq and M15dz/M15ea/M15ec: a slow upload is
+// cut at the instance timeout, the dedicated error text is kept, and a
+// hdrprof line is emitted at the trigger moment.
 func TestHeaderBudgetExceeded(t *testing.T) {
 	slow := newSlowUploadListener(t)
 	handler := newStreamHandler(t, Options{
@@ -81,11 +82,30 @@ func TestHeaderBudgetExceeded(t *testing.T) {
 	if status != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502 (single candidate budget failure)", status)
 	}
+	if elapsed < 200*time.Millisecond {
+		t.Errorf("request finished after %s, want the 200ms budget to fire", elapsed)
+	}
 	if elapsed > 5*time.Second {
 		t.Errorf("request took %s, want the 200ms budget to fire", elapsed)
 	}
-	if out := logs(); !strings.Contains(out, "response header budget exceeded") {
-		t.Errorf("missing budget error:\n%s", out)
+	out := logs()
+	if !strings.Contains(out, "response header budget exceeded after 200ms:") {
+		t.Errorf("missing/incorrect budget error:\n%s", out)
+	}
+	if got := strings.Count(out, "hdrprof inst=slow-inst"); got != 1 {
+		t.Errorf("hdrprof lines = %d, want exactly 1:\n%s", got, out)
+	}
+	var profile string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "hdrprof inst=slow-inst") {
+			profile = line
+			break
+		}
+	}
+	for _, field := range []string{"connect=", "tls=", "upload=", "server_wait=", "body_bytes=", "reused=", "remote=", "budget=200ms"} {
+		if !strings.Contains(profile, field) {
+			t.Errorf("hdrprof missing %q: %s", field, profile)
+		}
 	}
 	if failures := streamInstanceFailures(handler, protocolAnthropic, 0); failures != 1 {
 		t.Errorf("failures = %d, want 1", failures)
@@ -133,6 +153,8 @@ func TestHeaderBudgetLockedExempt(t *testing.T) {
 	}
 	if out := logs(); strings.Contains(out, "response header budget exceeded") {
 		t.Errorf("locked instance was budgeted:\n%s", out)
+	} else if strings.Contains(out, "hdrprof") {
+		t.Errorf("locked instance printed hdrprof:\n%s", out)
 	}
 }
 

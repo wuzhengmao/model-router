@@ -4,14 +4,11 @@
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-20
+
 ### Changed
 
 - `docker-compose.yml` 与 `docker-compose.named.yml` 的镜像标签由固定版本号统一改为 `wuzm219/model-router:latest`，避免 compose 文件里的版本号落后于实际发布版本（此前仍停在 `0.1.1`）。
-
-## [0.1.6] - 2026-11-18
-
-### Changed
-
 - 上游非 2xx 按状态码分类处置（§24.20 M49–M55）：`tryCandidate` 在响应头提交前先判定状态码，`<200` 或 `>=300` 视为候选失败并 `recordFailure`，请求按既有链路换下一个候选；候选耗尽时原样转发最后一次上游响应的状态码与响应体，不再改写成 502。错误文本固定为 `upstream status <code>: <body prefix>`（保证非空），`/api/stats` 的 `recentErrors[]` 新增 `upstreamBody`（响应体前 200 字符），WS `end` 事件同步携带；实时监控重试原因新增 `upstream_status`。本地生成的响应（models 列表、管理面、鉴权失败等）不经过该分类。
 - 全候选失败后的补漏尝试与错误透传（§24.21 M56–M62）：首轮（候选链按 §24.17–§24.19 规则走完）失败后，按配置顺序对本次请求尚未调用过的协议实例各补试一次，模型名一律使用该实例自己的映射（Anthropic `roles`、OpenAI `models`），不再用客户端原始模型名重跑；无可用映射的实例跳过。补漏尝试的重试原因为 `fallback_retry`，失败/成功照常 `recordFailure`/`recordSuccess`；按实例去重，一次请求最多真实调用 `len(insts)` 次，首轮已覆盖全部实例时不产生补漏。全部失败时若拿到过真实非 2xx 上游响应则透传最后一条，全部停在连接失败/超时才返回 502。锁定协议保持只打被锁定实例。
 - 测试同步：新增 `internal/proxy/upstream_fallback_internal_test.go`，覆盖 M15ba–M15bf、M15bh–M15bm；`docs/design.md` 新增 §38/§39，`docs/tests.md` 新增 §38（UT-850～UT-857）与 §39（UT-858～UT-864）。
@@ -27,6 +24,12 @@
 - 响应头前总预算（§24.26 M110–M113）：非锁定实例的每次上游尝试增加「从 attemptStart 到 client.Do() 返回」的预算（等于实例 timeout），用可停止的 timer + 可取消 context 实现，覆盖连接获取、h2 流控/槽位等待与 body 上传；拿到响应头后停表、不取消请求上下文，避免杀死 SSE 流。超时返回 `response header budget exceeded after <d>`，走既有 recordFailure/换候选路径；锁定实例完全不设预算（§24.25 M95 不变）。
 - 诊断埋点（§24.26 M114–M120）：`reqShape` 统计段改为 `tool_use_msgs`/`paired_msgs`/`unpaired_idx`（redacted_thinking 计入 paired，未配对索引最多 10 个、超出加 `+`）；失败或请求含 tool_use 时计算摘要，成功请求只打印 `reqshape msgs=... tool_use_msgs=... paired_msgs=... unpaired_idx=... thinking=... last=... session=<sha256 前 8 位>`，不进入 `recentErrors`。每个流式尝试打印 `resp_shape thinking_blocks=... tool_use_blocks=... signature_empty=... injected=...`；`hdr` 超过实例 timeout 一半时打印 `hdrprof`（connect/tls/upload/server_wait/body_bytes/reused/remote/budget，httptrace 采集）。所有日志只写进程日志，不改 `/api/stats` 与 WS 事件结构；版本保持 `0.1.6`。
 - 测试同步：新增 `internal/proxy/thinking_inject_internal_test.go`、`internal/proxy/header_budget_internal_test.go`、`internal/proxy/reqshape_diag_internal_test.go` 覆盖 M15dh–M15dy；既有 reqShape 断言按新字段名更新；`copySSE` 调用新增 `injectThinking` 实参（既有用例只做签名适配，断言未改）；`docs/design.md` 新增 §44，`docs/tests.md` 新增 §44（UT-907～UT-923）。
+- 响应头预算触发时补打 `hdrprof`（§24.27 M121–M126）：`client.Do` 因预算超时返回错误时，在返回前以触发时刻为观测点补打一行字段与 §24.26 M118 完全一致的 `hdrprof`，使 `hdr` 约为实例 `timeout` 并通过「超过 timeout 一半」门槛；正常拿到响应头的路径仍按原门槛判定，锁定实例无预算故不补打。补打只写日志，错误文本、熔断计数、重试链与转发字节不变；版本保持 `0.1.6`。
+- 测试同步：扩展 `internal/proxy/header_budget_internal_test.go` 的 `TestHeaderBudgetExceeded`（hdrprof 行/字段、错误文本、耗时下界）与 `TestHeaderBudgetLockedExempt`（无 hdrprof）；`docs/design.md` 新增 §45，`docs/tests.md` 新增 §45（UT-924～UT-929）。
+- 连接标识观测（§24.28 M127–M134）：`hdrprof` 行在 `remote=` 与 `budget=` 之间新增 `conn=<本地端口|->`；`stream` 阶段摘要在 `last_gap=` 之后新增 `conn=<本地端口|->`。端口取自 `httptrace.GotConnInfo.Conn.LocalAddr()`，`GotConn` 未触发时为 `-`；只输出端口数字，不含 IP、指针或连接对象信息，两处日志共用 `headerProfile.connID()`。只改日志，转发字节、超时判定、熔断计数、重试链、`/api/stats` 与 WS 事件均不变；版本保持 `0.1.6`。
+- 测试同步：新增 `internal/proxy/conn_identity_internal_test.go` 覆盖 M15ee–M15ei；`docs/design.md` 新增 §46，`docs/tests.md` 新增 §46（UT-930～UT-935）。
+- 监控页强行取消活跃请求（§24.29 M135–M149）：监控页活跃请求行尾新增 `×` 按钮，点击后通过既有 `/api/ws` 发送文本帧 `{"type":"cancel","id":"..."}`；服务端按请求 id 取消该请求的 request context（不关闭 transport 连接），立即终止上游响应头等待或响应体传输，不再尝试后续候选/补漏。响应头未提交时返回 502 `request cancelled by operator`；已提交时直接关闭客户端连接且不写 `pause_turn`。取消不计入实例失败/熔断，`end` 统计照常收尾，日志固定为 `request <id> cancelled by operator inst=<名|-> phase=<pre-header|streaming>`（每请求最多一行）。前端仅在活跃行显示按钮，点击后禁用并显示「已取消」，等待既有 `end` 事件收尾；未新增 HTTP 路由、配置项或统计/WS 字段，版本保持 `0.1.6`。
+- 测试同步：新增 `internal/proxy/operator_cancel_internal_test.go` 覆盖 M15ej–M15es（含 WS 文本帧解析、未知 id、已提交流截断无 pause_turn、取消日志与前端静态断言）；`docs/design.md` 新增 §47，`docs/tests.md` 新增 §47（UT-936～UT-945）。
 
 ## [0.1.5] - 2026-11-17
 

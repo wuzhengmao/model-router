@@ -3,7 +3,9 @@ package proxy
 import (
 	"crypto/tls"
 	"log"
+	"net"
 	"net/http/httptrace"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -20,6 +22,8 @@ type headerProfile struct {
 	firstByteAt    time.Time
 	reused         bool
 	remote         string
+	// §24.28 M128: local port of the connection, 0 when GotConn never fired.
+	localPort int
 }
 
 func (p *headerProfile) trace() *httptrace.ClientTrace {
@@ -62,7 +66,12 @@ func (p *headerProfile) trace() *httptrace.ClientTrace {
 			p.mu.Lock()
 			p.reused = info.Reused
 			if info.Conn != nil {
-				p.remote = info.Conn.RemoteAddr().String()
+				if remote := info.Conn.RemoteAddr(); remote != nil {
+					p.remote = remote.String()
+				}
+				if addr, ok := info.Conn.LocalAddr().(*net.TCPAddr); ok && addr != nil {
+					p.localPort = addr.Port
+				}
 			}
 			p.mu.Unlock()
 		},
@@ -103,8 +112,24 @@ func (p *headerProfile) log(instName string, attemptStart, headersAt time.Time, 
 	if remote == "" {
 		remote = "-"
 	}
-	log.Printf("hdrprof inst=%s connect=%s tls=%s upload=%s server_wait=%s body_bytes=%d reused=%d remote=%s budget=%s",
-		instName, connect, tlsPart, upload, serverWait, bodyBytes, reused, remote, formatProfileDuration(budget))
+	log.Printf("hdrprof inst=%s connect=%s tls=%s upload=%s server_wait=%s body_bytes=%d reused=%d remote=%s conn=%s budget=%s",
+		instName, connect, tlsPart, upload, serverWait, bodyBytes, reused, remote, p.connLabel(), formatProfileDuration(budget))
+}
+
+// connID returns the §24.28 connection identifier. It is safe to call from the
+// logging paths; the lock is held only for the field read.
+func (p *headerProfile) connID() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.connLabel()
+}
+
+// connLabel formats the local port while p.mu is already held.
+func (p *headerProfile) connLabel() string {
+	if p.localPort <= 0 {
+		return "-"
+	}
+	return strconv.Itoa(p.localPort)
 }
 
 func formatProfileDuration(d time.Duration) string {
