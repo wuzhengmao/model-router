@@ -4,7 +4,7 @@
 
 模型智能路由（`model-router`）是 OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理透传。
 
-> 当前版本：`0.1.6`（上游非 2xx 分类处置、全候选失败后的补漏与原样错误透传、失败请求体取证、流式无内容超时、空签名归一化、锁定实例超时豁免与无内容转交、缺 thinking 补位、响应头前总预算与 hdr/conn 诊断埋点、监控页运维取消请求）
+> 当前版本：`0.1.7`（MiniMax 国内供应商预设、上游非 2xx 分类处置、全候选失败后的补漏与原样错误透传、失败请求体取证、流式无内容超时、空签名归一化、锁定实例超时豁免与无内容转交、缺 thinking 补位、响应头前总预算与 hdr/conn 诊断埋点、监控页运维取消请求）
 > 需求：[docs/requirements.md](docs/requirements.md) ｜ 设计：[docs/design.md](docs/design.md) ｜ 测试：[docs/tests.md](docs/tests.md) ｜ 变更：[CHANGELOG.md](CHANGELOG.md)
 
 ## 能力范围（M1 ～ M4）

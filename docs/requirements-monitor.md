@@ -1723,3 +1723,106 @@ Go `net/http` 的 `ResponseHeaderTimeout` 契约（实测 + 源码核对）：
 | M15eq | 页面刷新后用快照恢复的「进行中」行，其 `×` 同样可用（`id` 与快照一致）。 |
 | M15er | 日志出现 `request <id> cancelled by operator inst=<名\|-> phase=<pre-header\|streaming>`，且每个请求最多一条。 |
 | M15es | **回归**：不点 `×` 时，`/api/stats`、WS 事件、转发字节、超时与熔断行为与改动前完全一致。 |
+
+## §24.30 MiniMax 国内供应商预设（并入 0.1.7）
+
+### §24.30.1 背景
+
+用户 m04668 原话：「供应商增加MiniMax 国内的支持，可参考www.minimax.cn的官网，支持openai/anthropic的」。
+
+现状：`internal/providers/providers.go` 内置 11 个纯数据预设，无 MiniMax。用户手工添加 MiniMax 实例需要自己填 base_url（`https://api.minimax.cn/anthropic` 或 `https://api.minimax.cn/v1`）。
+
+实测结论（2026-11-20，本机直连 `api.minimax.cn`）：
+- `GET https://api.minimax.cn/anthropic/v1/models` → 200，返回 Anthropic 格式模型列表（`MiniMax-M3.1-Flash` / `MiniMax-M3` / `MiniMax-M2.7` …）。
+- `GET https://api.minimax.cn/v1/models` → 200，返回 OpenAI 格式模型列表（`owned_by: "minimax"`）。
+- 因此 MiniMax **不需要** `models_override`（与 DeepSeek 不同：DeepSeek 的 anthropic 入口没有 `/v1/models`，才需要覆盖到 OpenAI 端点）。
+- 官方文档（`platform.minimax.cn/docs/guides/text-generation`）给出的两个 base_url：Anthropic 兼容 `https://api.minimax.cn/anthropic`（官方推荐）、OpenAI 兼容 `https://api.minimax.cn/v1`。国际站为 `api.minimax.io` / `www.minimaxi.com`，本期不内置。
+
+### §24.30.2 决策
+
+| 编号 | 决策 |
+| --- | --- |
+| M150 | `internal/providers` 的 `presets` 新增一条：`ID: "minimax"`、`Name: "MiniMax"`、`OpenAIBaseURL: "https://api.minimax.cn/v1"`、`AnthropicBaseURL: "https://api.minimax.cn/anthropic"`。`ModelsOverride` 留空（两个协议都自带模型列表端点）。 |
+| M151 | 预设编号只允许小写字母、数字与连字符；`minimax` 不得与既有 11 个 id 冲突（`GET /api/providers` 返回 12 条）。国际站不内置，按自定义实例处理（`provider` 留空）。 |
+| M152 | 并入 `0.1.7`，不额外 bump 版本。 |
+
+### §24.30.3 验收
+
+| 编号 | 验收 |
+| --- | --- |
+| M15et | `GET /api/providers` 返回 12 条预设，其中一条 `id == "minimax"`，其 `openai_base_url == "https://api.minimax.cn/v1"`、`anthropic_base_url == "https://api.minimax.cn/anthropic"`，且无 `models_override`。 |
+| M15eu | 在「添加提供商」界面选中 MiniMax 后，OpenAI 页签自动填入 `https://api.minimax.cn/v1`、Anthropic 页签自动填入 `https://api.minimax.cn/anthropic`（沿用既有「选择供应商即自动填 base_url」行为，不新增交互）。 |
+| M15ev | **回归**：`GET /api/providers` 既有 11 条预设的 id、base_url、`models_override` 一字未改；用既有预设新建实例的行为与改动前完全一致。 |
+
+## §24.31 余额与配额查询、余额列与配额耗尽自动禁用（并入 0.1.7）
+
+### §24.31.1 背景
+
+用户 m04668 原话：「另外支持MPlan订阅配额的查询，并在实例的状态前增加一栏余额显示 5h/7d的剩余配额，配额用完后，节点自动设置为不可用，并自动跳过，直到查询到有配额再恢复；同样的deepseek的实例也能查询余额，用完后节点自动设置为不可用；支持余额查询的实例的余额列点击可以刷新余额显示，同样也会触发节点状态的切换；」
+
+接口均已实测可用（2026-11-20）：
+
+- **MiniMax M Plan 额度**：`GET https://api.minimax.cn/v1/api/openplatform/coding_plan/remains`，`Authorization: Bearer <订阅 Key>` → 200。响应核心字段：`model_remains[]` 中 `model_name == "general"` 的一项，含 `current_interval_remaining_percent`（**5 小时窗口剩余百分比**，实测 90）、`current_weekly_remaining_percent`（**7 天窗口剩余百分比**，实测 97）、`current_interval_status` / `current_weekly_status`（1 = 正常）、`remains_time` / `weekly_remains_time`（毫秒）、`start_time` / `end_time` / `weekly_start_time` / `weekly_end_time`。**注意 `current_interval_usage_count` 实为「剩余量」不是「已用量」**（已用量 = `current_interval_total_count - current_interval_usage_count`），因此判定必须用 percent 字段，不能用 count 字段。
+- **DeepSeek 余额**：`GET https://api.deepseek.com/user/balance`，`Authorization: Bearer <API Key>` → 200。响应：`is_available`（布尔）+ `balance_infos[]`（每项含 `currency`（CNY/USD）、`total_balance`、`granted_balance`、`topped_up_balance`）。实测 `{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"51.01",...}]}`。
+
+M Plan 额度机制（官方文档 `platform.minimax.cn/docs/m-plan/usage-rules`）：**5 小时窗口**（图片/视频模型除外，首次使用起算 5 小时）与**周窗口**（7 天，所有模型）**各自独立刷新**；非视频模型需要**两个窗口都有剩余额度**才能使用；未用完的额度不累积、不结转。
+
+### §24.31.2 决策（配置与查询）
+
+| 编号 | 决策 |
+| --- | --- |
+| M153 | `config.Instance` 新增**可选**字段 `balance`（对象）。缺省整个对象 = 该实例不参与余额检查，行为与改动前完全一致。对象字段：`kind`（必填，只接受 `"minimax_plan"` 与 `"deepseek"`，其它值一律报配置错误）、`url`（可选，覆盖默认端点）、`interval`（可选，轮询周期，默认 `5m`，`0` 表示关闭周期轮询、只保留手动刷新）。未知字段报错（沿用既有 `DisallowUnknownFields` 严格风格）。**不按 provider 自动推断**——用户可能用按量计费 Key（不是订阅 Key），M Plan 接口不适用，必须显式声明。 |
+| M154 | 默认端点：`kind == "minimax_plan"` → `https://api.minimax.cn/v1/api/openplatform/coding_plan/remains`；`kind == "deepseek"` → `https://api.deepseek.com/user/balance`。认证统一 `Authorization: Bearer <实例的 api_key>`。查询超时固定 **10s**（与实例 `timeout` 无关，余额查询是轻量请求，不参与熔断计数、不触发 `recordFailure`/`recordSuccess`）。 |
+| M155 | 查询结果在内部统一为 `balanceInfo` 结构：`kind`、`interval5hPercent`（5 小时窗口剩余百分比，-1 = 未知）、`weekly7dPercent`（7 天窗口剩余百分比，-1 = 未知）、`amount`（金额字符串，如 `"51.01"`，minimax_plan 为空串）、`currency`（如 `"CNY"`）、`exhausted`（是否耗尽）、`checkedAt`（本次查询时刻）、`err`（查询失败原因，成功时为空串）。多币种时取 `balance_infos` 中 `currency == "CNY"` 的一项；没有 CNY 则取数组第一项，并在 `currency` 中如实写明实际币种。 |
+| M156 | **耗尽判定**：`minimax_plan` → `interval5hPercent <= 0` **或** `weekly7dPercent <= 0` 即耗尽（官方规则：非视频模型需两个窗口都有余额，故任一为 0 即不可用）；`deepseek` → `is_available == false` **或** `total_balance <= 0` 即耗尽。字段缺失导致无法判定时按「未耗尽」处理并在 `err` 留说明，不得因解析不确定就禁用节点。 |
+| M157 | **周期轮询**：Server 启动后为每个声明了 `balance` 的实例按其 `interval` 周期查询（默认 5m，`interval == 0` 不轮询）。**启动后立即执行一次**首查，避免上线后数分钟内状态未知。轮询在后台 goroutine 中进行，查询失败不影响服务、不阻塞其它实例。 |
+| M158 | **查询失败不改变状态**：网络错误、非 2xx、JSON 解析失败一律**不改变**该实例的 `exhausted` 状态（不能因为查不到就禁用节点），保留上一次成功的余额值与时间戳，在 `err` 中记原因，并打印一行日志 `balance check failed: inst=<名> err=<原因>`。 |
+| M159 | **手动刷新接口**：新增 `POST /api/instances/balance`，请求体 `{"protocol":"<openai|anthropic>","name":"<实例名>"}`，`name` 可省略（表示该协议下全部声明了 balance 的实例）。鉴权与 `/api/instances/lock`、`/api/instances/unlock` 完全一致（Basic `admin:<admin_password>` 或管理面会话 Cookie）。响应 `{"instances":[{"name","protocol","kind","state","balance":{...}}]}`。协议非法 → 400；`name` 指定的实例不存在或未声明 balance → 404。**接口同步执行查询并返回最新结果**，不等待周期轮询。 |
+
+### §24.31.3 决策（状态机与路由）
+
+| 编号 | 决策 |
+| --- | --- |
+| M160 | 实例状态新增第 5 个取值 `exhausted`（配额/余额耗尽），与既有 `closed` / `open` / `locked` / `-` 并列。触发：一次余额查询判定耗尽即置为 `exhausted`（记录 `degradedSince` 与 `reason == "quota_exhausted"`）；恢复：查询判定有余额即清除 `exhausted` 回到 `closed`。**`exhausted` 与熔断计数完全独立**：余额查询不调用 `recordFailure`/`recordSuccess`；余额恢复**不**强行清除熔断的 `open` 状态（熔断仍按 `degrade_duration` 到期自动回 closed）。 |
+| M161 | **路由跳过**：候选链构建时 `exhausted` 实例与 `open` 实例一样不进入 `attempts`。区别：`exhausted` 实例**不参与**「全部候选都不可用时整条链都试一遍」的兜底（该兜底只服务于熔断的 `open`），因为配额耗尽时上游必然快速失败，试它没有意义。 |
+| M162 | 若过滤掉 `exhausted` 后 `attempts` 为空 → 向客户端返回 **502**，错误文本固定 `all instance quotas exhausted`（并在正文中列出耗尽的实例名），同时写入 `recentErrors`（`inst` 字段为耗尽实例名之一、`error` 为上述文本）。 |
+| M163 | **锁定优先**：实例同时被锁定且配额耗尽时，`locked` 优先（运维显式锁定仍生效，该实例照旧排第一）。余额列仍如实显示耗尽状态，鼠标悬停给出提示。这是既有的「锁定 = 运维强制」语义的延续。 |
+| M164 | 日志两行：状态切换时 `instance <名> quota exhausted` / `instance <名> quota restored`；余额值发生变化时 `balance changed: inst=<名> 5h=<p>% 7d=<p>% amount=<金额> exhausted=<bool>`（未变化不打印）。查询失败按 M158 打印。 |
+
+### §24.31.4 决策（统计与前端）
+
+| 编号 | 决策 |
+| --- | --- |
+| M165 | `/api/stats` 的 `instances[]` 每项新增**可选**字段 `balance`（`omitempty`）：不支持余额查询的实例不带该字段，字段结构 = M155 的 `balanceInfo`（`checkedAt` 用毫秒时间戳，与 `degradedSince` 同口径）。`state` 字段新增取值 `exhausted`，`reason` 新增取值 `quota_exhausted`。既有字段一个不改。 |
+| M166 | **余额信息不落盘**：余额值与 `exhausted` 状态属「当下型」状态，**不写入 `stats.json`**，重启后由首查重建（与「降级状态不持久化」同理——带着陈旧的耗尽标记启动会导致节点被误跳过）。 |
+| M167 | **前端余额列**：OpenAI 与 Anthropic 两张实例表都在**「状态」列之前**新增一列「余额」（表头 + `colgroup` + `statCell` 三处同步），列宽约 10%。展示规则：`minimax_plan` → `5h 90% · 7d 97%`；`deepseek` → `51.01 CNY`；不支持余额查询 → `-`；最近一次查询失败 → 保留上次成功的展示值并在单元格 `title` 中追加错误原因。 |
+| M168 | **点击刷新**：余额单元格可点击（`cursor: pointer`，`title` 含「点击刷新余额」）。点击 → `POST /api/instances/balance`（带该行 protocol 与 name）→ 用响应就地更新该行的余额文本与状态列文本。请求进行中禁用重复点击（显示「刷新中…」），完成后恢复。刷新同样会触发 M160 的状态切换（查到有额度则立刻恢复 `exhausted`）。 |
+| M169 | 状态列新增 `exhausted` 的展示：文案「配额耗尽」，配色与熔断的 `open`（红）**不同**（用橙/黄系），`title` 写明原因（`quota_exhausted` 或上游返回的耗尽原因）。 |
+| M170 | **不新增 WS 事件**：既有 `stats` 帧已经携带 `instances[]`，余额与 `exhausted` 状态随该帧自动下发，不新增事件类型、不改既有字段结构。 |
+| M171 | 本期**只支持在 JSON 配置文件里写 `balance` 字段**；可视化配置页（新增实例表单 / 实例编辑）暂不提供 balance 的可视化编辑项（记为已知限制，见 §24.31.6）。 |
+| M172 | 并入 `0.1.7`，不额外 bump 版本。 |
+
+### §24.31.5 验收
+
+| 编号 | 验收 |
+| --- | --- |
+| M15fw | `config.example.json` 与 README 给出 `balance` 字段的完整示例（两种 kind）；配置里写了未知 `kind` 或未知子字段时启动报错并指明字段名。 |
+| M15fx | 未声明 `balance` 的实例：`/api/stats` 的该行**不带** `balance` 字段，余额列显示 `-`，路由行为与改动前完全一致。 |
+| M15fy | 声明 `kind: "minimax_plan"` 的实例：启动后立即完成一次查询，`/api/stats` 的 `balance` 含 `interval5hPercent` / `weekly7dPercent`（取自 `current_interval_remaining_percent` / `current_weekly_remaining_percent`），余额列显示 `5h <p>% · 7d <p>%`。 |
+| M15fz | 声明 `kind: "deepseek"` 的实例：`balance.amount` / `balance.currency` 取自 `balance_infos`（多币种时取 CNY，无 CNY 取第一项并如实写明币种），余额列显示 `<金额> <币种>`。 |
+| M15ga | 查询判定耗尽 → 该实例 `state` 变为 `exhausted`、`reason` 为 `quota_exhausted`，路由不再选它（发请求时不再出现该实例的转发日志）。 |
+| M15gb | 查询判定有余额 → `state` 回到 `closed`，日志出现 `instance <名> quota restored`。 |
+| M15gc | 全部候选都 `exhausted` → 客户端收到 502 且错误文本为 `all instance quotas exhausted`（含耗尽实例名），`recentErrors` 有对应记录。 |
+| M15gd | 查询失败（网络错误 / 非 2xx / 非法 JSON）→ 该实例**状态不变**（仍为耗尽或正常），余额值保留上一次成功结果，`balance.err` 有原因，日志有 `balance check failed`。 |
+| M15ge | `POST /api/instances/balance` 带合法 protocol+name → 200 且返回该实例**刚查询**的余额与状态；状态随之切换（耗尽↔可用）。 |
+| M15gf | `POST /api/instances/balance` 带非法 protocol → 400；带不存在的 name 或未声明 balance 的实例 → 404；未通过管理面鉴权 → 401/403（与 lock/unlock 同一套鉴权）。 |
+| M15gg | 前端：两张实例表都有「余额」列且排在「状态」列之前；点击余额单元格触发刷新并就地更新余额与状态文本；刷新中按钮/单元格禁用，不可重复点击。 |
+| M15gh | 余额列展示值与 `/api/stats` 的 `balance` 字段一致；统计页与监控页的其它列、格式（K/M、ms/s）不受影响。 |
+| M15gi | **回归**：未声明 `balance` 的实例，其 `state` 取值集合、路由顺序、熔断行为、`/api/stats` 既有字段与改动前完全一致；`stats.json` 里**不出现**任何余额字段（余额不落盘）。 |
+
+### §24.31.6 已知限制
+
+- 可视化配置页暂不支持编辑 `balance` 字段，只能编辑 JSON（§24.31.4 M171）。
+- 只内置 MiniMax 国内站与国际站 DeepSeek 两种检查方式；其它供应商的余额/配额查询需自行扩展 `kind`。
+- `exhausted` 节点不做主动恢复探测：只能等下一次余额查询（周期轮询或手动点击刷新）判定有余额后恢复。
+- M Plan 官方说明「额度充足仍可能因速率限制被限流」，因此余额充足不代表调用一定成功；本功能只覆盖配额/余额维度。

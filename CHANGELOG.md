@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-20
+
+### Added
+
+- MiniMax 国内供应商预设（§24.30 M150–M151）：内置预设新增 `minimax`（显示名「MiniMax」），OpenAI 兼容 base_url 为 `https://api.minimax.cn/v1`、Anthropic 兼容 base_url 为 `https://api.minimax.cn/anthropic`，两个协议都支持且都能列出模型（实测 `api.minimax.cn/anthropic/v1/models` 与 `api.minimax.cn/v1/models` 均返回 200），因此不需要 `models_override`。国际站（`api.minimax.io` / `www.minimaxi.com`）不内置，按自定义实例处理。
+
 ## [0.1.6] - 2026-11-20
 
 ### Changed
