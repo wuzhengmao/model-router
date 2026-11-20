@@ -4,7 +4,7 @@
 
 模型智能路由（`model-router`）是 OpenAI / Anthropic 兼容的**模型路由代理**——不转协议，只代理透传。
 
-> 当前版本：`0.1.5`（熔断改真实请求驱动半开语义、全 open 时逐实例向后重试、默认回退 5 分钟、实时监控与统计落盘等）
+> 当前版本：`0.1.7`（MiniMax 国内供应商预设、余额与配额查询与配额耗尽自动禁用、上游非 2xx 分类处置、全候选失败后的补漏与原样错误透传、失败请求体取证、流式无内容超时、空签名归一化、锁定实例超时豁免与无内容转交、缺 thinking 补位、响应头前总预算与 hdr/conn 诊断埋点、监控页运维取消请求）
 > 需求：[docs/requirements.md](docs/requirements.md) ｜ 设计：[docs/design.md](docs/design.md) ｜ 测试：[docs/tests.md](docs/tests.md) ｜ 变更：[CHANGELOG.md](CHANGELOG.md)
 
 ## 能力范围（M1 ～ M4）
@@ -13,20 +13,21 @@
 - **服务访问认证**：`/v1/chat/completions` 仅 `Authorization: Bearer <auth_token>`；Anthropic 入口与两个模型列表入口接受 `x-api-key: <auth_token>` 或 `Authorization: Bearer <auth_token>`（双认证，任一匹配即通过）；失败 401（按入口协议错误体）。
 - **实例化配置**：配置 `instances` 按协议分组为 `openai` / `anthropic` 两个有序数组；每个实例 = `base_url` + `api_key` + `timeout`，并声明自己的模型映射（OpenAI 用 `models` 数组，Anthropic 用 `roles` 对象）。
 - **回退参数可配置**：顶层 `fallback` 对象可设置 `failure_threshold`（默认 3）、`degrade_duration`（默认 `5m`）、`first_token_timeout`（默认 `10s`，0=禁用）、`min_tokens_per_second`（默认 30，0=禁用吞吐判定）、`idle_timeout`（默认 `30s`，0=禁用流式空闲超时）。
-- **供应商预设**：内置 11 个供应商（deepseek/openai/anthropic/zhipu/volcengine/moonshot/dashscope/siliconflow/groq/mistral/xai）。实例可用可选 `provider` 标记来源；`provider` 只影响「查询模型」的端点判定（通用 `models_override` 机制），不影响路由/转发。
+- **供应商预设**：内置 12 个供应商（deepseek/openai/anthropic/zhipu/volcengine/moonshot/dashscope/siliconflow/groq/mistral/xai/minimax）。实例可用可选 `provider` 标记来源；`provider` 只影响「查询模型」的端点判定（通用 `models_override` 机制），不影响路由/转发。
 - **实例展开路由**：
   - 精确匹配（R4a）：请求 `model` 等于某个声明的模型 → 转发该实例，**不改写**。
   - 角色匹配（R4c）：`model` 等于 `sonnet`/`opus`/`fable`/`haiku` 或以 `claude-<role>-` 开头 → 命中声明该角色的条目，改写顶层 `model` 为实例映射的模型；尾部 `[1m]` 后缀（如 `opus[1m]`）在判定前剥除，大小写不敏感。
   - 托底（R4d）：未命中精确/角色且存在 `"*"` 角色 → 命中第一个，改写顶层 `model`。
   - 回退（R5）：都未命中 → 转发展开后的首条目，不改写。
 - **实例粒度回退降级（M4）**：每个协议下实例按配置顺序构成候选链；连接失败/超时自动在本次请求内回退到下一候选；连续失败 3 次转 `open`（默认 5 分钟后自动恢复），恢复完全由真实请求驱动。吞吐判定仅在「生成时长 >2s 且输出 >100 token」时进行，低于 `min_tokens_per_second` 记为失败（已发出的响应不回退、不打断）。
+- **余额与配额查询（可选）**：实例可声明 `balance` 对象查询订阅额度或预付余额；判定为耗尽时实例状态变为「配额耗尽」（`exhausted`）并自动跳过，查到有额度即自动恢复（见「余额与配额查询」）。
 - **透传**：方法、路径、查询串、请求体（别名/角色命中时仅改顶层 `model`）与非认证请求头原样转发；响应原样回传，SSE 逐块 flush。
 - **上游认证分离**：OpenAI 实例使用 `Authorization: Bearer <api_key>`，Anthropic 实例使用 `x-api-key: <api_key>`；客户端 token 永不外传。
 - **请求日志**：每个请求打印 `req_model`（客户端原始模型）、`model`（实际转发模型）、`client`（客户端标识，十一级识别）、`ip`（来源 IP）与 `total`/`ttft`/`in`/`out`/`gen`（`gen` 满足吞吐门槛才显示数值，否则 `n/a`）。
 - **模型列表（路径决定格式）**：`GET /v1/models` 固定返回 OpenAI 格式（含可选能力字段），`GET /anthropic/v1/models` 固定返回 Anthropic 官方 schema；不调上游。
 - **Web 配置页 `/admin`**：可视化模式（回退参数输入框、OpenAI/Anthropic 双 tab、添加实例时先选供应商或自定义、实例卡片可拖动排序、测试连接、查询上游模型、勾选/手动填写）+ JSON 高级模式（含 `fallback` 与分组 `instances`；校验通过才可保存）。
 - **实时请求监控（M9）**：管理页「实时监控」页面通过 WebSocket（`GET /api/ws`）接收 AI 请求的 `start`/`chunk`/`retry`/`end` 事件，以一张表格展示状态、方法/路径、请求模型→实例/上游、token、耗时、TTFT 与速率，**每行**在最右侧绘制自己的 trunk 时间轴（横轴从 0 到该请求结束，块间空隙即 TTFT/卡顿，重试切换点用竖线标注）。连接后先收到 snapshot（已结束 100 条 + 进行中 ≤200 条），因此切页/刷新不会空白；「清空」只移除已完成的行、保留进行中的请求与连接。
-- **管理 API**：`GET/PUT /api/config`、`POST /api/reload`、`POST /api/config/validate`、`POST /api/probe/test`、`POST /api/probe/models`、`GET /api/providers`、`GET /api/stats`、`POST /api/stats/clear`、`POST /api/instances/lock`、`POST /api/instances/unlock`、`GET /api/ws`（WebSocket）；HTTP Basic Auth 或会话 Cookie。
+- **管理 API**：`GET/PUT /api/config`、`POST /api/reload`、`POST /api/config/validate`、`POST /api/probe/test`、`POST /api/probe/models`、`GET /api/providers`、`GET /api/stats`、`POST /api/stats/clear`、`POST /api/instances/lock`、`POST /api/instances/unlock`、`POST /api/instances/balance`、`GET /api/ws`（WebSocket）；HTTP Basic Auth 或会话 Cookie。
 - **手动重载**：重读 `-config` 文件并原子切换，进程不重启；失败保留旧配置。
 - **环境变量覆盖**：`listen`/`auth_token`/`admin_user`/`admin_password` 可用 `MODEL_ROUTER_*` 覆盖。
 - 版本号单一来源，构建通过 `-ldflags` 注入；`-version` 输出构建版本。
@@ -143,6 +144,7 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
 | `provider` | 否 | 内置供应商 id（见下节）；非空必须是已知 id，否则启动失败；空=自定义 |
 | `timeout` | 否 | 连接/等待响应头超时，默认 `15s` |
 | `models` | 是 | 模型列表；去空去重、保留顺序；不得出现 `roles` |
+| `balance` | 否 | 余额/配额查询对象（见「余额与配额查询」）；缺省表示该实例不参与余额检查。`kind`（必填，`minimax_plan` 或 `deepseek`）、`url`（可选，覆盖默认端点）、`interval`（可选，默认 `5m`，`0` = 关闭周期轮询只保留手动刷新）；未知 `kind` 或未知子字段启动报错 |
 
 `instances.anthropic[]` 字段：
 
@@ -153,12 +155,64 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
 | `provider` | 否 | 同上 |
 | `timeout` | 否 | 同上 |
 | `roles` | 是 | 角色→实际模型映射，键 ∈ `sonnet`/`opus`/`fable`/`haiku`/`*`，值非空；不得出现 `models` |
+| `balance` | 否 | 同上 |
 
 实例内不再有 `protocol` 字段（由所在分组决定）；出现即解析失败。旧 `instances` 数组形态会报错并提示迁移为分组结构；旧字段 `backends` / `matches` 等同样已废弃。
 
+### 余额与配额查询
+
+实例可声明 `balance` 对象来查询订阅额度或预付余额，并据此自动禁用 / 恢复节点。`kind` 必须**显式声明**，不按 provider 自动推断——按量计费的 Key 不适用订阅额度接口。
+
+| kind | 默认端点 | 余额列展示 | 耗尽判定 |
+|---|---|---|---|
+| `minimax_plan` | `https://api.minimax.cn/v1/api/openplatform/coding_plan/remains` | `5h 90% · 7d 97%` | 5 小时窗口或 7 天窗口的剩余百分比任一 ≤ 0 |
+| `deepseek` | `https://api.deepseek.com/user/balance` | `51.01 CNY` | `is_available` 为假，或 `total_balance` ≤ 0 |
+
+两种 kind 的完整示例（`url` 可选，缺省即上表端点；`interval` 缺省 `5m`，`0` = 关闭周期轮询、只保留手动刷新）：
+
+```json
+{
+  "instances": {
+    "openai": [
+      {
+        "name": "MiniMax-MPlan",
+        "base_url": "https://api.minimax.cn/v1",
+        "api_key": "replace-with-your-minimax-subscription-key",
+        "provider": "minimax",
+        "timeout": "15s",
+        "models": ["MiniMax-M3"],
+        "balance": {
+          "kind": "minimax_plan",
+          "interval": "5m"
+        }
+      },
+      {
+        "name": "DeepSeek",
+        "base_url": "https://api.deepseek.com",
+        "api_key": "sk-...",
+        "provider": "deepseek",
+        "timeout": "15s",
+        "models": ["deepseek-chat"],
+        "balance": {
+          "kind": "deepseek",
+          "url": "https://api.deepseek.com/user/balance",
+          "interval": "5m"
+        }
+      }
+    ]
+  }
+}
+```
+
+- 认证统一 `Authorization: Bearer <实例 api_key>`，查询超时固定 10s；查询失败（网络错误 / 非 2xx / 非法 JSON）**不改变**实例状态，只记录原因并保留上一次成功的余额值。
+- 判定为耗尽后实例状态变为「配额耗尽」（`exhausted`），路由自动跳过该实例（也不参与熔断「全 open 逐个重试」的兜底）；全部候选都耗尽时客户端收到 502 `all instance quotas exhausted`。查到有额度即自动恢复为「正常」（`closed`），不影响熔断状态。
+- 服务启动后立即查一次，之后按 `interval` 周期轮询；也可随时 `POST /api/instances/balance`（`{"protocol":"openai","name":"<实例名>"}`，`name` 可省略表示该协议下全部实例）手动刷新。
+- 管理页实例表的「状态」列之前有「余额」列，显示 `5h 90% · 7d 97%` 或 `51.01 CNY`；点击余额单元格即可刷新余额并就地更新状态文本。
+- 余额不写入 `stats.json`，重启后由启动首查重建。
+
 ### 供应商预设
 
-`GET /api/providers` 返回内置 11 个供应商（纯数据，可后续增改）：
+`GET /api/providers` 返回内置 12 个供应商（纯数据，可后续增改）：
 
 | id | name | OpenAI base_url | Anthropic base_url |
 |---|---|---|---|
@@ -173,8 +227,9 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
 | groq | Groq | https://api.groq.com/openai/v1 | — |
 | mistral | Mistral | https://api.mistral.ai/v1 | — |
 | xai | xAI Grok | https://api.x.ai/v1 | — |
+| minimax | MiniMax | https://api.minimax.cn/v1 | https://api.minimax.cn/anthropic |
 
-其中 DeepSeek 声明了通用 `models_override`：`anthropic → {base_url: https://api.deepseek.com, auth: bearer}`。这样 DeepSeek 的 Anthropic 实例（其入口未实现 `/v1/models`）在「查询模型」时改从 OpenAI 入口拉取；其他供应商以后若遇到同类问题，只需在预设数据中补一条 override，无需改逻辑。
+其中 DeepSeek 声明了通用 `models_override`：`anthropic → {base_url: https://api.deepseek.com, auth: bearer}`。这样 DeepSeek 的 Anthropic 实例（其入口未实现 `/v1/models`）在「查询模型」时改从 OpenAI 入口拉取；其他供应商以后若遇到同类问题，只需在预设数据中补一条 override，无需改逻辑。MiniMax 两个协议都能直接列出模型（实测 `api.minimax.cn/anthropic/v1/models` 与 `api.minimax.cn/v1/models` 均返回 200），因此没有 `models_override`。
 
 ## 路由规则
 
@@ -199,12 +254,14 @@ M5 及之后（跨平台 CI/Docker）见需求文档第 6 节。
   - OpenAI：实例含请求 `model` → 原样；不含 → 改用该实例 `models[0]` 并改写。
   - Anthropic：实例含角色 R → 用 `roles[R]` 并改写；不含但有 `*` → 用 `roles["*"]` 并改写；两者皆无 → 跳过。
   - R5（无 model/非字符串/null/非法 JSON/未命中）：以首个实例为基础，候选链覆盖该协议实例；Anthropic 只取声明 `*` 的实例；**正文不改写**。
-- 每个实例维护显式熔断状态（`closed` / `open`）与回退截止时间（参数来自顶层 `fallback`，默认 3 次 / 5 分钟 / 30 token/s）：
-  1. 跳过处于 `open` 的实例；
-  2. 连接失败 / 超时（实例 `timeout`，默认 15s）→ 本次请求立即尝试下一候选（临时回退）；
+- 每个实例维护显式熔断状态（`closed` / `open` / `exhausted`）与回退截止时间（参数来自顶层 `fallback`，默认 3 次 / 5 分钟 / 30 token/s）：
+  1. 跳过处于 `open` 的实例；配额耗尽（`exhausted`）的实例同样跳过，且不参与第 5 条的全 open 兜底；
+  2. 连接失败 / 超时（实例 `timeout`，默认 15s），或上游返回非 2xx（响应头尚未提交时）→ 本次请求立即尝试下一候选（临时回退）；非 2xx 的错误体前 512 字节进入日志与 `recentErrors[].upstreamBody`；
   3. 连续失败 ≥ `failure_threshold` 次 → 转 `open` 并记录降级开始时间；已 `open` 的实例再次失败 → 回退截止时间重置为「当前时间 + `degrade_duration`」，不做指数退避；
   4. 每次请求按候选链顺序选择**第一个 `closed` 实例**；回退截止时间到期后实例自动回到 `closed`（空闲时也按时间恢复，无需任何额外动作）；
-  5. 候选链上全部实例都 `open` → 新请求从**链上第一个**实例开始，按链序逐个向后重试，第一个成功即返回，全部失败才 502；成功的实例恢复 `closed`，后续请求继续由它承接。
+  5. 候选链上全部实例都 `open` → 新请求从**链上第一个**实例开始，按链序逐个向后重试，第一个成功即返回；成功的实例恢复 `closed`，后续请求继续由它承接；
+  6. 首轮全部失败 → 先补试链上因 `open` 被跳过的候选（重试原因 `fallback_retry`），仍未成功则用**客户端原始模型名**、原样请求体对尚未尝试过的实例按配置顺序再跑一遍；每个实例在一次请求中最多真实调用一次；
+  7. 两段保底仍全部失败 → 若拿到过真实非 2xx 上游响应，客户端收到**该状态码与原始响应体**；只有全部候选都停在连接失败/超时才返回 502 `upstream request failed`。
 - 实例回退状态按协议维护、只存内存；统计页实例行按「openai → anthropic、组内配置优先级」排序。
 - 锁定 / 解锁（`POST /api/instances/lock`、`POST /api/instances/unlock`）：锁定后熔断策略暂停，该协议全部请求发往被锁定实例；锁定状态不落盘，重启或 reload 后恢复。
 - 回退状态与锁定仅在进程内存；重启或 reload（重建 handler）后清零。
@@ -257,7 +314,7 @@ curl -sS http://127.0.0.1:18080/anthropic/v1/models -H "Authorization: Bearer <a
 
 管理页是四个独立路由页面（刷新后停留在当前页）：
 
-- **统计首页 `/admin/`**：运行与连接、请求统计、实例统计、近期错误四块指标；实例表按协议与优先级排序，`open` 显示降级开始时间，`locked` 显示「已锁定」，其余显示「正常」，每行带锁定/解锁按钮。数据来自 `GET /api/stats` 与全局 WS，缩写数值悬停显示精确值。
+- **统计首页 `/admin/`**：运行与连接、请求统计、实例统计、近期错误四块指标；实例表按协议与优先级排序，「状态」列之前有「余额」列（点击可刷新），`open` 显示降级开始时间，`exhausted` 显示「配额耗尽」，`locked` 显示「已锁定」，其余显示「正常」，每行带锁定/解锁按钮。数据来自 `GET /api/stats` 与全局 WS，缩写数值悬停显示精确值。
 - **实时监控 `/admin/monitor`**：登录后自动建立全局 WebSocket，无需单独的认证栏或连接/断开按钮。快照包含最近 100 条已结束请求与最多 200 条进行中请求（带逐块明细），因此切页/刷新不空白；进行中的行会继续接收 chunk/end 事件。主体是**一张表格**：`#`、状态、方法/路径、客户端、请求模型/实例·上游、入、出、块、耗时、TTFT、t/s、时间轴；每行独立时间轴，等待首包（琥珀）/ trunk（蓝）/ 含内容块（绿）三色、重试虚线、进行中当前游标，所有行共享按最长耗时动态更新的量程，刻度与图例在表头。「清空」只移除已完成行并同时清空后端最近 100 条环形缓冲，列表最多保留最近 500 条已完成请求。无 WS 客户端时仍累计统计并维护快照，只是不广播逐 trunk 事件；现有日志格式不变。
 - **可视化配置 `/admin/config`**：OpenAI / Anthropic 双 tab；「添加实例」先弹出供应商选择框（内置供应商 + 自定义），选内置会按当前协议自动填 `base_url` 并记录 `provider`，自定义则手动填写；每张实例卡片可「测试连接」「查询模型」（带上 `provider`，自动走 models_override）、勾选/手填模型；保存 → `PUT /api/config`。页面底部的统计持久化说明见「统计持久化与卷」。
 - **JSON 高级 `/admin/json`**：编辑完整配置；「校验」→ `POST /api/config/validate`，通过后才启用「保存」；编辑框随视口高度自适应。
@@ -276,9 +333,10 @@ curl -sS http://127.0.0.1:18080/anthropic/v1/models -H "Authorization: Bearer <a
 | `/api/probe/test` | POST | 按协议探测上游：openai `GET {base_url}/v1/models`；anthropic `POST {base_url}/v1/messages` 最小请求。返回 `{ok, latency_ms, message}`（2xx 或认证通过的 4xx 视为可达；401/403/404 视为失败） |
 | `/api/probe/models` | POST | `GET {base_url}/v1/models`（openai Bearer / anthropic x-api-key + version）；`provider` 命中 models_override 时改用 override 的 base_url/auth。返回 `{models:[...]}`；上游未实现该端点（404）时返回友好错误，引导手动输入 |
 | `/api/providers` | GET | 返回内置供应商清单（id/name/base_urls/models_override） |
-| `/api/stats` | GET | 返回统计快照（与 WS `stats` 帧的 `data` 同构，含累计值、分位数、实例与近期错误）；`instances[]` 每项含 `protocol`、`priority`、`state`（`closed`/`open`/`locked`/`-`）、`locked`、`degradedSince`（毫秒时间戳，0 表示未降级）、`reason`、`current`（恒为 false，兼容保留），并保留兼容字段 `degraded` |
+| `/api/stats` | GET | 返回统计快照（与 WS `stats` 帧的 `data` 同构，含累计值、分位数、实例与近期错误）；`instances[]` 每项含 `protocol`、`priority`、`state`（`closed`/`open`/`exhausted`/`locked`/`-`）、`locked`、`degradedSince`（毫秒时间戳，0 表示未降级）、`reason`、`current`（恒为 false，兼容保留），并保留兼容字段 `degraded`；声明了 `balance` 的实例另带 `balance` 字段（余额/配额快照） |
 | `/api/instances/lock` | POST | `{"protocol":"openai","name":"MTI"}`：锁定该实例；该协议其余实例显示为 `-`，熔断计数暂停，全部请求发往被锁定实例；重复锁定幂等返回 200 |
 | `/api/instances/unlock` | POST | `{"protocol":"openai"}`：解除锁定，该协议全部实例状态清零、重新计数，之后按候选链第一个 `closed` 实例选路 |
+| `/api/instances/balance` | POST | `{"protocol":"openai","name":"MTI"}`：同步查询余额/配额并返回 `{"instances":[{name,protocol,kind,state,balance}]}`；`name` 可省略（该协议下全部声明了 balance 的实例）；协议非法 400，实例不存在或未声明 balance 404 |
 | `/api/stats/clear` | POST | 清零累计统计与近期错误并立即落盘；不影响 100 条请求快照 |
 | `/api/monitor/clear` | POST | 清空后端最近 100 条请求快照；不影响累计统计 |
 | `/api/ws` | GET（WebSocket） | 快照 + 统计 + 实时监控事件流（`start`/`chunk`/`retry`/`end`）；认证同管理面，另接受 `?user=&password=` 回退。旧 `/api/monitor` 已删除（404） |

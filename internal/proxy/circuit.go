@@ -17,11 +17,14 @@ import (
 // §24.17 M34: an instance is only ever closed or open; protocols additionally
 // render locked and shadowed ("-") rows. The old probe state is gone because
 // there is no active probing subsystem any more.
+// §24.31 M160 adds a fifth state: "exhausted" marks an instance whose
+// quota/balance is used up. It is independent of the breaker.
 const (
-	stateClosed   = "closed"
-	stateOpen     = "open"
-	stateLocked   = "locked"
-	stateShadowed = "-"
+	stateClosed    = "closed"
+	stateOpen      = "open"
+	stateLocked    = "locked"
+	stateShadowed  = "-"
+	stateExhausted = "exhausted"
 )
 
 // reason values reported in GET /api/stats (§24.15.3). The decision table does
@@ -29,6 +32,9 @@ const (
 // breaker.
 const (
 	reasonFailureThreshold = "failure_threshold"
+	// reasonQuotaExhausted marks an instance disabled by its balance check
+	// (§24.31 M160).
+	reasonQuotaExhausted = "quota_exhausted"
 )
 
 // isOpen reports whether the breaker is open. §24.17 M35: the only input is the
@@ -57,6 +63,11 @@ func (inst *instanceRuntime) nowTime() time.Time {
 func (inst *instanceRuntime) state() string {
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
+	// §24.31 M160: a used up quota outranks the breaker state; the quota
+	// recovers on its own, the breaker does not.
+	if inst.quotaExhausted {
+		return stateExhausted
+	}
 	if inst.isOpenAt(inst.nowTime()) {
 		return stateOpen
 	}
@@ -113,6 +124,11 @@ func (inst *instanceRuntime) recordFailure(now time.Time, threshold int, duratio
 func (inst *instanceRuntime) displayState() (state string, since time.Time, reason string) {
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
+	// §24.31 M160: the quota state outranks the breaker state, but recovering
+	// from a quota never clears an open breaker.
+	if inst.quotaExhausted {
+		return stateExhausted, inst.quotaExhaustedSince, reasonQuotaExhausted
+	}
 	if inst.isOpenAt(inst.nowTime()) {
 		return stateOpen, inst.degradedSince, inst.degradeReason
 	}
@@ -158,7 +174,8 @@ func (ps *protocolRuntime) stateFor(index int) (state string, degradedSince int6
 	inst := ps.insts[index]
 	state, since, reason := inst.displayState()
 	var sinceMs int64
-	if state == stateOpen && !since.IsZero() {
+	// §24.31 M160: an exhausted instance reports since when the quota ran out.
+	if (state == stateOpen || state == stateExhausted) && !since.IsZero() {
 		sinceMs = since.UnixMilli()
 	}
 	return state, sinceMs, reason, false
@@ -208,8 +225,27 @@ func (h *Handler) isProtocolLocked(proto protocol) bool {
 	return ps != nil && ps.isLocked()
 }
 
+// isLockedInstance reports whether inst is the protocol's pinned instance.
+// §24.25 M92 exempts only that instance from breaker bookkeeping; other
+// instances of a locked protocol still count their failures.
+func (h *Handler) isLockedInstance(inst *instanceRuntime) bool {
+	if inst == nil {
+		return false
+	}
+	ps := h.protocolRuntime(inst.proto)
+	if ps == nil {
+		return false
+	}
+	idx := ps.lockedIndex()
+	if idx < 0 || idx >= len(ps.insts) {
+		return false
+	}
+	return ps.insts[idx] == inst
+}
+
 func (h *Handler) recordFailure(inst *instanceRuntime) {
-	if h.isProtocolLocked(inst.proto) {
+	// §24.25 M92: a failure on the pinned instance never touches the breaker.
+	if h.isLockedInstance(inst) {
 		return
 	}
 	inst.recordFailure(h.now(), h.failureThreshold, h.degradeDuration)
@@ -222,42 +258,15 @@ func (h *Handler) recordSuccess(inst *instanceRuntime) {
 	inst.recordSuccess()
 }
 
-// lockedCandidate maps a request onto the pinned instance (§24.15 M10): the
-// model rewrite follows the regular chain when possible, otherwise the
-// instance's default mapping is used.
+// lockedCandidate maps a request onto the pinned instance (§24.15 M10).
+// §24.25 M99/M100: the model rewrite goes through the same resolver as
+// fallbackCandidate; when the instance declares no usable mapping the client
+// model stays untouched (no guessing).
 func lockedCandidate(proto protocol, insts []*instanceRuntime, body []byte, index int) *candidate {
 	if index < 0 || index >= len(insts) {
 		return nil
 	}
-	inst := insts[index]
-	for _, cand := range buildChainFrom(proto, insts, body) {
-		if cand.inst == inst {
-			return cand
-		}
-	}
-	cand := &candidate{inst: inst}
-	model, usable := requestModel(body)
-	if !usable {
-		return cand
-	}
-	switch proto {
-	case protocolOpenAI:
-		if len(inst.models) > 0 {
-			cand.model = inst.models[0]
-			cand.rewrite = cand.model != model
-		}
-	case protocolAnthropic:
-		role, hasRole := requestRole(model)
-		if !hasRole {
-			return cand
-		}
-		if mapped, ok := inst.roles[role]; ok {
-			cand.model, cand.rewrite = mapped, true
-		} else if mapped, ok := inst.roles[config.RoleWildcard]; ok {
-			cand.model, cand.rewrite = mapped, true
-		}
-	}
-	return cand
+	return mappedCandidate(proto, insts[index], body)
 }
 
 // normalizeLockProtocol validates the protocol field of the lock APIs.

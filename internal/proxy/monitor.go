@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"cmp"
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
@@ -346,6 +347,8 @@ func (c *monitorClient) readLoop() {
 			return
 		}
 		switch opcode {
+		case 0x1: // text command (§24.29 M135)
+			c.handleTextCommand(payload)
 		case 0x8: // close
 			_ = c.writeFrame(0x8, payload)
 			return
@@ -355,6 +358,23 @@ func (c *monitorClient) readLoop() {
 			}
 		}
 	}
+}
+
+// handleTextCommand parses one browser command. Malformed payloads, unknown
+// types and empty ids are ignored without dropping the connection (§24.29
+// M136); cancellation itself is non-blocking.
+func (c *monitorClient) handleTextCommand(payload []byte) {
+	var command struct {
+		Type string `json:"type"`
+		ID   string `json:"id"`
+	}
+	if err := json.Unmarshal(payload, &command); err != nil {
+		return
+	}
+	if command.Type != "cancel" || command.ID == "" {
+		return
+	}
+	c.hub.cancelRequest(command.ID)
 }
 
 func (c *monitorClient) writeFrame(opcode byte, payload []byte) error {
@@ -577,6 +597,10 @@ type monitorEndEvent struct {
 	InstName      string  `json:"instName"`
 	UpstreamModel string  `json:"upstreamModel"`
 	Error         string  `json:"error,omitempty"`
+	// §24.20 M53: excerpt of a non-2xx upstream body.
+	UpstreamBody string `json:"upstreamBody,omitempty"`
+	// §24.22 M66: structural summary of the client body, failed requests only.
+	ReqShape string `json:"reqShape,omitempty"`
 }
 
 // monitorChunkSnapshot is the compact per-chunk copy kept in the recent-request
@@ -615,6 +639,8 @@ type monitorRequestSnapshot struct {
 	GenMs         int64                  `json:"genMs"`
 	TPS           float64                `json:"tps"`
 	Error         string                 `json:"error,omitempty"`
+	UpstreamBody  string                 `json:"upstreamBody,omitempty"`
+	ReqShape      string                 `json:"reqShape,omitempty"`
 	Ended         bool                   `json:"ended"`
 }
 
@@ -633,6 +659,12 @@ type monitorStatsEvent struct {
 const (
 	retryReasonError             = "error"
 	retryReasonFirstTokenTimeout = "first_token_timeout"
+	// §24.20 M54: the candidate failed because the upstream answered with a
+	// status outside 2xx.
+	retryReasonUpstreamStatus = "upstream_status"
+	// §24.21 M60: the request entered the fallback round (instances the first
+	// round never called, each with its own mapped model).
+	retryReasonFallbackRetry = "fallback_retry"
 )
 
 // attemptFailure carries the §24.2 F3 retry reason across the tryCandidate
@@ -649,6 +681,10 @@ func retryReason(err error) string {
 	var failure *attemptFailure
 	if errors.As(err, &failure) {
 		return failure.reason
+	}
+	var upstream *upstreamResponseError
+	if errors.As(err, &upstream) {
+		return retryReasonUpstreamStatus
 	}
 	return retryReasonError
 }
@@ -679,6 +715,68 @@ type requestMonitor struct {
 	cumTokens     int
 	firstChunkAt  time.Time
 	lastChunkAt   time.Time
+	// §24.29 M137: cancel is registered for the request lifetime and cleared by
+	// end, so only in-progress requests can be cancelled.
+	cancel              context.CancelFunc
+	cancelledByOperator bool
+}
+
+// setCancel registers the per-request cancel entry (§24.29 M137).
+func (m *requestMonitor) setCancel(cancel context.CancelFunc) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.cancel = cancel
+	m.mu.Unlock()
+}
+
+// cancelByOperator cancels the request once and reports whether this call was
+// the one that did it. Finished requests and repeated cancels are ignored.
+func (m *requestMonitor) cancelByOperator() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	if m.finished || m.cancel == nil {
+		m.mu.Unlock()
+		return false
+	}
+	cancel := m.cancel
+	m.cancelledByOperator = true
+	m.mu.Unlock()
+	cancel()
+	return true
+}
+
+// operatorCancelled reports whether an operator cancelled this request.
+func (m *requestMonitor) operatorCancelled() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cancelledByOperator
+}
+
+// cancelRequest finds an in-progress request by id and cancels it (§24.29
+// M136). Unknown or finished ids are silently ignored. The active slice is
+// copied before calling cancel: cancellation can synchronously finish the
+// request and take activeMu through removeActive.
+func (h *monitorHub) cancelRequest(id string) bool {
+	if h == nil || id == "" {
+		return false
+	}
+	h.activeMu.Lock()
+	active := make([]*requestMonitor, len(h.active))
+	copy(active, h.active)
+	h.activeMu.Unlock()
+	for _, monitor := range active {
+		if monitor.id == id {
+			return monitor.cancelByOperator()
+		}
+	}
+	return false
 }
 
 // trackRequest always returns a tracker so cumulative statistics and the recent
@@ -918,6 +1016,8 @@ func (m *requestMonitor) end(status int, err error, metrics attemptMetrics) {
 		tps = math.Round(float64(outTokens)*1000/float64(genMs)*10) / 10
 	}
 	m.finished = true
+	// §24.29 M137: the cancel entry exists only while the request is active.
+	m.cancel = nil
 	snapshot := monitorRequestSnapshot{
 		ID:            m.id,
 		TS:            m.start.UnixMilli(),
@@ -939,6 +1039,8 @@ func (m *requestMonitor) end(status int, err error, metrics attemptMetrics) {
 		GenMs:         genMs,
 		TPS:           tps,
 		Error:         message,
+		UpstreamBody:  metrics.upstreamBody,
+		ReqShape:      metrics.reqShape,
 		Ended:         true,
 	}
 	m.mu.Unlock()
@@ -965,5 +1067,7 @@ func (m *requestMonitor) end(status int, err error, metrics attemptMetrics) {
 		InstName:      snapshot.InstName,
 		UpstreamModel: snapshot.UpstreamModel,
 		Error:         snapshot.Error,
+		UpstreamBody:  snapshot.UpstreamBody,
+		ReqShape:      snapshot.ReqShape,
 	})
 }

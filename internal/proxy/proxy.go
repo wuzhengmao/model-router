@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"slices"
 	"strconv"
@@ -49,6 +50,9 @@ const (
 	// §24.15.3 per-instance breaker controls.
 	PathInstancesLock   = "/api/instances/lock"
 	PathInstancesUnlock = "/api/instances/unlock"
+
+	// §24.31 M159: manual balance refresh of one or all instances.
+	PathInstancesBalance = "/api/instances/balance"
 )
 
 // MaxRequestBodyBytes caps how much of a request body is buffered for
@@ -85,6 +89,19 @@ const (
 	protocolAnthropic protocol = config.ProtocolAnthropic
 )
 
+// errLockedHandoff marks a non-locked stream attempt that was aborted before it
+// produced content while the protocol is pinned (§24.25 M94). serveChain uses it
+// to route the request back to the locked instance.
+var errLockedHandoff = errors.New("handoff to locked instance")
+
+// errRequestCancelledByOperator marks a request terminated from the monitor
+// page (§24.29). It is never treated as an upstream failure.
+var errRequestCancelledByOperator = errors.New("request cancelled by operator")
+
+// errAllQuotasExhausted is the client facing error of a request whose whole
+// candidate chain ran out of quota (§24.31 M162).
+const errAllQuotasExhausted = "all instance quotas exhausted"
+
 // instanceRuntime is one configured instance plus its in-memory fallback state.
 type instanceRuntime struct {
 	name         string
@@ -98,6 +115,11 @@ type instanceRuntime struct {
 	roleNames    map[string]string
 	capabilities map[string]config.ModelCapability
 	client       *http.Client
+	// lockedClient is used instead of client while this instance is pinned
+	// (§24.25 M95): all three connection/header timeouts are zero, so the
+	// locked instance is never cut off by its own timeout. It stays separate
+	// from client so unlocking restores the configured timeout immediately.
+	lockedClient *http.Client
 
 	// now is the clock the breaker compares against degradedUntil (§24.17 M35).
 	// A nil clock means time.Now, so literal instances in tests stay usable.
@@ -113,6 +135,18 @@ type instanceRuntime struct {
 	// fail over to, so opening would only pin a red state without diverting
 	// traffic. Set from len(protocolRuntime.insts) at construction.
 	singleInstanceProtocol bool
+
+	// §24.31 M153: the optional balance/quota check of this instance. An
+	// empty balanceKind means the instance never takes part in a balance
+	// check. The fields below are guarded by mu.
+	balanceKind     string
+	balanceURL      string
+	balanceInterval time.Duration
+	balanceInfo     balanceInfo
+	// quotaExhausted marks an instance whose quota/balance is used up
+	// (§24.31 M160). It is independent of the breaker counters.
+	quotaExhausted      bool
+	quotaExhaustedSince time.Time
 }
 
 // Fallback defaults (kept for compatibility; the effective values come from
@@ -225,6 +259,29 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Handler, error) {
 			timeout: inst.Timeout.Duration(),
 			now:     opts.Now,
 			client:  newClient(inst.Timeout.Duration()),
+			// §24.25 M95: the pinned instance is exempt from every network
+			// timeout. Keeping a second client makes lock/unlock take effect on
+			// the next attempt without mutating the unlocked client.
+			lockedClient: newClient(0),
+		}
+		// §24.31 M153: the balance check is opt-in and never inferred from the
+		// provider.
+		if inst.Balance != nil {
+			kind := strings.ToLower(strings.TrimSpace(inst.Balance.Kind))
+			switch kind {
+			case config.BalanceKindMiniMaxPlan, config.BalanceKindDeepSeek:
+			default:
+				return nil, fmt.Errorf("instances[%d]: balance.kind must be %q or %q, got %q",
+					i, config.BalanceKindMiniMaxPlan, config.BalanceKindDeepSeek, inst.Balance.Kind)
+			}
+			ir.balanceKind = kind
+			ir.balanceURL = strings.TrimSpace(inst.Balance.URL)
+			ir.balanceInterval = inst.Balance.PollInterval()
+			ir.balanceInfo = balanceInfo{
+				Kind:              kind,
+				Interval5hPercent: unknownPercent,
+				Weekly7dPercent:   unknownPercent,
+			}
 		}
 		switch proto {
 		case protocolOpenAI:
@@ -844,6 +901,60 @@ type candidate struct {
 	rewrite bool
 }
 
+// §24.20 M49/M50: a status outside 2xx received before anything was written to
+// the client is a retryable candidate failure. The buffered response is kept so
+// the last real rejection can be forwarded verbatim once every candidate has
+// failed (§24.21 M52/M60).
+const (
+	upstreamErrorBodyLimit   = 4 << 20 // bytes buffered for verbatim forwarding
+	upstreamBodyExcerptLimit = 512     // bytes kept for logs and recentErrors
+)
+
+type upstreamResponseError struct {
+	status int
+	header http.Header
+	body   []byte
+}
+
+func (e *upstreamResponseError) Error() string {
+	if excerpt := e.excerpt(); excerpt != "" {
+		return fmt.Sprintf("upstream status %d: %s", e.status, excerpt)
+	}
+	return fmt.Sprintf("upstream status %d", e.status)
+}
+
+// excerpt returns a readable prefix of the response body. A gzip-encoded body
+// (preserved for verbatim forwarding) is decoded best-effort for the log.
+func (e *upstreamResponseError) excerpt() string {
+	body := e.body
+	switch strings.ToLower(strings.TrimSpace(e.header.Get("Content-Encoding"))) {
+	case "gzip", "x-gzip":
+		if zr, err := gzip.NewReader(bytes.NewReader(body)); err == nil {
+			decoded, readErr := io.ReadAll(io.LimitReader(zr, upstreamBodyExcerptLimit))
+			_ = zr.Close()
+			if readErr == nil {
+				body = decoded
+			}
+		}
+	}
+	if len(body) > upstreamBodyExcerptLimit {
+		body = body[:upstreamBodyExcerptLimit]
+	}
+	return strings.TrimSpace(strings.ToValidUTF8(string(body), "�"))
+}
+
+// forwardUpstreamError relays the buffered non-2xx response unchanged
+// (§24.21 M52/M60): same status, headers and body; only the hop-by-hop headers
+// and Content-Length (the body may have been buffered/truncated) are adjusted.
+func forwardUpstreamError(w http.ResponseWriter, e *upstreamResponseError) {
+	copyHeader(w.Header(), e.header)
+	removeHopByHop(w.Header())
+	w.Header().Del("Content-Length")
+	w.Header().Set("Content-Length", strconv.Itoa(len(e.body)))
+	w.WriteHeader(e.status)
+	_, _ = w.Write(e.body)
+}
+
 // serveChain runs the fallback state machine: build the candidate chain for the
 // request, try the first closed instance, retry pre-response failures on the
 // next closed candidate, and record outcomes. §24.17 M36/M37: there is no
@@ -851,6 +962,11 @@ type candidate struct {
 // chain. §24.19 M45–M48: an all-open chain tries every candidate in chain order,
 // starting at index 0. A locked protocol sends everything to the pinned
 // instance (§24.15 M10).
+//
+// §24.21 adds a fallback round after the first round fails: every protocol
+// instance the first round never called is tried in configuration order, with
+// the instance's own mapped model (M56–M58). Each instance is attempted at most
+// once per request (M61/M15bl).
 func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto protocol, insts []*instanceRuntime, body []byte) {
 	start := time.Now()
 	reqModel, _ := requestModel(body)
@@ -860,42 +976,213 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		locked = ps.lockedIndex()
 	}
 	var chain []*candidate
-	switch {
-	case locked >= 0 && locked < len(insts):
-		if cand := lockedCandidate(proto, insts, body, locked); cand != nil {
-			chain = []*candidate{cand}
+	lockedMode := locked >= 0 && locked < len(insts)
+	var lockedCand *candidate
+	if lockedMode {
+		// §24.25 M93: the pinned instance is always first, then every other
+		// instance in configuration order, each with its own mapped model
+		// (§24.25 M99/M100).
+		lockedCand = lockedCandidate(proto, insts, body, locked)
+		if lockedCand != nil {
+			chain = append(chain, lockedCand)
 		}
-	default:
+		for i, inst := range insts {
+			if i == locked {
+				continue
+			}
+			chain = append(chain, mappedCandidate(proto, inst, body))
+		}
+	} else {
 		chain = buildChainFrom(proto, insts, body)
 	}
 
 	// §24.17 M36/M39: closed candidates are tried in chain order; open ones are
 	// skipped. §24.19 M45/M46: when every candidate is open the whole chain is
 	// tried from index 0, so a failing head falls through to the next instance.
-	attempts := make([]*candidate, 0, len(chain))
-	for _, cand := range chain {
-		if !cand.inst.isOpen() {
-			attempts = append(attempts, cand)
+	// §24.25 M93: the pinned candidate is never skipped, even when open.
+	// §24.31 M161: exhausted instances never enter the attempts and never take
+	// part in the all-open fallback.
+	var attempts []*candidate
+	var exhaustedCands []*candidate
+	if lockedMode {
+		if lockedCand != nil {
+			attempts = append(attempts, lockedCand)
+		}
+		var closed, rest []*candidate
+		for _, cand := range chain {
+			if cand == lockedCand {
+				// §24.31 M163: an operator pin wins over the quota state.
+				continue
+			}
+			if cand.inst.isExhausted() {
+				continue
+			}
+			rest = append(rest, cand)
+			if !cand.inst.isOpen() {
+				closed = append(closed, cand)
+			}
+		}
+		if len(closed) > 0 {
+			attempts = append(attempts, closed...)
+		} else {
+			attempts = append(attempts, rest...)
+		}
+	} else {
+		for _, cand := range chain {
+			if cand.inst.isExhausted() {
+				exhaustedCands = append(exhaustedCands, cand)
+				continue
+			}
+			if !cand.inst.isOpen() {
+				attempts = append(attempts, cand)
+			}
+		}
+		if len(attempts) == 0 {
+			for _, cand := range chain {
+				if cand.inst.isExhausted() {
+					continue
+				}
+				attempts = append(attempts, cand)
+			}
 		}
 	}
-	if len(attempts) == 0 && len(chain) > 0 {
-		attempts = append(attempts, chain...)
+
+	// plan is the first round plus the §24.21 fallback round. fallbackStart
+	// separates the rounds so the monitor reports the right retry reason.
+	plan := attempts
+	fallbackStart := len(attempts)
+	// §24.31 M162: every candidate of the chain is out of quota, so the
+	// request cannot be served at all.
+	allExhausted := len(attempts) == 0 && len(exhaustedCands) > 0
+	if !lockedMode && !allExhausted {
+		seen := make(map[*instanceRuntime]bool, len(insts))
+		for _, cand := range attempts {
+			seen[cand.inst] = true
+		}
+		byInst := make(map[*instanceRuntime]*candidate, len(chain))
+		for _, cand := range chain {
+			byInst[cand.inst] = cand
+		}
+		// M56–M58/M61: every protocol instance the first round never called is
+		// topped up in configuration order. A chain candidate kept its own
+		// mapped model; a chain-external instance is mapped from its own roles
+		// or models, never from the client's original model name.
+		for _, inst := range insts {
+			if seen[inst] {
+				continue
+			}
+			seen[inst] = true
+			// §24.31 M161: an instance without quota is never called.
+			if inst.isExhausted() {
+				continue
+			}
+			cand := byInst[inst]
+			if cand == nil {
+				cand = fallbackCandidate(proto, inst, body)
+				if cand == nil {
+					continue
+				}
+			}
+			plan = append(plan, cand)
+		}
 	}
 
 	tracker := h.monitor.trackRequest(r, proto, reqModel)
+	// §24.29 M137: derive a request-scoped cancellable context. Every upstream
+	// attempt inherits it, so an operator cancel interrupts in-flight header
+	// waits and body reads without touching the shared transport connection.
+	ctx, cancelRequest := context.WithCancel(r.Context())
+	r = r.WithContext(ctx)
+	tracker.setCancel(cancelRequest)
+	defer cancelRequest()
+
 	finalStatus := 0
 	var finalMetrics attemptMetrics
 	var finalErr error
-	defer func() { tracker.end(finalStatus, finalErr, finalMetrics) }()
+	// §24.29 M139–M144: cancellation stops the chain, skips breaker accounting
+	// and maps to 502 (pre-header) or a truncated connection (committed).
+	finishCancelled := func(committed bool, status int, m attemptMetrics) {
+		m.reqModel = reqModel
+		finalMetrics = m
+		finalErr = errRequestCancelledByOperator
+		inst := m.instName
+		if inst == "" {
+			inst = "-"
+		}
+		if committed {
+			finalStatus = status
+			// Log before closing the client connection: the client observes the
+			// truncation immediately, and the reason line must not race it.
+			log.Printf("request %s cancelled by operator inst=%s phase=streaming", tracker.id, inst)
+			truncateClientConnection(w)
+		} else {
+			finalStatus = http.StatusBadGateway
+			log.Printf("request %s cancelled by operator inst=%s phase=pre-header", tracker.id, inst)
+			writeProtocolError(w, proto, http.StatusBadGateway, errRequestCancelledByOperator.Error())
+		}
+		logRequest(r, m, time.Since(start))
+	}
+	// §24.22 M63/M69 and §24.26 M115/M116: the summary is computed for failed
+	// requests and for requests that carry tool_use. A successful request only
+	// gets the log line; reqShape is written to stats on failure alone (M119).
+	defer func() {
+		failed := finalStatus >= http.StatusBadRequest || finalStatus == 0
+		if failed || requestMayHaveToolUse(body) {
+			stats := computeReqShapeStats(proto, body)
+			if stats.ToolUseMsgs > 0 {
+				log.Printf("reqshape msgs=%d tool_use_msgs=%d paired_msgs=%d unpaired_idx=%s thinking=%s last=%s session=%s",
+					stats.Messages, stats.ToolUseMsgs, stats.PairedMsgs, formatUnpaired(stats),
+					stats.Declared, stats.Last, stats.Session)
+			}
+			if failed {
+				finalMetrics.reqShape = buildReqShapeWithStats(proto, body, stats)
+			}
+		}
+		tracker.end(finalStatus, finalErr, finalMetrics)
+	}()
+
+	// §24.31 M162: no candidate left because every one of them ran out of
+	// quota. The client gets a 502 naming the exhausted instances.
+	if allExhausted {
+		names := make([]string, 0, len(exhaustedCands))
+		for _, cand := range exhaustedCands {
+			names = append(names, cand.inst.name)
+		}
+		finalStatus = http.StatusBadGateway
+		finalErr = errors.New(errAllQuotasExhausted)
+		finalMetrics = attemptMetrics{instName: names[0], reqModel: reqModel}
+		tracker.begin(exhaustedCands[0])
+		writeProtocolError(w, proto, http.StatusBadGateway,
+			errAllQuotasExhausted+": "+strings.Join(names, ", "))
+		log.Printf("%s %s -> (%s) total=%ss status=502 %s", r.Method, r.URL.Path, proto,
+			formatSeconds(time.Since(start)), errAllQuotasExhausted)
+		logRequest(r, finalMetrics, time.Since(start))
+		return
+	}
 
 	// last is the candidate that failed before any response was written. Its
 	// model information goes into the final log line so that a failed routed
 	// call still shows which instance/model was tried (§23 only drops the
 	// segment for traffic that never reached a route).
 	var last *candidate
-	for i, cand := range attempts {
+	// lastUpstream keeps the last real non-2xx upstream response so it can be
+	// forwarded instead of a synthetic 502 (§24.21 M60).
+	var lastUpstream *upstreamResponseError
+	var lastUpstreamCand *candidate
+	var lastUpstreamMetrics attemptMetrics
+	handoffUsed := false
+	for i := 0; i < len(plan); i++ {
+		cand := plan[i]
+		lockedExempt := lockedMode && cand == lockedCand
+		handoffBeforeContent := lockedMode && !lockedExempt
 		tracker.begin(cand)
-		committed, status, metrics, err := h.tryCandidate(w, r, proto, cand, body, tracker)
+		committed, status, metrics, err := h.tryCandidate(w, r, proto, cand, body, tracker, lockedExempt, handoffBeforeContent)
+		// §24.29 M139: an operator cancel terminates the request immediately;
+		// no later candidate or §24.21 fallback round may start.
+		if tracker.operatorCancelled() {
+			finishCancelled(committed, status, metrics)
+			return
+		}
 		if committed {
 			if err != nil {
 				log.Printf("%s %s response committed with error: %v", r.Method, r.URL.Path, err)
@@ -908,9 +1195,77 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		log.Printf("%s %s candidate %s failed: %v", r.Method, r.URL.Path, cand.inst.name, err)
 		last = cand
 		finalMetrics = metrics
-		if i+1 < len(attempts) {
-			tracker.retry(attempts[i+1], retryReason(err))
+		var upstream *upstreamResponseError
+		if errors.As(err, &upstream) {
+			lastUpstream, lastUpstreamCand, lastUpstreamMetrics = upstream, cand, metrics
 		}
+		// §24.25 M94: while pinned, a non-locked stream that has not produced
+		// content is aborted and handed back to the locked instance at once.
+		if lockedMode && !handoffUsed && lockedCand != nil && cand != lockedCand &&
+			errors.Is(err, errLockedHandoff) {
+			handoffUsed = true
+			plan = append(plan[:i+1], lockedCand)
+			tracker.retry(lockedCand, retryReasonFallbackRetry)
+			continue
+		}
+		if i+1 < len(plan) {
+			reason := retryReason(err)
+			if i+1 >= fallbackStart {
+				reason = retryReasonFallbackRetry
+			}
+			tracker.retry(plan[i+1], reason)
+		}
+	}
+
+	// §24.25 M94d/M15de: after every non-locked candidate failed before the
+	// client saw a byte, the pinned instance gets one final try. The handoff is
+	// used at most once; afterwards routing never returns to non-locked peers.
+	if lockedMode && !handoffUsed && lockedCand != nil && last != nil && last != lockedCand {
+		handoffUsed = true
+		tracker.begin(lockedCand)
+		committed, status, metrics, err := h.tryCandidate(w, r, proto, lockedCand, body, tracker, true, false)
+		if tracker.operatorCancelled() {
+			finishCancelled(committed, status, metrics)
+			return
+		}
+		if committed {
+			if err != nil {
+				log.Printf("%s %s response committed with error: %v", r.Method, r.URL.Path, err)
+			}
+			metrics.reqModel = reqModel
+			finalStatus, finalMetrics, finalErr = status, metrics, err
+			logRequest(r, metrics, time.Since(start))
+			return
+		}
+		log.Printf("%s %s candidate %s failed: %v", r.Method, r.URL.Path, lockedCand.inst.name, err)
+		last = lockedCand
+		finalMetrics = metrics
+		var upstream *upstreamResponseError
+		if errors.As(err, &upstream) {
+			lastUpstream, lastUpstreamCand, lastUpstreamMetrics = upstream, lockedCand, metrics
+		}
+	}
+
+	// §24.29 M139: a cancel between the last attempt and the final response
+	// must still terminate without forwarding a candidate response.
+	if tracker.operatorCancelled() {
+		finishCancelled(false, 0, finalMetrics)
+		return
+	}
+
+	if lastUpstream != nil && lastUpstreamCand != nil {
+		// M52/M60: with no candidate left, relay the last upstream rejection
+		// unchanged instead of hiding it behind a 502.
+		tracker.begin(lastUpstreamCand)
+		log.Printf("%s %s -> (%s) total=%ss status=%d all candidates failed (forwarding upstream response)",
+			r.Method, r.URL.Path, proto, formatSeconds(time.Since(start)), lastUpstream.status)
+		forwardUpstreamError(w, lastUpstream)
+		lastUpstreamMetrics.reqModel = reqModel
+		finalStatus = lastUpstream.status
+		finalErr = lastUpstream
+		finalMetrics = lastUpstreamMetrics
+		logRequest(r, finalMetrics, time.Since(start))
+		return
 	}
 
 	if last != nil {
@@ -1048,6 +1403,80 @@ func fallbackChain(proto protocol, insts []*instanceRuntime) []*candidate {
 	return out
 }
 
+// fallbackCandidate maps one protocol instance the first round never called
+// onto the request with that instance's own upstream model (§24.21 M58): the
+// requested role or wildcard for Anthropic, the declared model or the first
+// model for OpenAI. It returns nil when the instance has no mapping, so the
+// fallback round never falls back to the client's original model name.
+func fallbackCandidate(proto protocol, inst *instanceRuntime, body []byte) *candidate {
+	model, rewrite, ok := resolveInstanceModel(proto, inst, body)
+	if !ok {
+		return nil
+	}
+	return &candidate{inst: inst, model: model, rewrite: rewrite}
+}
+
+// resolveInstanceModel returns the upstream model this instance maps the
+// request onto and whether the body must be rewritten (§24.25 M99/M100).
+// ok=false means the instance declares no usable mapping; callers decide how to
+// fall back (lockedCandidate keeps the client model untouched, fallbackCandidate
+// skips the instance).
+func resolveInstanceModel(proto protocol, inst *instanceRuntime, body []byte) (model string, rewrite, ok bool) {
+	requested, usable := requestModel(body)
+	switch proto {
+	case protocolAnthropic:
+		if usable {
+			if inst.hasModel(requested) {
+				return requested, false, true
+			}
+			if role, ok := requestRole(requested); ok {
+				if mapped, ok := inst.roles[role]; ok {
+					return mapped, true, true
+				}
+			}
+		}
+		if mapped, ok := inst.roles[config.RoleWildcard]; ok {
+			return mapped, true, true
+		}
+		if mapped, ok := firstRoleMapping(inst); ok {
+			return mapped, true, true
+		}
+		return "", false, false
+	default:
+		if len(inst.models) == 0 {
+			return "", false, false
+		}
+		if usable && contains(inst.models, requested) {
+			return requested, false, true
+		}
+		return inst.models[0], true, true
+	}
+}
+
+// mappedCandidate builds a candidate with the instance's own mapping. Unlike
+// fallbackCandidate it never returns nil: when no mapping resolves, the client
+// model is kept verbatim (§24.25 M99).
+func mappedCandidate(proto protocol, inst *instanceRuntime, body []byte) *candidate {
+	model, rewrite, ok := resolveInstanceModel(proto, inst, body)
+	if ok {
+		return &candidate{inst: inst, model: model, rewrite: rewrite}
+	}
+	requested, _ := requestModel(body)
+	return &candidate{inst: inst, model: requested}
+}
+
+// firstRoleMapping returns the instance's mapping in canonical role order
+// (wildcard is handled by fallbackCandidate), so an Anthropic instance that
+// maps no requested role still contributes a deterministic own model.
+func firstRoleMapping(inst *instanceRuntime) (string, bool) {
+	for _, role := range concreteRoles {
+		if model, ok := inst.roles[role]; ok {
+			return model, true
+		}
+	}
+	return "", false
+}
+
 func (inst *instanceRuntime) hasModel(model string) bool {
 	for _, declared := range inst.models {
 		if declared == model {
@@ -1169,6 +1598,11 @@ type attemptMetrics struct {
 	hasGen      bool
 	genTPS      float64
 	hasTPS      bool
+	// upstreamBody is the excerpt of a non-2xx upstream body (§24.20 M53).
+	upstreamBody string
+	// reqShape is the §24.22 M63 structural summary of the client request body,
+	// filled only when the request ends in failure.
+	reqShape string
 }
 
 const (
@@ -1330,10 +1764,19 @@ func logRequest(r *http.Request, m attemptMetrics, total time.Duration) {
 // (at least partially) written to the client, so no further candidate may be
 // tried. A non-nil error with committed=false is a retryable pre-response
 // failure (connection/dial/response-header/first-token-timeout errors).
-func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto protocol, cand *candidate, body []byte, tracker *requestMonitor) (committed bool, status int, m attemptMetrics, err error) {
+func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto protocol, cand *candidate, body []byte, tracker *requestMonitor, lockedExempt, handoffBeforeContent bool) (committed bool, status int, m attemptMetrics, err error) {
+	attemptStart := time.Now()
 	m.instName = cand.inst.name
 	m.model = cand.model
 	m.hasModel = true
+	// §24.29 M142: an operator cancel is not an upstream failure and must not
+	// touch the breaker, even when a timer/error path also fires.
+	recordFailure := func() {
+		if tracker.operatorCancelled() {
+			return
+		}
+		h.recordFailure(cand.inst)
+	}
 	attemptBody := body
 	if cand.rewrite {
 		attemptBody = rewriteModel(body, cand.model)
@@ -1341,16 +1784,43 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 
 	target, err := url.JoinPath(cand.inst.baseURL.String(), upstreamPath(r.URL.Path))
 	if err != nil {
-		h.recordFailure(cand.inst)
+		recordFailure()
 		return false, 0, m, fmt.Errorf("join upstream URL: %w", err)
 	}
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
 
-	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, target, bytes.NewReader(attemptBody))
+	trace := &headerProfile{}
+	requestCtx := r.Context()
+	budget := time.Duration(0)
+	var budgetFired atomic.Bool
+	var budgetTimer *time.Timer
+	var cancelBudget context.CancelFunc
+	if !lockedExempt && cand.inst.timeout > 0 {
+		// §24.26 M110: this budget covers connect, upload and the wait for
+		// response headers. http.Client.Timeout would kill the SSE body, so the
+		// deadline is a timer that cancels a derived context; stopping the
+		// timer after Do returns removes the deadline from the stream.
+		budget = cand.inst.timeout
+		requestCtx, cancelBudget = context.WithCancel(requestCtx)
+		remaining := time.Until(attemptStart.Add(budget))
+		if remaining < 0 {
+			remaining = 0
+		}
+		budgetTimer = time.AfterFunc(remaining, func() {
+			budgetFired.Store(true)
+			cancelBudget()
+		})
+		// Runs after the response body has been consumed; stopping the timer
+		// is what removes the deadline once headers arrive.
+		defer cancelBudget()
+	}
+	requestCtx = httptrace.WithClientTrace(requestCtx, trace.trace())
+
+	outReq, err := http.NewRequestWithContext(requestCtx, r.Method, target, bytes.NewReader(attemptBody))
 	if err != nil {
-		h.recordFailure(cand.inst)
+		recordFailure()
 		return false, 0, m, fmt.Errorf("build upstream request: %w", err)
 	}
 	outReq.ContentLength = int64(len(attemptBody))
@@ -1372,13 +1842,64 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 		outReq.Header.Set("Authorization", "Bearer "+cand.inst.apiKey)
 	}
 
-	resp, err := cand.inst.client.Do(outReq)
+	client := cand.inst.client
+	if lockedExempt && cand.inst.lockedClient != nil {
+		// §24.25 M95: the pinned instance uses the timeout-free client.
+		client = cand.inst.lockedClient
+	}
+	resp, err := client.Do(outReq)
+	if budgetTimer != nil {
+		budgetTimer.Stop()
+	}
+	budgetHit := budgetFired.Load()
 	if err != nil {
-		h.recordFailure(cand.inst)
+		// §24.29: an operator cancel wins over budget/upstream errors and never
+		// counts as an instance failure.
+		if tracker.operatorCancelled() {
+			return false, 0, m, errRequestCancelledByOperator
+		}
+		recordFailure()
+		if budgetHit {
+			// §24.27 M121/M122: the budget fired exactly when the diagnostic is
+			// needed. Use the trigger moment as the observation point so hdr is
+			// about the instance timeout and passes M118's half-timeout gate.
+			trace.log(cand.inst.name, attemptStart, time.Now(), cand.inst.timeout, len(attemptBody), budget)
+			// §24.26 M111: the pre-header budget fired before any response.
+			return false, 0, m, fmt.Errorf("response header budget exceeded after %s: %w", formatProfileDuration(budget), err)
+		}
 		return false, 0, m, fmt.Errorf("upstream request: %w", err)
 	}
 	defer resp.Body.Close()
 	headersAt := time.Now()
+	// §24.26 M118: only slow header waits are logged.
+	trace.log(cand.inst.name, attemptStart, headersAt, cand.inst.timeout, len(attemptBody), budget)
+
+	// §24.20 M49–M51: a final status outside 2xx is a failed candidate. Nothing
+	// has been written to the client yet, so the body is buffered and the chain
+	// may move on; if this turns out to be the last opportunity, serveChain
+	// forwards the buffered response verbatim (M52).
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, upstreamErrorBodyLimit+1))
+		// §24.29 M142: a cancel during the error-body read is still not an
+		// upstream failure.
+		if tracker.operatorCancelled() {
+			return false, resp.StatusCode, m, errRequestCancelledByOperator
+		}
+		recordFailure()
+		if readErr != nil {
+			return false, 0, m, fmt.Errorf("read upstream status %d body: %w", resp.StatusCode, readErr)
+		}
+		if len(errBody) > upstreamErrorBodyLimit {
+			errBody = errBody[:upstreamErrorBodyLimit]
+		}
+		statusErr := &upstreamResponseError{
+			status: resp.StatusCode,
+			header: resp.Header.Clone(),
+			body:   errBody,
+		}
+		m.upstreamBody = statusErr.excerpt()
+		return false, resp.StatusCode, m, statusErr
+	}
 
 	encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
 	decompressGzip := encoding == "gzip" || encoding == "x-gzip"
@@ -1394,7 +1915,7 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 		// first_token_timeout still covers a silent upstream.
 		gz, gzErr := newGzipBody(resp.Body, streaming)
 		if gzErr != nil {
-			h.recordFailure(cand.inst)
+			recordFailure()
 			return false, 0, m, fmt.Errorf("decompress upstream gzip body: %w", gzErr)
 		}
 		respBody = gz
@@ -1421,20 +1942,60 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	}
 
 	if streaming {
+		streamIdle, streamFirstToken, streamContentIdle := h.idleTimeout, h.firstTokenTimeout, cand.inst.timeout
+		slowInterrupt := proto == protocolAnthropic
+		minTPS := h.minTokensPerSecond
+		if lockedExempt {
+			// §24.25 M95/M97: the pinned instance is exempt from every time
+			// budget, including the real-time slow-stream interruption.
+			streamIdle, streamFirstToken, streamContentIdle = 0, 0, 0
+			slowInterrupt = false
+			minTPS = 0
+		}
 		// For streams, headers are committed together with the first data chunk
 		// so a first-token timeout can still fail over to another instance.
-		outcome, streamErr := h.copySSE(w, respBody, h.idleTimeout, h.firstTokenTimeout,
-			h.minTokensPerSecond, proto == protocolAnthropic, parseable, writeResponseHead, tracker)
+		outcome, streamErr := h.copySSE(w, respBody, streamIdle, streamFirstToken, streamContentIdle,
+			minTPS, slowInterrupt, parseable, cand.inst.name,
+			proto == protocolAnthropic && parseable, proto == protocolAnthropic && parseable,
+			lockedExempt, handoffBeforeContent, writeResponseHead, tracker)
+		// §24.23 M76: exactly one stage summary per streaming attempt.
+		logStreamPhases(cand.inst.name, headersAt.Sub(attemptStart), outcome, trace.connID())
+		// §24.26 M117: response shape sits next to the stage summary.
+		injected := 0
+		if outcome.injected {
+			injected = 1
+		}
+		log.Printf("resp_shape thinking_blocks=%d tool_use_blocks=%d signature_empty=%d injected=%d",
+			outcome.thinkingBlocks, outcome.toolUseBlocks, outcome.signatureEmpty, injected)
+		// §24.29 M141: cancellation is checked before the idle/slow branches so
+		// a concurrent content-idle timer cannot append a pause_turn tail. The
+		// committed state decides whether serveChain truncates or returns 502.
+		if tracker.operatorCancelled() {
+			if outcome.committed {
+				return true, resp.StatusCode, m, errRequestCancelledByOperator
+			}
+			return false, 0, m, errRequestCancelledByOperator
+		}
+		if outcome.handoff {
+			// §24.25 M94b: the aborted non-locked attempt counts as a failure
+			// (M92 exempts only the locked instance).
+			recordFailure()
+			return false, 0, m, errLockedHandoff
+		}
 		if outcome.firstTokenTimeout {
-			h.recordFailure(cand.inst)
+			log.Printf("instance %s timeout: first-token for %s; stream terminated", cand.inst.name, h.firstTokenTimeout)
+			recordFailure()
 			return false, 0, m, &attemptFailure{
 				reason: retryReasonFirstTokenTimeout,
 				err:    fmt.Errorf("first token timeout after %s", h.firstTokenTimeout),
 			}
 		}
 		if !outcome.committed {
+			if tracker.operatorCancelled() {
+				return false, 0, m, errRequestCancelledByOperator
+			}
 			if streamErr != nil {
-				h.recordFailure(cand.inst)
+				recordFailure()
 				return false, 0, m, fmt.Errorf("read stream: %w", streamErr)
 			}
 			// Empty stream: commit the (empty) response and treat as success.
@@ -1450,24 +2011,43 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 		m.inTokens, m.hasIn = outcome.state.inTokens, outcome.state.hasIn
 		m.outTokens, m.hasOut = outcome.state.tokens, outcome.state.hasTokens
 
-		if outcome.idle {
+		if outcome.idle || outcome.contentIdle {
+			// §24.29 M141: even if a timer won the race, an operator cancel must
+			// not append the pause_turn tail.
+			if tracker.operatorCancelled() {
+				return true, resp.StatusCode, m, errRequestCancelledByOperator
+			}
+			// §24.23 M73: the content-idle verdict shares this branch verbatim,
+			// so the client-visible bytes match an idle_timeout exactly.
+			// Record and log before truncating: an OpenAI truncation closes the
+			// client connection immediately, and the reason line must not race
+			// the client's EOF.
+			recordFailure()
+			if outcome.contentIdle {
+				log.Printf("instance %s timeout: content-idle for %s (no content block); stream terminated", cand.inst.name, cand.inst.timeout)
+			} else {
+				log.Printf("instance %s idle for %s; stream terminated", cand.inst.name, h.idleTimeout)
+			}
 			if proto == protocolAnthropic && !outcome.state.finished {
 				if err := writePauseTurnTail(w, &outcome.state); err != nil {
-					h.recordFailure(cand.inst)
 					return true, resp.StatusCode, m, fmt.Errorf("write pause_turn tail: %w", err)
 				}
 			} else if proto == protocolOpenAI {
 				truncateClientConnection(w)
 			}
-			h.recordFailure(cand.inst)
-			log.Printf("instance %s idle for %s; stream terminated", cand.inst.name, h.idleTimeout)
 			return true, resp.StatusCode, m, nil
 		}
 		if outcome.slow {
+			// §24.29 M141: same guard for the slow-stream pause_turn tail.
+			if tracker.operatorCancelled() {
+				return true, resp.StatusCode, m, errRequestCancelledByOperator
+			}
 			// §19 real-time low throughput: the verdict already implies a failed
 			// attempt, so the post-hoc throughput judgement is skipped.
-			h.recordFailure(cand.inst)
+			recordFailure()
 			log.Printf("instance %s slow stream (realtime): %.0fB/s", cand.inst.name, outcome.slowBytesPerSecond)
+			log.Printf("instance %s timeout: slow for %.0fB/s (min %st/s); stream %s", cand.inst.name,
+				outcome.slowBytesPerSecond, formatTPS(h.minTokensPerSecond), slowStreamState(proto))
 			if proto == protocolAnthropic && !outcome.state.finished {
 				if err := writePauseTurnTail(w, &outcome.state); err != nil {
 					return true, resp.StatusCode, m, fmt.Errorf("write pause_turn tail: %w", err)
@@ -1476,11 +2056,11 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 			return true, resp.StatusCode, m, nil
 		}
 		if streamErr != nil {
-			h.recordFailure(cand.inst)
+			recordFailure()
 			return true, resp.StatusCode, m, fmt.Errorf("copy response body: %w", streamErr)
 		}
-		if h.judgeThroughput(&m) {
-			h.recordFailure(cand.inst)
+		if !lockedExempt && h.judgeThroughput(&m) {
+			recordFailure()
 			log.Printf("instance %s slow stream: %st/s", cand.inst.name, formatTPS(m.genTPS))
 		} else {
 			h.recordSuccess(cand.inst)
@@ -1507,11 +2087,17 @@ func (h *Handler) tryCandidate(w http.ResponseWriter, r *http.Request, proto pro
 	}
 
 	if copyErr != nil {
-		h.recordFailure(cand.inst)
+		if tracker.operatorCancelled() {
+			return true, resp.StatusCode, m, errRequestCancelledByOperator
+		}
+		recordFailure()
 		return true, resp.StatusCode, m, fmt.Errorf("copy response body: %w", copyErr)
 	}
-	if h.judgeThroughput(&m) {
-		h.recordFailure(cand.inst)
+	if tracker.operatorCancelled() {
+		return true, resp.StatusCode, m, errRequestCancelledByOperator
+	}
+	if !lockedExempt && h.judgeThroughput(&m) {
+		recordFailure()
 		log.Printf("instance %s slow: %st/s", cand.inst.name, formatTPS(m.genTPS))
 	} else {
 		h.recordSuccess(cand.inst)
@@ -1726,6 +2312,23 @@ type sseState struct {
 	// tokens (usage only, reported once at stream end) this ticks on every
 	// incremental content event, so per-chunk diffs identify real content.
 	contentDeltas int
+	// events counts every recognised data event. contentDeltas is a subset;
+	// the difference is the heartbeat/non-content count logged by §24.23 M76.
+	events int
+	// realContentDeltas counts only deltas that carry payload (Anthropic
+	// text/thinking/input_json, non-empty; OpenAI non-empty content/reasoning/
+	// tool arguments). signature_delta is excluded (§24.25 M94a). It is kept
+	// separate so §24.23's contentDeltas semantics stay unchanged.
+	realContentDeltas int
+	// §24.26 M103/M117 response shape: thinking/tool_use block counts, the
+	// highest block index seen, and which thinking blocks started with an empty
+	// signature but never received a non-empty signature_delta.
+	thinkingBlocks     int
+	toolUseBlocks      int
+	maxBlockIndex      int
+	hasBlockIndex      bool
+	emptyThinkingStart map[int]bool
+	filledThinkingSig  map[int]bool
 }
 
 func (s *sseState) feed(chunk []byte) {
@@ -1750,6 +2353,7 @@ func (s *sseState) processLine(line string) {
 		return
 	}
 	if payload == "[DONE]" {
+		s.events++
 		s.finished = true
 		return
 	}
@@ -1764,6 +2368,17 @@ func (s *sseState) processLine(line string) {
 		} `json:"message"`
 		// §24.9 Z5: OpenAI chat.completion chunks carry no content_block_delta;
 		// any non-empty delta field counts as one content-bearing chunk.
+		Delta struct {
+			Type        string `json:"type"`
+			Text        string `json:"text"`
+			Thinking    string `json:"thinking"`
+			PartialJSON string `json:"partial_json"`
+			Signature   string `json:"signature"`
+		} `json:"delta"`
+		ContentBlock struct {
+			Type      string  `json:"type"`
+			Signature *string `json:"signature"`
+		} `json:"content_block"`
 		Choices []struct {
 			Delta struct {
 				Content          string `json:"content"`
@@ -1779,6 +2394,7 @@ func (s *sseState) processLine(line string) {
 	if err := json.Unmarshal([]byte(payload), &event); err != nil {
 		return
 	}
+	s.events++
 	openAIContent := false
 	for _, choice := range event.Choices {
 		if choice.Delta.Content != "" || choice.Delta.ReasoningContent != "" {
@@ -1802,13 +2418,41 @@ func (s *sseState) processLine(line string) {
 	switch event.Type {
 	case "content_block_start":
 		s.inBlock = true
+		blockIndex := -1
 		if event.Index != nil {
-			s.blockIndex = *event.Index
+			blockIndex = *event.Index
+			s.blockIndex = blockIndex
+			if !s.hasBlockIndex || blockIndex > s.maxBlockIndex {
+				s.maxBlockIndex = blockIndex
+				s.hasBlockIndex = true
+			}
+		}
+		switch event.ContentBlock.Type {
+		case "thinking":
+			s.thinkingBlocks++
+			if event.ContentBlock.Signature == nil || *event.ContentBlock.Signature == "" {
+				if s.emptyThinkingStart == nil {
+					s.emptyThinkingStart = make(map[int]bool)
+				}
+				s.emptyThinkingStart[blockIndex] = true
+			}
+		case "tool_use":
+			s.toolUseBlocks++
 		}
 	case "content_block_stop":
 		s.inBlock = false
 	case "message_stop":
 		s.finished = true
+	}
+	if event.Type == "content_block_delta" && event.Delta.Type == "signature_delta" && event.Delta.Signature != "" {
+		index := s.blockIndex
+		if event.Index != nil {
+			index = *event.Index
+		}
+		if s.filledThinkingSig == nil {
+			s.filledThinkingSig = make(map[int]bool)
+		}
+		s.filledThinkingSig[index] = true
 	}
 	if event.Type == "content_block_delta" || openAIContent {
 		// Anthropic: one per content_block_delta. OpenAI: one per chunk that
@@ -1816,6 +2460,47 @@ func (s *sseState) processLine(line string) {
 		// together (§24.9 Z5).
 		s.contentDeltas++
 	}
+	// §24.25 M94a/M71: only deltas that carry actual payload count as "has
+	// content"; signature_delta and empty deltas do not.
+	realContent := false
+	switch event.Type {
+	case "content_block_delta":
+		switch event.Delta.Type {
+		case "text_delta":
+			realContent = event.Delta.Text != ""
+		case "thinking_delta":
+			realContent = event.Delta.Thinking != ""
+		case "input_json_delta":
+			realContent = event.Delta.PartialJSON != ""
+		}
+	default:
+		realContent = openAIContent
+	}
+	if realContent {
+		s.realContentDeltas++
+	}
+}
+
+// signatureEmptyCount returns the number of thinking blocks whose start
+// signature was empty/missing and that never received a non-empty
+// signature_delta (§24.26 M117).
+func (s *sseState) signatureEmptyCount() int {
+	n := 0
+	for index := range s.emptyThinkingStart {
+		if !s.filledThinkingSig[index] {
+			n++
+		}
+	}
+	return n
+}
+
+// nextBlockIndex is the index for an injected block: the highest index seen
+// plus one (§24.26 M104).
+func (s *sseState) nextBlockIndex() int {
+	if !s.hasBlockIndex {
+		return 0
+	}
+	return s.maxBlockIndex + 1
 }
 
 type sseOutcome struct {
@@ -1828,7 +2513,34 @@ type sseOutcome struct {
 	firstBlockAt       time.Time
 	lastBlockAt        time.Time
 	state              sseState
+
+	// §24.23 M70: the content-idle timer fired.
+	contentIdle bool
+	// §24.25 M94: a non-locked stream was aborted before its first real
+	// content block so the request can be handed to the locked instance.
+	handoff bool
+	// §24.26 M103/M117: an empty thinking block was injected, and the
+	// response-shape counters observed on the original bytes.
+	injected       bool
+	thinkingBlocks int
+	toolUseBlocks  int
+	signatureEmpty int
+	// §24.23 M76 stream phases, all relative to the response headers.
+	firstBlockDelay   time.Duration
+	firstContentDelay time.Duration
+	blockCount        int
+	pingCount         int
+	contentCount      int
+	lastGap           time.Duration
 }
+
+// §24.23 M78: timer identities recorded by the stream timeout reason line.
+const (
+	sseTimeoutNone int32 = iota
+	sseTimeoutFirstToken
+	sseTimeoutIdle
+	sseTimeoutContent
+)
 
 // §19 real-time throughput detection: token counts are unavailable mid-stream,
 // so byte throughput is measured and converted with a rough ratio.
@@ -1845,8 +2557,11 @@ type byteSample struct {
 
 // copySSE streams an SSE body. It arms a first-token timer until the first
 // chunk (commit is invoked just before that chunk is written) and then switches
-// to an idle timer reset on every chunk. When a timer fires the upstream body is
-// closed and the outcome reports which phase timed out.
+// to an idle timer reset on every chunk. §24.23 adds a content-idle timer: it
+// starts with the first chunk and is reset only by chunks that carry content
+// (the same counter the token statistics use), so heartbeats and block
+// boundaries cannot keep an empty stream alive. When a timer fires the upstream
+// body is closed and the outcome reports which phase timed out.
 //
 // It also tracks byte throughput over a sliding 10s window (§19). Once the
 // window is full and the rate is below minTokensPerSecond*bytesPerToken the
@@ -1854,49 +2569,148 @@ type byteSample struct {
 // closed immediately, otherwise (OpenAI) the stream keeps flowing.
 //
 // parse is false for bodies in an encoding the proxy cannot decode (§20.2);
-// such streams are forwarded but neither usage nor the byte window is tracked.
-func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, firstToken time.Duration, minTokensPerSecond float64, slowInterrupt, parse bool, commit func(), tracker *requestMonitor) (outcome sseOutcome, err error) {
-	var firstHit, idleHit, slowHit atomic.Bool
+// such streams are forwarded but neither usage, the byte window nor the
+// content-idle timer is tracked (content cannot be recognised).
+func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, firstToken, contentIdle time.Duration, minTokensPerSecond float64, slowInterrupt, parse bool, instName string, normalizeSignature, injectThinking, exemptLocked, handoffBeforeContent bool, commit func(), tracker *requestMonitor) (outcome sseOutcome, err error) {
+	streamStart := time.Now()
+	// §24.24 M81: signature normalization is Anthropic SSE only; the caller
+	// passes false for OpenAI and for encodings the proxy cannot decode.
+	var sigNorm *sseSignatureNormalizer
+	if normalizeSignature {
+		sigNorm = &sseSignatureNormalizer{}
+	}
+	// §24.26 M103: injection is a separate switch from normalization (M113).
+	var injector *sseThinkingInjector
+	if injectThinking {
+		injector = &sseThinkingInjector{instName: instName}
+	}
+	var firstHit, idleHit, contentHit, slowHit atomic.Bool
+	// timeoutReason records which timer fired first (§24.23 M78). The two idle
+	// timers can both fire before the blocked read returns.
+	var timeoutReason atomic.Int32
+
 	var timerMu sync.Mutex
-	var timer *time.Timer
+	var phaseTimer, contentTimer *time.Timer
 
 	var window []byteSample
 	var windowBytes int
 	var firstChunkAt time.Time
+	var firstContentAt time.Time
 	var slowBytes float64
 
 	defer func() {
 		outcome.slow = slowHit.Load()
 		outcome.slowBytesPerSecond = slowBytes
+		outcome.blockCount = outcome.chunks
+		outcome.contentCount = outcome.state.contentDeltas
+		outcome.pingCount = outcome.state.events - outcome.state.contentDeltas
+		if !outcome.firstBlockAt.IsZero() {
+			outcome.firstBlockDelay = outcome.firstBlockAt.Sub(streamStart)
+		}
+		if !firstContentAt.IsZero() {
+			outcome.firstContentDelay = firstContentAt.Sub(streamStart)
+		}
+		if !outcome.lastBlockAt.IsZero() {
+			outcome.lastGap = time.Since(outcome.lastBlockAt)
+		}
+		// §24.26 M117: response shape is read from the original bytes.
+		outcome.thinkingBlocks = outcome.state.thinkingBlocks
+		outcome.toolUseBlocks = outcome.state.toolUseBlocks
+		outcome.signatureEmpty = outcome.state.signatureEmptyCount()
 	}()
+	if sigNorm != nil || injector != nil {
+		defer func() {
+			// §24.25 M94c: a handoff aborts before any client byte, so pending
+			// event bytes must not leak to the client.
+			if outcome.handoff {
+				return
+			}
+			var tail []byte
+			if sigNorm != nil {
+				// §24.24 M86: an incomplete trailing event is forwarded
+				// verbatim, never dropped or truncated.
+				tail = sigNorm.flush()
+			}
+			if injector != nil {
+				// §24.26 M103: the final message_delta/message_stop may itself
+				// be pending here, so injection still runs before it.
+				tail = injector.feed(tail, &outcome.state)
+				tail = append(tail, injector.flush()...)
+				outcome.injected = injector.injected
+			}
+			if len(tail) > 0 {
+				_, _ = w.Write(tail)
+			}
+			// §24.24 M89: at most one summary line per streaming attempt, and
+			// only when something was actually rewritten.
+			if sigNorm != nil && sigNorm.blocks > 0 {
+				log.Printf("thinking signature normalized: blocks=%d inst=%s", sigNorm.blocks, instName)
+			}
+		}()
+	}
+	if exemptLocked {
+		defer func() {
+			// §24.25 M101: the pinned stream is exempt from every timeout; the
+			// old content-idle line is never printed for it.
+			if outcome.committed {
+				log.Printf("instance %s locked; stream not interrupted", instName)
+			}
+		}()
+	}
 
-	arm := func(d time.Duration, idleStage bool) {
+	markTimeout := func(reason int32) {
+		timeoutReason.CompareAndSwap(sseTimeoutNone, reason)
+		_ = body.Close()
+	}
+	// armPhase covers the first-token and idle phases; they share one slot
+	// because idle only starts once the first chunk arrived.
+	armPhase := func(d time.Duration, reason int32) {
 		timerMu.Lock()
 		defer timerMu.Unlock()
-		if timer != nil {
-			timer.Stop()
-			timer = nil
+		if phaseTimer != nil {
+			phaseTimer.Stop()
+			phaseTimer = nil
 		}
 		if d <= 0 {
 			return
 		}
-		timer = time.AfterFunc(d, func() {
-			if idleStage {
-				idleHit.Store(true)
-			} else {
+		phaseTimer = time.AfterFunc(d, func() {
+			if reason == sseTimeoutFirstToken {
 				firstHit.Store(true)
+			} else {
+				idleHit.Store(true)
 			}
-			_ = body.Close()
+			markTimeout(reason)
+		})
+	}
+	// armContent (re)starts the §24.23 M70 content-idle timer, which has its own
+	// reset condition and therefore its own slot.
+	armContent := func(d time.Duration) {
+		timerMu.Lock()
+		defer timerMu.Unlock()
+		if contentTimer != nil {
+			contentTimer.Stop()
+			contentTimer = nil
+		}
+		if d <= 0 {
+			return
+		}
+		contentTimer = time.AfterFunc(d, func() {
+			contentHit.Store(true)
+			markTimeout(sseTimeoutContent)
 		})
 	}
 	defer func() {
 		timerMu.Lock()
-		if timer != nil {
-			timer.Stop()
+		if phaseTimer != nil {
+			phaseTimer.Stop()
+		}
+		if contentTimer != nil {
+			contentTimer.Stop()
 		}
 		timerMu.Unlock()
 	}()
-	arm(firstToken, false)
+	armPhase(firstToken, sseTimeoutFirstToken)
 
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
@@ -1905,15 +2719,6 @@ func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, first
 		n, err := body.Read(buf)
 		if n > 0 {
 			now := time.Now()
-			if !outcome.committed {
-				commit()
-				outcome.committed = true
-			}
-			if outcome.chunks == 0 {
-				outcome.firstBlockAt = now
-			}
-			outcome.lastBlockAt = now
-			outcome.chunks++
 			deltaTokens, cumTokens, tokensKnown, contentDeltas := 0, 0, false, 0
 			if parse {
 				before := outcome.state.tokens
@@ -1927,6 +2732,9 @@ func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, first
 				cumTokens = after
 				tokensKnown = outcome.state.hasTokens
 				contentDeltas = outcome.state.contentDeltas - beforeContent
+				if contentDeltas > 0 && firstContentAt.IsZero() {
+					firstContentAt = now
+				}
 				if minTokensPerSecond > 0 {
 					if firstChunkAt.IsZero() {
 						firstChunkAt = now
@@ -1948,14 +2756,49 @@ func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, first
 					}
 				}
 			}
+			// §24.25 M94b: while pinned, judge a non-locked attempt once per
+			// chunk. Without a real content delta the upstream is closed before
+			// commit(), so the client has seen no byte and can be rerouted.
+			if handoffBeforeContent && parse && outcome.state.realContentDeltas == 0 {
+				_ = body.Close()
+				outcome.handoff = true
+				return outcome, nil
+			}
+			firstChunk := outcome.chunks == 0
+			if !outcome.committed {
+				commit()
+				outcome.committed = true
+			}
+			if firstChunk {
+				outcome.firstBlockAt = now
+			}
+			outcome.lastBlockAt = now
+			outcome.chunks++
+			if parse && (firstChunk || contentDeltas > 0) {
+				// §24.23 M70: the clock starts with the first chunk and is
+				// reset only by content, so heartbeats and block boundaries
+				// cannot extend an empty stream.
+				armContent(contentIdle)
+			}
 			tracker.chunk(readStart, now, n, deltaTokens, contentDeltas, cumTokens, tokensKnown)
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return outcome, werr
+			// §24.24 M85: sseState.feed above sees the original bytes; only
+			// this client-facing copy may be rewritten.
+			forward := buf[:n]
+			if sigNorm != nil {
+				forward = sigNorm.feed(buf[:n])
 			}
-			if flusher != nil {
-				flusher.Flush()
+			if injector != nil {
+				forward = injector.feed(forward, &outcome.state)
 			}
-			arm(idle, true)
+			if len(forward) > 0 {
+				if _, werr := w.Write(forward); werr != nil {
+					return outcome, werr
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			armPhase(idle, sseTimeoutIdle)
 		}
 		if err == io.EOF {
 			return outcome, nil
@@ -1965,9 +2808,27 @@ func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, first
 				outcome.firstTokenTimeout = true
 				return outcome, nil
 			}
-			if idleHit.Load() && outcome.committed {
-				outcome.idle = true
-				return outcome, nil
+			// The first timer to fire decides the reason; only one can win the
+			// CAS even if both close the body before the read returns.
+			if outcome.committed {
+				switch timeoutReason.Load() {
+				case sseTimeoutContent:
+					outcome.contentIdle = true
+					return outcome, nil
+				case sseTimeoutIdle:
+					outcome.idle = true
+					return outcome, nil
+				case sseTimeoutNone:
+					// Defensive fallback; a timer always marks its reason.
+					if contentHit.Load() {
+						outcome.contentIdle = true
+						return outcome, nil
+					}
+					if idleHit.Load() {
+						outcome.idle = true
+						return outcome, nil
+					}
+				}
 			}
 			if slowHit.Load() {
 				// The body was closed by the slow-stream detector; report the
@@ -1977,6 +2838,39 @@ func (h *Handler) copySSE(w http.ResponseWriter, body io.ReadCloser, idle, first
 			return outcome, err
 		}
 	}
+}
+
+// §24.23 M76: one stage-summary line per streaming attempt, fixed field order.
+// Unreached phases print "-". The line is log-only and never feeds statistics.
+func logStreamPhases(instName string, hdr time.Duration, outcome sseOutcome, conn string) {
+	firstBlock, firstContent, lastGap := "-", "-", "-"
+	if outcome.blockCount > 0 {
+		firstBlock = formatStreamPhase(outcome.firstBlockDelay)
+		lastGap = formatStreamPhase(outcome.lastGap)
+	}
+	if outcome.contentCount > 0 {
+		firstContent = formatStreamPhase(outcome.firstContentDelay)
+	}
+	log.Printf("stream %s hdr=%s first_block=%s first_content=%s blocks=%d pings=%d content=%d last_gap=%s conn=%s",
+		instName, formatStreamPhase(hdr), firstBlock, firstContent,
+		outcome.blockCount, outcome.pingCount, outcome.contentCount, lastGap, conn)
+}
+
+// formatStreamPhase renders a phase duration with the sample's precision:
+// hundredths below 10s, tenths above.
+func formatStreamPhase(d time.Duration) string {
+	if d < 10*time.Second {
+		return fmt.Sprintf("%.2fs", d.Seconds())
+	}
+	return fmt.Sprintf("%.1fs", d.Seconds())
+}
+
+// slowStreamState describes the §19 realtime verdict in the M78 reason line.
+func slowStreamState(proto protocol) string {
+	if proto == protocolAnthropic {
+		return "terminated"
+	}
+	return "continues"
 }
 
 // writePauseTurnTail emits Anthropic's graceful stop for an idle stream so the
@@ -2172,6 +3066,10 @@ type Server struct {
 	monitor    *monitorHub
 	sessions   *sessionStore
 	startedAt  time.Time
+	// §24.31 M157: the periodic balance checks of the current state.
+	balanceMu     sync.Mutex
+	balanceClient *http.Client
+	balances      *balancePoller
 }
 
 type serverState struct {
@@ -2188,6 +3086,8 @@ func NewServer(configPath string, cfg *config.Config) (*Server, error) {
 		monitor:    newMonitorHub(),
 		sessions:   newSessionStore(),
 		startedAt:  startedAt,
+		// §24.31 M154: the balance query has its own fixed timeout.
+		balanceClient: newBalanceClient(),
 	}
 	s.monitor.startedAt = startedAt
 	s.monitor.statsSource = s.statsSnapshot
@@ -2198,7 +3098,25 @@ func NewServer(configPath string, cfg *config.Config) (*Server, error) {
 		return nil, err
 	}
 	s.state.Store(st)
+	s.startBalanceChecks(st)
 	return s, nil
+}
+
+// startBalanceChecks (re)starts the periodic balance checks of st (§24.31 M157).
+// The first check of every instance runs right away so the state is known
+// within seconds of the startup.
+func (s *Server) startBalanceChecks(st *serverState) {
+	s.balanceMu.Lock()
+	defer s.balanceMu.Unlock()
+	if s.balances != nil {
+		s.balances.stop()
+		s.balances = nil
+	}
+	var insts []*instanceRuntime
+	for _, proto := range []protocol{protocolOpenAI, protocolAnthropic} {
+		insts = append(insts, st.handler.byProtocol[proto]...)
+	}
+	s.balances = newBalancePoller(s.balanceClient, insts)
 }
 
 func buildState(cfg *config.Config, monitor *monitorHub) (*serverState, error) {
@@ -2220,6 +3138,13 @@ func (s *Server) StartPersistence() {
 // idempotent.
 func (s *Server) Close() {
 	s.monitor.stats.stopPersistence()
+	// §24.31 M157: the balance checks stop with the server.
+	s.balanceMu.Lock()
+	if s.balances != nil {
+		s.balances.stop()
+		s.balances = nil
+	}
+	s.balanceMu.Unlock()
 }
 
 func (s *Server) reload() error {
@@ -2232,6 +3157,7 @@ func (s *Server) reload() error {
 		return err
 	}
 	s.state.Store(st)
+	s.startBalanceChecks(st)
 	return nil
 }
 
@@ -2346,6 +3272,8 @@ func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request, st *serverSt
 		s.serveInstanceLock(w, r, st)
 	case PathInstancesUnlock:
 		s.serveInstanceUnlock(w, r, st)
+	case PathInstancesBalance:
+		s.serveInstanceBalance(w, r, st)
 	case PathStatsClear:
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)

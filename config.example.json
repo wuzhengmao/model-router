@@ -18,6 +18,10 @@
         "provider": "deepseek",
         "timeout": "15s",
         "models": ["deepseek-chat", "deepseek-reasoner"],
+        "balance": {
+          "kind": "deepseek",
+          "interval": "5m"
+        },
         "model_capabilities": {
           "deepseek-chat": {
             "max_input_tokens": 1000000,
@@ -30,6 +34,18 @@
             "thinking": true
           }
         }
+      },
+      {
+        "name": "MiniMax",
+        "base_url": "https://api.minimax.cn/v1",
+        "api_key": "replace-with-your-minimax-subscription-key",
+        "provider": "minimax",
+        "timeout": "15s",
+        "models": ["MiniMax-M2.7", "MiniMax-M3"],
+        "balance": {
+          "kind": "minimax_plan",
+          "interval": "5m"
+        }
       }
     ],
     "anthropic": [
@@ -39,6 +55,10 @@
         "api_key": "sk-replace-with-your-deepseek-key",
         "provider": "deepseek",
         "timeout": "15s",
+        "balance": {
+          "kind": "deepseek",
+          "interval": "5m"
+        },
         "roles": {
           "sonnet": "deepseek-v4-flash",
           "opus": "deepseek-v4-pro",

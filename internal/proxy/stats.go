@@ -30,6 +30,7 @@ const (
 	statsRecentRequests   = 100
 	statsRecentErrors     = 20
 	statsErrorSummaryRune = 80
+	statsUpstreamBodyRune = 200
 	statsQPSWindow        = 60 * time.Second
 )
 
@@ -62,6 +63,9 @@ type statsInstance struct {
 	DegradedSince int64  `json:"degradedSince"`
 	Reason        string `json:"reason"`
 	Current       bool   `json:"current"`
+	// §24.31 M165: balance/quota snapshot of the instance. The field is
+	// omitted for instances that do not take part in a balance check.
+	Balance *balanceInfo `json:"balance,omitempty"`
 	// Removed marks persisted counters for an instance no longer configured
 	// (§24.7 D11): the row stays visible with a "removed" label.
 	Removed bool `json:"removed"`
@@ -106,6 +110,10 @@ type statsError struct {
 	UpstreamModel string `json:"upstreamModel"`
 	Model         string `json:"model"`
 	Error         string `json:"error"`
+	// §24.20.3: excerpt of the non-2xx upstream body that caused the failure.
+	UpstreamBody string `json:"upstreamBody,omitempty"`
+	// §24.22.3: structural summary of the failed request's client body.
+	ReqShape string `json:"reqShape,omitempty"`
 }
 
 // statsSnapshot is the single serialization shape shared by GET /api/stats and
@@ -299,6 +307,8 @@ func (a *statsAggregator) finish(req monitorRequestSnapshot, success bool) {
 			UpstreamModel: req.UpstreamModel,
 			Model:         req.ReqModel,
 			Error:         truncateRunes(req.Error, statsErrorSummaryRune),
+			UpstreamBody:  truncateRunes(req.UpstreamBody, statsUpstreamBodyRune),
+			ReqShape:      req.ReqShape,
 		}}, a.recentErrors...)
 		if len(a.recentErrors) > statsRecentErrors {
 			a.recentErrors = a.recentErrors[:statsRecentErrors]
@@ -521,6 +531,11 @@ func (s *Server) statsSnapshot(wsClients int) statsSnapshot {
 				row.State, row.DegradedSince, row.Reason, row.Locked = ps.stateFor(i)
 			}
 			row.Degraded = row.State == stateOpen
+			// §24.31 M165: only instances with a balance check carry the field.
+			if info, ok := inst.balanceSnapshot(); ok {
+				snapshot := info
+				row.Balance = &snapshot
+			}
 			rows = append(rows, row)
 		}
 	}

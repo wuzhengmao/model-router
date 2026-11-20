@@ -856,7 +856,7 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 | K6d | 匿名 `curl -s -o /dev/null -w "%{http_code} %{content_type}"` → `200 image/x-icon`；响应体 `magic=00000100`、ICONDIR count=6（含 16/32/48） |
 | K6e / L3a | **已修订**：匿名 `/logo.svg` → 200、`image/svg+xml`、体以 `<svg` 开头、含 `viewBox="0 0 256 256"`；`/admin/logo.svg` 不再返回 200 |
 | K6f | `grep -c model-router internal/web/index.html internal/web/login.html` 均为 0；浏览器逐页 `document.body.innerText` 不含 `model-router` |
-| K6g | `grep -rn model-router go.mod Dockerfile docker-compose.yml` 仍为 `module model-router`、`wuzm219/model-router:0.1.1`、服务名 `model-router` |
+| K6g | `grep -rn model-router go.mod Dockerfile docker-compose.yml` 仍为 `module model-router`、服务名 `model-router`；镜像标签后按用户要求统一改为 `wuzm219/model-router:latest`（两个 compose 文件同步） |
 | K6h | UT-794：`go build`/`go vet`/`gofmt -l internal main.go`/`go test ./... -race -count=1` 全绿 |
 
 原始数据：`.claude-runs/m9-brand/measurements.json`；截图：`stats-1600x1019.png`、`stats-1000x900.png`、`monitor-1600x1019.png`、`monitor-1000x900.png`、`login-1600x1019.png`。
@@ -961,3 +961,298 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 - 新增用例全部在 `internal/proxy/circuit_internal_test.go`；公共装置 `cbAllOpenThree` 先用一条请求让三个失败实例全部转 `open`（`failure_threshold = 1`），再发全 `open` 请求验证重试链，避免每个用例重复铺陈。
 - 旧用例处理：`TestAllOpenUsesFirst`（UT-833）的语义已被 §24.19 M47 撤订，用例删除，由 UT-844～UT-848 取代；`TestFailureRetimesBackoff`（UT-835）追加断言全 `open` 重试中第二个实例同样被调用并重新计时；`TestFallbackAllDegradedUsesFirst` 更名为 `TestFallbackAllOpenRetriesEveryInstance`（UT-407），第二次全 `open` 请求的期望由「首实例 +1、次实例 0 次追加调用」改为「两实例各 +1 次追加调用」。
 - `attempts` 的构造与既有重试循环、`tracker.begin`/`tracker.retry` 记账未变，因此监控统计与请求日志的三档格式不受影响。
+
+## 38. 第十七轮：上游非 2xx 分类处置（§24.20 M49–M55）
+
+### 38.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-850 | M15ba 上游 400 换实例并记失败 | `TestUpstream400FailsOverAndRecordsFailure` | 首实例返回 400、响应头未提交：请求改打第二实例并得到 200；两实例各调用 1 次；首实例 `consecutiveFailures = 1` |
+| UT-851 | M15bb 上游 500 换实例并记失败 | `TestUpstream500FailsOverAndRecordsFailure` | 与 UT-850 相同，首实例返回 500 |
+| UT-852 | M15bc 候选耗尽转发原始 400 | `TestUpstream400AllCandidatesFailedForwardsOriginal` | 两实例都返回 400：客户端收到 400 与原始 body；`recentErrors[0]` 的 `status=400`、`error`/`upstreamBody` 非空、`instName` 为最后失败实例 |
+| UT-853 | M15bd 已提交流不换实例 | `TestCommittedStreamIsNotRetried` | 首实例写出首个 SSE 块后断开连接：客户端收到已提交的 200，首实例调用 1 次、第二实例 0 次 |
+| UT-854 | M15be 连续 5xx 打开熔断 | `TestUpstream5xxOpensBreakerAtThreshold` | 阈值 2、两实例持续 500：两次请求后首实例 `consecutiveFailures = 2` 且 `state = open` |
+| UT-855 | M15bf 本地错误不计入实例 | `TestLocalAuthErrorDoesNotCountAgainstInstance` | 未带凭据请求返回 401：上游调用 0 次，所有实例失败计数 0、`degradedUntil` 为零 |
+| UT-856 | M54 重试原因 `upstream_status` | `TestRetryReasonUpstreamStatus` | `retryReason(*upstreamResponseError)` 返回 `upstream_status`；`fallback_retry` 常量值正确；错误文本非空 |
+| UT-857 | M15bg 构建与测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race` | 全部通过 |
+
+### 38.2 场景说明
+
+- 新增用例全部位于 `internal/proxy/upstream_fallback_internal_test.go`（`package proxy`），复用 `circuit_internal_test.go` 的 `cbClock`、`cbBackend`、`cbOpenAIInstance`、`newCBHandler`、`cbSend`/`cbPath` 装置，并额外提供 `instFailureCount` 与 `sendProxyRequest`（可断言响应体）。
+- UT-852 通过手工挂载 `newMonitorHub()` 让处理器记录统计，再从 `stats.snapshot` 读取 `recentErrors`；`upstreamBody` 字段由 `attemptMetrics` → `requestMonitor.end` → `statsAggregator.finish` 传递。
+- UT-853 用 `panic(http.ErrAbortHandler)` 模拟首块之后连接中断；代理端 `copySSE` 判定 `committed=true`，因此第二实例不会被调用。
+
+## 39. 第十八轮：全候选失败后的补漏尝试与错误透传（§24.21 M56–M62）
+
+### 39.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-858 | M15bh 闭包失败后依次尝试开断实例 | `TestOpenInstancesTriedAfterClosedCandidates` | 5 实例（3 closed + 2 open）全部连接失败：5 个实例各被调用 1 次，两个 open 实例按配置顺序被调用 |
+| UT-859 | M15bi 最后一个上游 400 透传 | `TestLastUpstream400ForwardedToClient` | 前两个实例失败（500 / 连接失败），开断的第三实例在补漏段返回 400：客户端收到 400 与原始 body，而不是 502；三者各调用 1 次 |
+| UT-860 | M15bj 全连接失败仍 502 | `TestAllConnectionFailuresReturn502` | 全部实例连接失败：客户端收到 502 且 body 含 `upstream request failed` |
+| UT-861 | M15bk 补漏使用实例映射模型 | `TestFallbackUsesInstanceMappedModel` | 首轮 sonnet 实例收到自身映射 `model-a`；链外 opus 实例在补漏段收到自身映射 `model-opus`，不是客户端原模型 `claude-sonnet-4-5` |
+| UT-862 | M15bl 五实例每实例最多一次 | `TestFiveInstancesCalledAtMostOnce` | 5 实例协议（3 closed + 2 open）全部失败时 5 个实例各调用 1 次；5 个全 closed 全部失败时同样各调用 1 次（首轮已覆盖全部实例，补漏段为空） |
+| UT-863 | M15bm 补漏失败仍记账 | `TestFallbackFailuresStillCount` | 补漏段实例失败计数 3→4；链外实例失败计数 0→1 |
+| UT-864 | M15bn 构建与测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race` | 全部通过 |
+
+### 39.2 场景说明
+
+- 旧用例处理：`TestOriginalModelRerunKeepsRequestBody`（原 M15bk「原模型重跑」）与 `TestFallbackStagesCallEachInstanceOnce`（原三实例）的语义已被改写后的 §24.21 M56–M62 推翻，分别由 UT-861/UT-862 取代；`TestLastUpstream400ForwardedToClient` 扩展为「最后一个实例在补漏段返回 400」。
+- 补漏段只使用「首轮尚未调用过的实例」：`serveChain` 用 `seen` 集合去重；链内实例直接复用首轮候选（映射一致），链外实例用 `fallbackCandidate` 按自身 `roles`/`models` 映射。M15bl 的「每实例 ≤1 次」与 M62 的「首轮已覆盖全部实例时不产生补漏」同时成立。
+- UT-861/UT-863 使用 Anthropic 角色链构造「链内实例 + 链外实例」：请求 `claude-sonnet-4-5` 只把声明 `sonnet` 的实例放进链；声明 `opus` 的实例在补漏段以自身映射（`model-opus`/`model-c`）被尝试，从而可机械区分「首轮映射」与「补漏映射」，并证明补漏没有回退到客户端原始模型名。
+- UT-858/UT-862 用 `handler.recordFailure` 预先把实例置为 `open`（阈值 1），避免依赖请求顺序制造状态。
+- 错误透传：只要任一候选拿到过真实非 2xx 响应，最终失败就转发最后一条（UT-859）；全部停在连接失败/超时才回退到 502（UT-860）。
+
+## 40. 第十九轮：失败请求的客户端请求体取证（§24.22 M63–M69）
+
+### 40.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-865 | M15bo 失败请求记录 `reqShape` 且条数一致 | `TestReqShapeAnthropicFormat` | 4 条消息的 Anthropic 请求返回上游 400：`recentErrors[0].reqShape` 等于 `msgs=4 \| 0:user[text] \| 1:assistant[thinking,text,tool_use] \| 2:user[tool_result] \| 3:user[text]`，且不含任何消息正文 |
+| UT-866 | M15bp 缺 `thinking` 的助手消息带标记 | `TestReqShapeToolUseWithoutThinking` | Anthropic `[text,tool_use]` 与 OpenAI `tool_calls`（content 为 null）两种消息均输出 `...]!!tool_use_without_thinking`，标记紧跟在 `]` 之后 |
+| UT-867 | M15bq 同时含 `tool_use` 与 `thinking` 不带标记 | `TestReqShapeToolUseWithThinking` | Anthropic `[thinking,text,tool_use]`、OpenAI `reasoning_content`+`tool_calls`、`reasoning`+`tool_calls` 均不含标记 |
+| UT-868 | M15br 大请求体仍 ≤ 1024 字符 | `TestReqShapeLargeBodyLimit` | 1 MiB / 20 条消息的 `reqShape` 字节数与 rune 数均 ≤ 1024 且以 `msgs=20` 开头；400 条消息时被截断并以 `…` 结尾 |
+| UT-869 | M15bs 非 JSON 不改变转发且记 `unparsable:` | `TestReqShapeUnparsable` | 请求体 `not-json` 原样到达上游、客户端仍收到上游 400；`recentErrors[0].reqShape` 为 `unparsable: not-json`；无 `messages` 的合法 JSON 同样走 `unparsable:` |
+| UT-870 | M15bt 成功请求不出现 `reqShape` | `TestReqShapeSuccessNotRecorded` | 200 请求后 `recentErrors` 为空，监控快照记录的 `ReqShape` 为空且序列化后不含 `reqShape` 键 |
+| UT-871 | M15bu 取证不改变转发字节 | `TestReqShapeDoesNotChangeForwardedBody` | `buildReqShape` 不修改入参切片；无需改写时上游收到逐字节相同的客户端 body，需改写时上游收到与 `rewriteModel` 输出完全一致的 body |
+| UT-872 | M15bv 构建与测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race` | 全部通过 |
+
+### 40.2 场景说明
+
+- 新增用例全部位于 `internal/proxy/req_shape_internal_test.go`（`package proxy`），复用 `circuit_internal_test.go` 的 `cbClock`、`cbBackend`、`cbOpenAIInstance`、`cbAnthropicInstance`、`newCBHandler` 与 `upstream_fallback_internal_test.go` 的 `sendProxyRequest`。
+- UT-865/UT-869/UT-870 通过手工挂载 `newMonitorHub()` 让处理器记录统计，再从 `stats.snapshot` 读取 `recentErrors`、从 `snapshotRequests()` 读取监控终态快照。
+- UT-868 用 `encoding/json` 生成 20 条各含 55 KiB 正文的消息（> 1 MiB），断言摘要长度与 `msgs=20` 前缀；再用 400 条消息触发截断分支，断言 `…` 结尾。
+- 格式与标记断言采用全等比较（UT-865～UT-867），因此 `msgs=` 前缀、` | ` 分隔符、块类型逗号分隔、`!!tool_use_without_thinking` 的位置均被机械校验；UT-865 额外断言摘要不含构造请求中的任何正文片段。
+- `reqShape` 只在下发给失败请求的 `statsError`、`monitorRequestSnapshot`、`monitorEndEvent` 上出现，三者均为 `string` + `omitempty`；UT-870 与 `TestReqShapeJSONField` 共同验证空值不序列化。
+
+## 41. 第二十轮：流式无内容超时与阶段日志（§24.23 M70–M80）
+
+### 41.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-873 | M15bw Anthropic 只发心跳被终止并写 `pause_turn` | `TestContentIdleTimeoutAnthropic` | 实例 `timeout=200ms`、`idle_timeout=5s`：上游先发 `message_start`/`content_block_start`/`content_block_stop`、随后每 10ms 只发 `event: ping`；请求在 3s 内结束，返回 200 且含 `"stop_reason":"pause_turn"` 与 `message_stop`，实例 `consecutiveFailures == 1` |
+| UT-874 | M15bw OpenAI 只发空 delta 被截断 | `TestContentIdleTimeoutOpenAI` | 实例 `timeout=200ms`：上游每 10ms 发一个空 `delta` chunk；客户端读到连接截断错误、body 不含 `[DONE]`，实例失败计数 +1 |
+| UT-875 | M15bz 块边界事件不重置无内容定时器 | `TestContentIdleIgnoresBoundaryEvents` | 上游每 10ms 重复 `message_start`/`content_block_start`/`content_block_stop` 且无 delta；200ms 实例超时后仍以 `pause_turn` 终止 |
+| UT-876 | M15bx 正常内容流不被误杀且字节一致 | `TestContentIdleContentKeepsStreamAlive` | 10 组 ping+`content_block_delta`（间隔 20ms）、实例 `timeout=150ms`：响应体与上游写入**逐字节相同**、无 `pause_turn`、失败计数 0，阶段摘要 `content=10` |
+| UT-877 | M15by 静默上游仍由 `first_token_timeout` 处置 | `TestSilentUpstreamFirstTokenTimeoutUnchanged` | `first_token_timeout=150ms`、实例 timeout 5s：单候选请求在 3s 内返回 502，失败计数 1，日志含 `timeout: first-token for 150ms` 且不含 `content-idle`；摘要 `first_block=-`、`first_content=-` |
+| UT-878 | M15ca 无内容超时与 idle 的客户端字节相同 | `TestContentIdleMatchesIdleClientBytes` | Anthropic 与 OpenAI 各自用同一上游前缀比较两条路径：Anthropic 的 `pause_turn` 尾巴逐字节相同；OpenAI 均以截断连接结束且已收到字节相同 |
+| UT-879 | M15cb/M15cc 每流一行摘要、非流式不打印 | `TestStreamPhaseSummaryOncePerStream` | 一个 SSE 请求 + 一个 JSON 请求：`stream phase-probe hdr=` 恰好出现 1 次；字段顺序为 `hdr=`、`first_block=`、`first_content=`、`blocks=`、`pings=`、`content=`、`last_gap=`，且 `content=2`、`pings=1`；JSON 响应体逐字节等于上游输出 |
+| UT-880 | M15cf 构建与全量测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` | 全部通过 |
+
+### 41.2 场景说明
+
+- 新增用例全部位于 `internal/proxy/stream_content_idle_internal_test.go`（`package proxy`），使用 `NewWithOptions` 直接构造处理器，实例名用于断言阶段行与原因行。
+- UT-873/UT-875/UT-876/UT-878 的上游在写完前缀后持续发心跳并阻塞，直到代理关闭响应体；因此断言的是「定时器真的触发」而不是上游主动 EOF。
+- UT-878 复用同一段上游字节，仅通过「实例 timeout 100ms + idle 5s」与「idle 100ms + 实例 timeout 5s」互换，证明两条路径落到同一个处置分支。
+- `TestRealtimeSlowAnthropicPauseTurn` 与 `TestRealtimeSlowOpenAINotInterrupted` 的实例 `timeout` 从 5s 调整为 30s：这两个 fixture 故意只发注释块（无内容），按 §24.23 会在实例 timeout 处被终止；提高到 30s 后 10s 慢窗口仍先到，断言未改动。
+- 既有测试的断言未改动；唯一签名适配是 `TestStreamingCopyStillFlushes` 的 `copySSE` 调用新增了一个 `contentIdle=0` 实参（禁用）。
+
+## 42. 第二十一轮：流式空 signature 归一化（§24.24 M81–M91）
+
+### 42.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-881 | M15cg thinking、`signature:""` 归一化 | `TestSignatureNormalizeEmptySignature` | 整包与 7 字节分片两种上游写法下，客户端 body 的 `signature` 均为 `model-router-placeholder`，其余事件逐字节不变；CRLF 行尾同样保留 |
+| UT-882 | M15cp thinking、`signature` 缺失 | `TestSignatureNormalizeMissingSignature` | 缺失字段被插入为 `"signature":"model-router-placeholder"` 且位于 `content_block` 开头；对象内既有空白与字段顺序保留 |
+| UT-883 | M15ch thinking、`signature` 非空 | `TestSignatureNormalizeNonEmptySignature` | 客户端 body 与上游 payload 逐字节相同 |
+| UT-884 | M15ci `content_block_start` 非 thinking | `TestSignatureNormalizeNonThinkingStart` | `text` / `redacted_thinking` 块（即使带空 `signature`）全部逐字节不变 |
+| UT-885 | M15cj 其它事件 | `TestSignatureNormalizeOtherEvents` | `message_start`、`ping`、`signature_delta`、`content_block_stop`、`message_stop` 全部逐字节不变 |
+| UT-886 | M15ck 不可解析/多行 data/超长/半行 | `TestSignatureNormalizeUnparsablePassthrough` | 非 JSON、多行 `data:`、超 32 KiB 事件原样透传且后续 thinking 事件仍被归一化；末尾未闭合事件逐字节补写 |
+| UT-887 | M15cl usage/token 统计不受改写影响 | `TestSignatureNormalizeStatsUnaffected` | 空签名与预签名两份同构流的 `sseState` 字段一致（in=11/out=22）；处理器统计 `InTokens/OutTokens = 11/22` |
+| UT-888 | M15cm 日志每请求最多一行 | `TestSignatureNormalizeLogsOnce` | 一次请求改写 2 个块只出现 1 行 `thinking signature normalized: blocks=2 inst=sig-inst`；无改写时该行不出现 |
+| UT-889 | M15co OpenAI 流式 / Anthropic 非流式不受影响 | `TestSignatureNormalizeOpenAIAndNonStreamUnaffected` | OpenAI SSE（即使含 Anthropic 形状事件）与 Anthropic JSON 响应均与上游逐字节相同 |
+| UT-890 | 构建与全量测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` | 全部通过 |
+
+### 42.2 场景说明
+
+- 新增用例全部位于 `internal/proxy/signature_normalize_internal_test.go`（`package proxy`），复用 `stream_content_idle_internal_test.go` 的 `newStreamHandler`、`streamAnthropicInstance`、`streamOpenAIInstance`、`doStreamRequest`、`captureStreamLogs` 与 `flush_internal_test.go` 的 `newFlushRecorder`。
+- UT-881 的 7 字节分片上游每片 `Flush` 并间隔 2ms，确保 `content_block_start` 事件跨多次 `copySSE` 读取；UT-886 的 80 KiB 事件强制走 `maxSignatureEventBytes` 的透传分支并验证下一事件恢复归一化。
+- UT-887 直接调用 `copySSE` 比较同一 payload 在空签名/预签名两种情况下的 `sseState`，再从挂载 `newMonitorHub()` 的处理器读取累计 token；tps 的输入 `outTokens/genDuration` 同源于该 state。
+- 唯一既有测试适配：`flush_internal_test.go` 的 `copySSE` 调用新增 `instName` 与 `normalizeSignature=false` 实参，断言未改。
+
+## 43. 第二十二轮：锁定豁免、无内容转交与映射统一（§24.25 M92–M102）
+
+### 43.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-891 | M15cq/M15cr 锁定流超时豁免与日志 | `TestLockedStreamExemptFromTimeouts` | 锁定实例 `timeout=50ms`，上游每 20ms 发一个 `ping`（共 20 个）且无内容；请求耗时 ≥250ms（>3× timeout），客户端 body 与上游字节**完全相同**、不含 `pause_turn`；日志含 `instance locked-inst locked; stream not interrupted`，不含 `timeout: content-idle` |
+| UT-892 | M15ct 锁定实例连接层无响应头超时 | `TestLockedNoResponseHeaderTimeout` | 上游接受连接后阻塞 300ms（远超 50ms 实例 timeout）再回响应头：网关在 300ms 内不返回、不主动断开；日志无 `timeout awaiting response headers`、无 `instance locked-inst timeout`；释放后客户端拿到 200 |
+| UT-893 | M15cs/M15cu 锁定失败不计数且继续走其余实例 | `TestLockedFailureNotCountedAndFallsThrough` | 锁定实例返回 400、其余实例返回 200：客户端拿到 200 与其余实例响应；调用次数 1/1；锁定实例 `consecutiveFailures=0`、`degradedUntil` 为零 |
+| UT-894 | M15da 全部失败时透传最后一次真实响应 | `TestLockedFailureAllPeersFailForwardsLast` | 锁定实例与其余实例均返回 400：客户端收到锁定实例最后一次 400 与原始响应体；调用次数 2/1（锁定、其余、锁定最终重试）；锁定实例失败数 0、其余实例失败数 1 |
+| UT-895 | M15cv 锁定成功时其余实例零调用 | `TestLockedSuccessSkipsPeers` | 锁定实例 200、其余实例 200：客户端拿到锁定实例响应；调用次数 1/0 |
+| UT-896 | M15cw 解锁清零且锁定期间失败不追溯 | `TestUnlockClearsLockedPeriodCounters` | 阈值 1：锁定实例 400 不计数、其余实例 400 计 1；`unlock()` 后两个实例的 `consecutiveFailures` 与 `degradedUntil` 均归零 |
+| UT-897 | M15cx 锁定场景使用映射模型名 | `TestLockedUsesMappedModel` | 锁定实例 `roles={"sonnet":"deepseek-flash"}`，客户端发 `claude-sonnet-5`：上游收到的 body 中 `model` 为 `deepseek-flash` |
+| UT-898 | M15cy 锁定与补漏映射完全一致 | `TestLockedAndFallbackMappingAgree` | 12 个子用例：`*`/`sonnet`/`fable`/`opus`/`haiku` 五种角色 × 有无能力申明，另加精确模型与无映射；`lockedCandidate` 与 `fallbackCandidate` 的 model/rewrite 相同；无映射时 `fallbackCandidate` 为 nil、`lockedCandidate` 保持原模型名且 `rewrite=false` |
+| UT-899 | M15db/M15dc 无内容立即转交且不依赖超时 | `TestLockedHandoffBeforeContent` | 锁定实例首次 400、第二次返回完整内容流；非锁定实例只发 `message_start`+`ping`，其 `timeout=10min`：网关立即关闭该上游（请求耗时 <2s），客户端只收到锁定实例的完整 payload；调用次数 2/1；非锁定上游请求 context 被取消 |
+| UT-900 | M94d 转交只发生一次 | `TestLockedHandoffHappensOnce` | 锁定实例两次均 400；非锁定实例只发 `ping`：流程为锁定 400 → 非锁定中断 → 锁定最终 400，客户端收到最后一次 400；调用次数 2/1，不再回到非锁定实例 |
+| UT-901 | M15dg/M94a 非内容事件不算有 token | `TestLockedHandoffIgnoresNonContentEvents` | 6 个子用例：`ping`、`message_start`、`content_block_start`、空 `text_delta`、空 `thinking_delta`、`signature_delta`；每种都触发转交，客户端拿到锁定实例 payload，调用次数 2/1，非锁定上游被取消 |
+| UT-902 | M15dd/M94 已产出内容后不中断 | `TestLockedHandoffAfterContentDoesNotInterrupt` | 锁定实例首次 400；非锁定实例先发一个非空 `text_delta`，100ms 后再发 `ping`/`message_stop`：不转交，客户端收到非锁定实例完整流；调用次数 1/1 |
+| UT-903 | M15de 非锁定实例首字节失败后改发锁定实例 | `TestLockedHandoffOnPeerFirstByteFailure` | 锁定实例首次 400、第二次返回完整内容流；非锁定实例返回 400：客户端只收到锁定实例的完整响应，无重复响应头/半截字节；调用次数 2/1 |
+| UT-904 | M15df 未锁定路径逐字节不变 | `TestNoLockStreamBytesUnchanged` | 无锁定实例时，`message_start`/`content_block_start`/非空 `text_delta`/`ping`/`message_stop` 组成的流与上游 payload 全等 |
+| UT-905 | M15cz 既有锁定测试按新语义调整 | `TestLockRoutesEverythingAndUnlockResets` | 锁定实例 400 → 其余实例 200（不再 502）；锁定实例失败数 0、`degradedUntil` 零值；移动锁定后两者均失败 → 调用 3/3（锁定、其余、锁定最终重试）、锁定失败数 0、其余失败数 1；解锁后全部清零；解锁后首实例失败、次实例成功，调用 4/4 |
+| UT-906 | M15cz 构建与全量测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` | 全部通过 |
+
+### 43.2 场景说明
+
+- 新增用例全部位于 `internal/proxy/locked_exempt_internal_test.go`（`package proxy`），复用 `stream_content_idle_internal_test.go` 的 `newStreamHandler`、`doStreamRequest`、`captureStreamLogs`；`lxPacedSSE` 按事件间隔写出，用于验证超过实例 timeout 的锁定流；`newLXJSONBackend` 记录上游收到的 body。
+- UT-891 的 20 个 ping 每 20ms 一个，总时长约 400ms，明显超过 3×50ms；断言 `elapsed ≥ 250ms` 与完整字节，证明不是提前 EOF。
+- UT-892 先用 channel 确认上游已接受请求，再等待 300ms 断言客户端仍未返回；之后释放上游并断言 200，排除「网关直接断开」。
+- UT-899/UT-900/UT-901 使用 `lxRunNoContentHandoff`：锁定实例第一次返回 400、第二次成功，非锁定实例只发非内容事件并阻塞；通过上游请求 context 的 `Done` 断言非锁定上游被提前关闭。
+- UT-899 的非锁定实例 `timeout=10min`，同时断言请求总耗时 <2s，证明转交不依赖实例超时（M15dc）。
+- UT-898 不启动网络，直接构造 `instanceRuntime` 并比较 `lockedCandidate`/`fallbackCandidate` 的 `model`/`rewrite`；能力申明只影响 `capabilities`，不参与映射选择。
+- UT-905 是既有用例 `TestLockRoutesEverythingAndUnlockResets` 的语义调整：旧断言「锁定失败 → 502」按 M93/M96 改为「继续走其余实例」；锁定期间非锁定实例失败会按 M92 计数（其余实例 +1）；两者都失败时锁定实例获得一次最终重试（M15de），因此调用次数由 1/2 调整为 3/3；解锁后的调用次数相应为 4/4。其余断言（状态显示、解锁清零、解锁后从首实例恢复路由）未改。
+
+## 44. 第二十三轮：thinking 补位、响应头前总预算与诊断埋点（§24.26 M103–M120）
+
+### 44.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-907 | M15dh/M15dk/M15dl 注入位置、index 与 usage | `TestThinkingInjectionAddsBlock` | 三个子用例：有 `message_delta` 时注入块位于其前、仅有 `message_stop` 时位于其前、多个块 index 0/2 时注入 index=3；删除注入字节后与上游 payload 全等；`sseState.tokens=7` |
+| UT-908 | M15di/M15dj 已有 thinking 时不注入 | `TestThinkingInjectionSkipped` | thinking+tool_use、仅 thinking、仅 text 三种流客户端字节与上游全等，`outcome.injected=false` |
+| UT-909 | M15dm 非流式不注入 | `TestThinkingInjectionSkippedNonStreaming` | Anthropic JSON 响应含 tool_use 无 thinking：客户端 body 与上游全等，日志无 `thinking block injected:` |
+| UT-910 | M15dn parse=false 不注入 | `TestThinkingInjectionSkippedUnparseable` | 上游 `Content-Encoding: br` 且 `Content-Type: text/event-stream`：客户端收到原始字节，日志无注入 |
+| UT-911 | M15do 注入日志每尝试一行 | `TestThinkingInjectionLogOnce` | 3 个 tool_use 块的流只打印 1 行 `thinking block injected: inst=ti-inst tool_use=3 index=3`；不注入的流不打印 |
+| UT-912 | M113 注入与签名归一化互相独立 | `TestThinkingInjectionIndependentOfNormalization` | normalize=true/inject=false 只出现 placeholder、不注入；normalize=false/inject=true 正常注入且注入块 signature 为空串 |
+| UT-913 | M15dv signature_empty 口径 | `TestRespShapeSignatureEmpty` | 空 start + 空 delta → `signature_empty=1`；空 start + 非空 delta → 0；非空 start + 空 delta → 0；tool_use-only → `injected=1` |
+| UT-914 | M15dp 小 body 不受预算影响 | `TestHeaderBudgetFastRequestUnaffected` | 实例 timeout 2s、小请求 200 且总耗时 <500ms，日志无 `hdrprof` |
+| UT-915 | M15dq 慢上传触发预算 | `TestHeaderBudgetExceeded` | 上游只 accept 不读 body、实例 timeout 200ms、2 MiB 请求体：客户端收到 502，日志含 `response header budget exceeded`，实例失败计数 1 |
+| UT-916 | M15dr 锁定实例不施加预算 | `TestHeaderBudgetLockedExempt` | 同一慢上传场景锁定实例 timeout 200ms：600ms 后网关仍未返回；释放上游后请求结束，日志不含预算错误 |
+| UT-917 | M15ds 预算失败后换候选 | `TestHeaderBudgetFallsThrough` | 慢上传实例失败后第二个实例返回 200；日志含预算错误，第一实例失败 1、第二实例调用 1 |
+| UT-918 | M15dw hdrprof 字段与触发条件 | `TestHeaderProfileSlowHeaders` | 上游延迟 400ms 回响应头、实例 timeout 600ms：打印 `hdrprof inst=slow-hdr`，含 `connect=`/`tls=`/`upload=`/`server_wait=`/`body_bytes=`/`reused=`/`remote=`/`budget=600ms` 且 server_wait 已测量；快速请求不打印 |
+| UT-919 | M15dt/M15du/M15dx 请求形态日志与会话哈希 | `TestReqShapeDiagnosticsLog` | 成功请求（thinking+redacted_thinking+未配对）打印 2 次同一行：`reqshape msgs=5 tool_use_msgs=3 paired_msgs=2 unpaired_idx=3 thinking=absent last=tool_result session=<sha256 前 8 位>`；`recentErrors` 为空 |
+| UT-920 | M15dx session 缺失/非 JSON | `TestReqShapeSessionMissing` | 无 metadata、user_id 非 JSON、内层无 session_id 三种情况均打印 `session=-` |
+| UT-921 | M15dt redacted 计入 paired 与 unpaired 截断 | `TestReqShapeRedactedPairedAndUnpairedCap`、`TestReqShapeCountSuffix`、`TestReqShapeCountSuffixBeyondTruncation` | redacted_thinking+tool_use → `paired_msgs=1 unpaired_idx=-` 且无 `!!`；12 个未配对 → `unpaired_idx=1,2,3,4,5,6,7,8,9,10,+`；40 个交替未配对 → `1,3,...,19,+` |
+| UT-922 | M15dy 无 tool_use 请求不变 | `TestNoToolUseRequestUnchanged` | 普通 SSE 请求客户端字节与上游全等，无 `reqshape`/注入日志，`recentErrors` 为空 |
+| UT-923 | 回归：全量构建与测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` | 全部通过；既有 stats/WS 结构测试未改 |
+
+### 44.2 场景说明
+
+- 注入用例位于 `internal/proxy/thinking_inject_internal_test.go`：`tiRun` 直接调用 `copySSE`（`normalize/inject` 单独开关），用 `newFlushRecorder` 捕获客户端字节并从 `sseOutcome` 读取 `state.tokens`、块计数与 `injected`；端到端用例复用 `newStreamHandler`/`doStreamRequest`。
+- 预算与 `hdrprof` 用例位于 `internal/proxy/header_budget_internal_test.go`：`newSlowUploadListener` 是只 `Accept` 不读 body 的裸 TCP listener（`SetReadBuffer(4096)`），用 2 MiB 请求体确保上传阻塞；预算测试用实例 timeout 200ms，锁定用例在 600ms 后断言网关仍未返回。
+- 诊断用例位于 `internal/proxy/reqshape_diag_internal_test.go`：挂载 `newMonitorHub()` 以断言成功请求不进入 `recentErrors`；会话哈希在测试内用 `sha256` 复算。
+- 既有断言按 M114 改为 `tool_use_msgs`/`paired_msgs`/`unpaired_idx`；`TestReqShapeToolUseWithoutThinking` 等块级标记用例未改语义，仅 redacted 块不再产生标记。
+- 既有 `copySSE` 调用新增 `injectThinking=false` 实参；`flush_internal_test.go` 与 `signature_normalize_internal_test.go` 只做签名适配，断言未改。
+
+## 45. 第二十四轮：预算触发时补打 hdrprof（§24.27 M121–M126）
+
+### 45.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-924 | M15dz 预算触发时补打一行 hdrprof | `TestHeaderBudgetExceeded` | 慢上传 + 实例 timeout 200ms：日志含且仅含 1 行 `hdrprof inst=slow-inst`，含 `connect=`/`tls=`/`upload=`/`server_wait=`/`body_bytes=`/`reused=`/`remote=`/`budget=200ms` |
+| UT-925 | M15ea 补打不受 half-timeout 门槛影响 | `TestHeaderBudgetExceeded` | 请求耗时 ≥200ms（预算到点才返回），`hdrprof` 行仍出现 |
+| UT-926 | M15eb 快速响应头不补打（回归） | `TestHeaderBudgetFastRequestUnaffected`、`TestHeaderProfileSlowHeaders`（快速分支） | 小请求与快速上游均不打印 `hdrprof` |
+| UT-927 | M15ec 错误文本/计数/链路不变（回归） | `TestHeaderBudgetExceeded`、`TestHeaderBudgetFallsThrough` | 错误文本含 `response header budget exceeded after 200ms:`；慢实例失败计数 1；下一候选返回 200、客户端状态码不变 |
+| UT-928 | M15ed 锁定实例不补打（回归） | `TestHeaderBudgetLockedExempt` | 锁定慢实例 600ms 内不返回、无预算错误、无 `hdrprof` |
+| UT-929 | 构建与全量测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` | 全部通过 |
+
+### 45.2 场景说明
+
+- 复用 §44 的 `newSlowUploadListener`、`hbBigBody`、`lxAnthropicInstance`；`TestHeaderBudgetExceeded` 在原有断言上增加 `hdrprof` 行数/字段、错误文本与 `elapsed ≥ timeout` 断言。
+- `TestHeaderBudgetLockedExempt` 增加「无 `hdrprof`」断言；其余既有断言未改。
+
+## 46. 第二十五轮：连接标识观测（§24.28 M127–M134）
+
+### 46.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-930 | M15ee hdrprof 的 conn 与 remote 属于同一连接 | `TestHdrProfConnMatchesConnection` | 300ms 延迟 + 500ms 实例 timeout 触发 hdrprof：行含 `remote=127.0.0.1:<port>`、`conn=<port>`，且 `conn` 等于后端 `r.RemoteAddr` 的客户端端口；响应 200 且字节不变 |
+| UT-931 | M15ef GotConn 未触发时 conn=- | `TestHdrProfConnUnknown` | 零值 `headerProfile` 直接调用 `log`：`conn=-`、`remote=-`、`body_bytes=0`、`reused=0`、`budget=1s`，字段顺序完整，无数字端口 |
+| UT-932 | M15eg stream 行 conn 在 last_gap 后 | `TestStreamPhaseConnField` | `stream ... last_gap=<d> conn=<port>`，`conn` 等于后端看到的客户端端口；客户端字节逐字节不变、`recentErrors` 为空 |
+| UT-933 | M15eh 同连接相同、不同连接不同 | `TestConnIdentityStableAndDistinct` | 同一 handler 连续两次请求 `conn` 相同且后端两次 `RemoteAddr` 端口相同；新 handler 的 `conn` 不同且后端端口不同；conn 与后端端口一一对应 |
+| UT-934 | M15ei 回归：转发与统计不变 | `TestHdrProfConnMatchesConnection`、`TestStreamPhaseConnField`、全量既有测试 | 状态码、响应字节、超时判定、熔断计数与 `/api/stats` 结构未变 |
+| UT-935 | 构建与全量测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` | 全部通过 |
+
+### 46.2 场景说明
+
+- 新用例位于 `internal/proxy/conn_identity_internal_test.go`（`package proxy`）。`connTestBackend` 记录每个请求的 `r.RemoteAddr`，用来证明日志里的 `conn` 就是该连接在服务端看到的客户端端口。
+- hdrprof 用例用 300ms 延迟 + 500ms 实例 timeout 触发 §24.26 M118 的 half-timeout 门槛；stream 用例复用 `thinking_inject_internal_test.go` 的 SSE 构造器与 `newStreamHandler`/`doStreamRequest`/`captureStreamLogs`。
+- `TestConnIdentityStableAndDistinct` 通过同一 handler（同一 Transport）与新 handler（新 Transport）验证连接复用与区分；端口复用跨时间的情形无法稳定构造，未覆盖。
+- 既有 `TestHeaderProfileSlowHeaders`、`TestHeaderBudgetExceeded` 的字段断言不含 `conn`，新增字段不影响；`TestStreamPhaseSummaryOncePerStream` 只校验 `last_gap=` 之前的字段顺序。
+
+## 47. 第二十六轮：监控页强行取消活跃请求（§24.29 M135–M149）
+
+### 47.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-936 | M15ej/M15eq 前端取消列与按钮 | `TestMonitorCancelUI` | `index.html` 的 `colgroup` 在 `col-timeline` 后含 `col-cancel`，thead 有对应空表头；行构造在时间线后追加 `cancelCell`；仅未结束行显示 `×`，快照/已结束行隐藏；点击发送 `{"type":"cancel","id":...}` 文本帧并显示「已取消」 |
+| UT-937 | M15ek 响应头未提交时取消 → 502 | `TestOperatorCancelPreHeader` | 慢上游（不返回响应头）取消后客户端收到 502，正文含 `request cancelled by operator` |
+| UT-938 | M15el 已提交流取消 → 截断且无 pause_turn | `TestOperatorCancelCommittedStream` | 上游先发 SSE 头与内容后挂起；取消后客户端读到连接错误、状态 200、body 不含 `pause_turn` |
+| UT-939 | M15em 取消后不再发起后续候选 | `TestOperatorCancelPreHeader` | 取消后第二个实例调用计数为 0，无补漏尝试 |
+| UT-940 | M15en 取消不计入实例失败 | `TestOperatorCancelPreHeader`、`TestOperatorCancelCommittedStream` | 目标实例 `consecutiveFailures=0`、`degradedUntil` 为零 |
+| UT-941 | M15eo 同一连接其他请求不受影响 | 设计保证（见 design §47.2） | 取消只作用于 request context，不 Close transport 连接；未做 h2+TLS 端到端用例 |
+| UT-942 | M15ep 未知 id 与非法命令被忽略 | `TestMonitorCancelWebSocketCommands` | 非法 JSON/缺失字段/未知 type 后 ping 仍收到 pong；未知 id 不终止活动请求；随后正确 id 仍可取消 |
+| UT-943 | M15eq 快照恢复行的取消能力 | `TestMonitorCancelUI` | 快照行与实时行共用 `addMonitorRow`，id 不变，未结束行按钮可见 |
+| UT-944 | M15er 取消日志格式与唯一性 | `TestOperatorCancelPreHeader`、`TestOperatorCancelCommittedStream` | 每个请求恰好一行 `request <id> cancelled by operator inst=<名> phase=<pre-header\|streaming>`；日志先于客户端可见的关闭/502 |
+| UT-945 | M15es 回归：不点取消时行为不变 | `go test ./... -race -count=1` 全量既有用例 | 转发字节、超时、熔断、`/api/stats` 与 WS 事件结构未变 |
+
+### 47.2 场景说明
+
+- 新增用例位于 `internal/proxy/operator_cancel_internal_test.go`（`package proxy`）。`blockedHeaderBackend` 读取请求体后挂起不返回响应头；`waitActiveID` 轮询 `hub.active` 取当前请求 id；取消通过 `hub.cancelRequest(id)` 或 WebSocket 文本帧触发。
+- `TestMonitorCancelWebSocketCommands` 直接以 `hub.serveWS` 启动 WS 端，使用一个最小 RFC 6455 客户端完成握手、带掩码文本/控制帧发送与服务器帧读取；非法命令后用 ping/pong 证明连接未断。
+- `TestOperatorCancelCommittedStream` 的上游先写 `message_start`+text 事件并 flush，再阻塞；取消后断言客户端读取错误、状态码仍为已提交的 200、body 中无 `pause_turn`。
+- `TestMonitorCancelUI` 读取 `../web/index.html` 做静态契约断言（列位置、按钮文案、隐藏条件、WS 文本帧内容）；项目暂无浏览器自动化测试。
+
+## 48. 第二十七轮：MiniMax 国内供应商预设（§24.30 M150–M152）
+
+### 48.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-946 | M15et 预设共 12 条且含 minimax | `TestListContainsBuiltinProviders`（`internal/providers/providers_test.go`） | `providers.List()` 长度为 12；id 清单含 `minimax` 且无重复；每条预设的 base_url 都是绝对 http(s) URL；既有 11 条 id 全部仍在 |
+| UT-947 | M150 MiniMax 的两个 base_url | `TestMiniMaxPreset` | `Name == "MiniMax"`、`OpenAIBaseURL == "https://api.minimax.cn/v1"`、`AnthropicBaseURL == "https://api.minimax.cn/anthropic"` |
+| UT-948 | M150 MiniMax 无 models_override | `TestMiniMaxPreset` | `ModelsOverride == nil`；`GetModelsOverride("minimax","openai")` 与 `("minimax","anthropic")` 都 miss |
+| UT-949 | M150 无 override 时 ModelsSource 回落 fallback | `TestMiniMaxPreset` | `ModelsSource("minimax","anthropic","https://fallback.example","bearer")` 返回传入的 fallback 与 auth（preset 自身的 base_url 由上一条覆盖） |
+| UT-950 | M15eu 可视化添加实例自动填 base_url | 设计保证（见 design §48.1） | 沿用既有「选中内置供应商即按当前协议填 base_url」路径，MiniMax 无新增交互；无浏览器自动化测试 |
+| UT-951 | M15ev 回归：既有 11 条预设一字未改 | `TestListContainsBuiltinProviders`、`TestDeepSeekModelsOverride`、`TestModelsSource`（均未改动） | 既有 id、base_url、`models_override` 断言全部保留并通过；本轮 `presets` 只追加一条 |
+| UT-952 | 构建与全量测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` | 全部通过 |
+
+### 48.2 场景说明
+
+- MiniMax 相关用例位于 `internal/providers/providers_test.go`（`package providers_test`）：`TestMiniMaxPreset` 通过 `providers.Get("minimax")` 读取预设，字段断言覆盖名称、两个 base_url 与「无 override」；`ModelsSource` 的断言按其真实语义写成「无 override 时回落到调用方 fallback」。
+- `TestListContainsBuiltinProviders` 的 id 清单本轮追加 `minimax`，长度断言由 11 改为 12；其余断言（URL 合法、id 不重复、override 协议合法）未改。
+- 既有 `TestDeepSeekModelsOverride`、`TestModelsSource` 未做任何改动，作为 M15ev 的回归基线。
+
+## 49. 第二十八轮：余额与配额查询、余额列与配额耗尽自动禁用（§24.31 M153–M172）
+
+### 49.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-953 | M153 balance 对象严格解析 | `TestBalanceObjectParsing`（`internal/config/balance_test.go`）、`TestBalanceConfigParsing`（`internal/proxy/balance_internal_test.go`） | 两种 kind 均可解析；缺省 `balance` 的实例 `Balance == nil`；未知 kind 报 `balance.kind`；未知子字段报字段名；`url` 非绝对地址报 `balance.url`；`interval` 缺省为 5m、显式 `0s` 为 0；配置可 round trip |
+| UT-954 | M15fw 示例与启动报错 | `config.example.json`、`README.md` | 示例文件与 README 各给出 `minimax_plan` 与 `deepseek` 两种 kind；未知 kind / 未知子字段在启动时报错并指明字段名（同上一条用例） |
+| UT-955 | M155/M156 MiniMax 额度解析 | `TestBalanceParsesMiniMaxPlan` | 只取 `model_name == "general"`；`5h/7d` 取自 `current_interval_remaining_percent` / `current_weekly_remaining_percent`；任一窗口为 0 即耗尽；两个百分比缺失时按未知（-1）处理且不耗尽，note 非空 |
+| UT-956 | M155/M156 DeepSeek 余额解析 | `TestBalanceParsesDeepSeek` | 多币种取 CNY；无 CNY 取第一项并如实写明币种；`is_available == false` 或 `total_balance <= 0` 即耗尽；字符串与数字金额都接受；`balance_infos` 为空时按未知处理 |
+| UT-957 | M157 启动首查与认证 | `TestBalanceStartupCheck` | 实例启动后立即完成一次查询；余额快照 `amount == "51.01"`、`currency == "CNY"`、`checkedAt > 0`；上游收到的 `Authorization` 为 `Bearer <实例 api_key>`；`/api/stats` 的实例行带 `balance` 字段 |
+| UT-958 | M157 周期轮询 | `TestBalancePeriodicPoll` | `interval = 50ms` 的实例在 3s 内被查询至少 3 次（首查 + 周期） |
+| UT-959 | M15fy minimax_plan 的余额字段 | `TestBalanceStatsMiniMaxPlan` | `/api/stats` 的 `balance` 含 `kind == "minimax_plan"`、`interval5hPercent == 90`、`weekly7dPercent == 97`；订阅额度不产出金额与币种；未耗尽 |
+| UT-960 | M15fz deepseek 的金额与币种 | `TestBalanceStartupCheck`、`TestBalanceParsesDeepSeek` | `balance.amount == "51.01"`、`balance.currency == "CNY"`；无 CNY 时取第一项并写明实际币种 |
+| UT-961 | M15fx/M165 未声明 balance 的实例 | `TestBalanceStatsOmitsFieldWithoutBalance` | `/api/stats` 的实例行不带 `balance` 字段；路由与熔断行为不变 |
+| UT-962 | M158/M15gd 查询失败不改状态 | `TestBalanceCheckFailureKeepsState` | 上游返回 500 与非法 JSON 后状态仍为 `exhausted`；`balance.err` 有原因；上次成功的金额/币种与 `checkedAt` 保持不变 |
+| UT-963 | M160/M15gb 额度恢复 | `TestBalanceRefreshRestoresInstance` | 手动刷新查到有余额后状态回到 `closed`、响应体金额为新值；该实例重新承接请求并返回 200 |
+| UT-964 | M161/M15ga 耗尽实例被跳过 | `TestExhaustedInstanceIsSkipped` | 耗尽实例不承接请求（健康实例请求数 +1）；耗尽行 `state == "exhausted"`、`reason == "quota_exhausted"`、`degradedSince > 0` |
+| UT-965 | M162/M15gc 全耗尽 502 与 recentErrors | `TestAllExhaustedReturns502` | 客户端收到 502，正文含 `all instance quotas exhausted` 与耗尽实例名；上游调用数为 0；`stats` 快照与 `GET /api/stats` 的 `recentErrors[]` 都有一条记录，`error` 为该固定文本、`instName` 为耗尽实例名之一 |
+| UT-966 | M164 状态/数值/失败日志 | `TestBalanceLogs` | 耗尽时打印 `instance <名> quota exhausted` 与 `balance changed: inst=<名>`；恢复时打印 `instance <名> quota restored`；查询失败打印 `balance check failed: inst=<名> err=` |
+| UT-967 | M159/M15ge/M15gf 手动刷新接口 | `TestBalanceRefreshAPI` | 指定 name 返回 200 与该实例刚查询的余额与状态；不指定 name 刷新该协议全部声明了 balance 的实例；非法 protocol 400；不存在的 name 与未声明 balance 的实例 404；未鉴权 401 |
+| UT-968 | M167/M168/M169/M15gg 前端余额列 | `TestBalanceUI` | 两张实例表都有 `<th>余额</th>` 且排在 `<th>状态</th>` 之前；页面含 `stat-balance-clickable`、`点击刷新余额`、`/api/instances/balance`、`刷新中…`、`配额耗尽`、`stat-exhausted`；可视化页面把 `raw.balance` 原样带回 `item.balance`，保存配置时不丢该对象 |
+| UT-969 | M15gh 余额列与 /api/stats 一致 | `TestBalanceStatsMiniMaxPlan`、`TestBalanceUI` | 前端展示值取自 `/api/stats` 的同一个 `balance` 字段（`item.balance`），后端字段与前端渲染同源 |
+| UT-970 | M166/M15gi 余额不落盘 | `TestBalanceNotPersisted` | `stats.json` 全文不含 `balance` 字段 |
+| UT-971 | 回归：未声明 balance 的实例行为不变 | `go test ./... -race -count=1` 全量既有用例 | 既有 state 取值集合、路由顺序、熔断行为与 `/api/stats` 既有字段断言全部未改并通过 |
+| UT-972 | 构建与全量测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` | 全部通过 |
+
+### 49.2 场景说明
+
+- 新增用例位于 `internal/proxy/balance_internal_test.go`（`package proxy`）与 `internal/config/balance_test.go`（`package config_test`）。前者用 `balBackend`（可改 payload/状态码的假余额端点）与 `balServer`（本地 HTTP Server）驱动端到端路径，`balNoPoll()` / `balPoll(d)` 把周期设为 0 或指定值；后者只测配置解析，不依赖网络。
+- `TestAllExhaustedReturns502` 断言到两层：`server.monitor.stats.snapshot(...)` 的 `recentErrors` 与 `GET /api/stats` 的 `recentErrors[]`（`balGetRecentErrors`），后者对应 M15gc 的字面口径。
+- `TestBalanceLogs` 复用 `stream_content_idle_internal_test.go` 的 `captureStreamLogs`（同一 package）捕获标准 logger，断言 M164 的三行日志；日志捕获期间其它测试不并行运行。
+- `TestBalanceUI` 读取 `../web/index.html` 做静态契约断言（列位置、文案、类名、刷新接口）；项目暂无浏览器自动化测试，M15gg 的「刷新中禁用重复点击」由 `data-refreshing` 属性与 `刷新中…` 文案间接覆盖。
+- `TestBalancePeriodicPoll` 用 50ms 周期验证 M157 的重复查询；`balancePoller.stop()` 在 `Server.Close` 中取消并等待 goroutine，测试结束不泄漏。

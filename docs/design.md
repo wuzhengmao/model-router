@@ -1398,3 +1398,307 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 
 - **D-M15-1 沿用同一重试循环**：不为全 open 另写一套重试/记账路径，避免与 closed 候选语义分叉；差异只在 `attempts` 的构造。
 - **未覆盖**：§24.19 未给全 open 重试增加总时长上限——一次请求最多尝试 `len(chain)` 个实例，总耗时受各实例 `timeout` 与上游返回共同约束；实现不引入额外总超时。
+
+## 38. 第十七轮：上游非 2xx 按状态码分类处置（§24.20 M49–M55）
+
+### 38.1 实现
+
+- `internal/proxy/proxy.go` 的 `tryCandidate` 在 `client.Do` 拿到响应、尚未向客户端写出任何字节时先判定状态码：`<200 || >=300` 视为候选失败（M49/M50；Go 客户端已自动跟随重定向，最终仍非 2xx 的按同规则处理，M51）。
+- 失败时调用 `h.recordFailure(cand.inst)`，与连接错误同等记账；随后把响应体读入内存（上限 `upstreamErrorBodyLimit = 4 MiB`）并返回新的 `*upstreamResponseError`，其中保存状态码、响应头与响应体。未提交任何响应头，因此 `serveChain` 可以继续换下一个候选。
+- 响应体前缀（`upstreamBodyExcerptLimit = 512` 字节）进入三条可观测路径：
+  - 错误文本为 `upstream status <code>: <body prefix>`，即使响应体为空也至少是 `upstream status <code>`，保证 `error` 非空（M53）；
+  - `attemptMetrics.upstreamBody` → `requestMonitor.end` → `monitorRequestSnapshot.upstreamBody` → WS `end` 事件与 `/api/stats` 的 `recentErrors[].upstreamBody`（M53、§24.20.3）；
+  - `recentErrors[]` 的 `status`/`instName`/`upstreamModel`/`model` 沿用既有字段，分别来自最终失败候选与上游响应。
+- 若上游强制 gzip（`Content-Encoding: gzip`），转发仍使用原始压缩字节与原始响应头；错误文本里的 body 前缀额外做一次 best-effort 解压，便于阅读。
+- `retryReason()` 识别 `*upstreamResponseError` 并返回 `upstream_status`（M54）；前端未知原因按原文展示。
+- 候选全部失败时，`serveChain` 调 `forwardUpstreamError` 原样转发最后一次观测到的非 2xx 响应：状态码不变（M52），响应头经 `removeHopByHop` 清理，`Content-Length` 按实际缓冲长度重写。若所有候选都停在「未拿到响应头」阶段，则保持既有 502（M59 第二句）。
+- 本地生成响应（models 列表、管理面、鉴权失败、请求体过大等）在进入 `serveChain` 之前返回，不经过状态码分类（M55）。
+
+### 38.2 决策与未覆盖
+
+- **D-M16-1 状态分类只发生在真实转发路径**：`tryCandidate` 是唯一调用上游的位置；本地响应与 probe 接口（`/api/probe/*`）不共享该逻辑。
+- **D-M16-2 3xx 一律判失败**：Go 客户端默认跟随重定向；未被跟随的最终 3xx（如缺少 `Location`、`304`）按 M51 归入非 2xx 失败，而不是透传。
+- **D-M16-3 缓冲上限**：错误响应体最多缓冲 4 MiB 以便原样转发；超限时只转发前缀。正常上游错误体远小于该值，避免故障上游用超大错误体耗尽内存。
+- **未覆盖**：已提交响应后的上游错误（流式首块之后）不属于 M49/M50 的「响应头尚未提交」前提，行为保持既有语义——客户端收到已提交的响应，不再换实例（M15bd）。
+
+## 39. 第十八轮：全候选失败后的补漏尝试与错误透传（§24.21 M56–M62）
+
+### 39.1 实现
+
+- `serveChain` 在首轮尝试列表之后构造 `plan`：
+  1. **首轮**（原语义）：闭包候选按链序；链上全部 open 时整条链按链序（§24.19）。首轮真实调用过的实例记入 `seen`。
+  2. **补漏段**（M56–M58）：按**配置顺序**遍历该协议全部实例，跳过首轮已调用过的实例。未调用实例若在候选链上有候选（混合场景中被 `open` 跳过、但仍属于链的实例），直接复用首轮构造的 `candidate`；否则用 `fallbackCandidate` 按实例自己的映射构造：Anthropic 在请求模型等于实例声明模型时直连，否则依次取请求角色映射、`roles['*']`、`concreteRoles`（sonnet → opus → fable → haiku）顺序的第一个映射；OpenAI 取实例声明的请求模型（直连），未声明时取 `models[0]`。需要换名时通过 `rewrite` 改写请求体 `model`。
+- 没有任何映射的实例（Anthropic 无请求角色、无 `*`、无具体角色映射；OpenAI `models` 为空）不进入补漏段——M58 禁止回退到客户端原始模型名。
+- `seen`（按 `*instanceRuntime` 去重）保证每个实例在一次请求中最多被真实调用一次（M61）；`plan` 长度不超过该协议实例总数，首轮已覆盖全部实例时补漏段为空（M62）。
+- 首轮内部的 retry 原因仍按失败类型记 `error`/`first_token_timeout`/`upstream_status`（M54）；进入补漏段的 retry 记为 `fallback_retry`（M60）。
+- 补漏尝试的失败与成功仍走 `tryCandidate` 内的 `recordFailure`/`recordSuccess`，与首轮一致（M60/M15bm）。
+- 全部失败后：若过程中观测到真实非 2xx 上游响应，转发最后一条（状态码 + 响应体，M59）；只有所有候选都停在「未拿到响应头」阶段才返回 502 `upstream request failed`。
+- 锁定协议保持 §24.15 M10：只打被锁定实例，不进入补漏段（M62）。
+- `/api/stats` 未新增接口字段（`recentErrors[].upstreamBody` 属于 §24.20）；实时监控重试原因枚举增加 `upstream_status` 与 `fallback_retry`。
+
+### 39.2 决策与未覆盖
+
+- **D-M18-1 链内实例复用首轮候选**：混合场景中被 `open` 跳过、但仍属于候选链的实例，补漏段直接使用首轮构造的同一 `candidate`（相同 `model`/`rewrite`），避免重新推导导致与首轮映射分叉（M58「与第 1 段完全一致」）。
+- **D-M18-2 链外实例的映射选择**：Anthropic 实例可能只映射了别的角色（请求 `sonnet`、实例只声明 `opus`）。补漏段仍取该实例自己的映射，顺序为「请求角色 → `*` → `concreteRoles`」；OpenAI 取实例声明的请求模型，否则 `models[0]`。§24.21 未规定链外 Anthropic 实例选哪个角色映射，`concreteRoles` 顺序是实现的确定性选择（`fallbackCandidate`/`firstRoleMapping`）。
+- **D-M18-3 无映射实例跳过**：实例没有任何可用映射时不进入补漏段。M56 只定义「尚未调用过的实例集」，M58 又禁止使用客户端原始模型名；实现取 M58 优先：无映射即跳过。
+- **D-M18-4 无模型名的请求**：`requestModel` 解析不到字符串 `model` 时，补漏段仍按实例自己的映射（Anthropic 的 `*`/首个角色映射、OpenAI 的 `models[0]`）构造候选；§24.21 未覆盖此情况。
+- **D-M18-5 转发最后观测到的上游非 2xx**：M59 第一句写「最后一个候选」；若最后几次尝试是连接失败、但更早的候选拿到过 4xx/5xx，则按第二句「所有候选都停在未拿到响应头才 502」的精神，转发最后一次真实拿到的上游响应。
+- **未覆盖**：§24.21 未给补漏段增加总时长上限；一次请求最坏尝试 `len(insts)` 次，总耗时受各实例 `timeout` 与上游返回共同约束，实现不引入额外总超时。
+- **未覆盖**：补漏段失败后的熔断记账沿用既有 `recordFailure` 语义（达到阈值转 `open`，已 `open` 则重置回退时间），§24.21 未给出额外规则。
+
+## 40. 第十九轮：失败请求的客户端请求体取证（§24.22 M63–M69）
+
+### 40.1 实现
+
+- 采集点：`internal/proxy/proxy.go` 的 `serveChain` 在 defer 中判定 `finalStatus >= 400 || finalStatus == 0`，成立时把 `finalMetrics.reqShape = buildReqShape(proto, body)` 交给 `requestMonitor.end`（M63/M69）。`body` 是客户端**原始**请求体，不是任何候选改写后的 `attemptBody`；计算发生在响应写出之后，且纯函数只读入参（M68）。
+- 构造：`internal/proxy/reqshape.go` 的 `buildReqShape(proto, body)` 是独立的纯函数，便于单测：
+  - 解析顶层 `{"messages":[...]}`；消息元素的 `role` 必须是字符串。
+  - `content` 为字符串时记一个 `text` 块；为块数组时按数组顺序记每个块的 `type`；缺省或 `null` 记空序列。
+  - Anthropic 直接用块 `type`；OpenAI 额外把 `reasoning_content`/`reasoning`（非 null）记作 `thinking`（置于 content 之前）、把非空 `tool_calls` 数组记作 `tool_use`（置于 content 之后），仅作用于 `assistant` 消息（M64、§24.22.2）。
+  - 助手消息同时含 `tool_use` 且不含 `thinking` 时，在 `]` 之后追加 `!!tool_use_without_thinking`。
+  - 文本格式固定为 `msgs=N | <i>:<role>[<type,...>] | ...`。
+- 上限：`reqShapeLimit = 1024` 字节（摘要内容全为 ASCII，字节数即字符数上限）。构造时先预留省略标记 `…` 的 3 字节，按整条消息段追加，放不下即停止并追加 `…`（M65）。`unparsable:` 分支最多 64 个 rune，恒小于上限。
+- 解析失败（非 JSON、无 `messages` 数组、消息/块结构不符）时返回 `unparsable: ` + 前 64 个 rune（M67）；非法 UTF-8 以 `�` 替换，保证可打印。该路径不返回错误、不重试、不改变状态码。
+- 下发：`attemptMetrics.reqShape` → `monitorRequestSnapshot.reqShape` → `statsError.reqShape` 与 WS `end` 事件（`omitempty`）。`/api/stats` 的 `recentErrors[]` 只在失败时新增条目，因此成功请求不会出现该字段（M66/M69）。
+
+### 40.2 决策与未覆盖
+
+- **D-M19-1 失败判据取 M63 的字面定义**：`status >= 400 || status == 0`。已提交响应（如流式首块后断开）的 `status` 是上游 2xx，即便 `error` 非空也不写 `reqShape`；§24.22 未覆盖该情形。
+- **D-M19-2 OpenAI 摘要顺序**：`thinking` 在前、`tool_use` 在后，与 Anthropic 示例的 `[thinking,text,tool_use]` 生成顺序一致；§24.22 未规定 OpenAI 的块顺序。
+- **D-M19-3 非聊天结构一律 unparsable**：合法 JSON 但不是 `{"messages":[...]}`（或消息/块字段类型不符）按 M67 的精神记 `unparsable:`，不尝试猜测；仅非 JSON 在 M67 中有明文。
+- **未覆盖**：`redacted_thinking` 块按字面只作为块类型记录，不计入「含 `thinking`」，因此带 `tool_use` + `redacted_thinking` 的助手消息仍会带标记；§24.22 只提到 `thinking`。
+- **未覆盖**：OpenAI 非 `assistant` 消息即使带 `tool_calls`/`reasoning` 也不计入（§24.22.2 限定 `assistant` 消息）。
+- **未覆盖**：进入 `serveChain` 之前返回的本地错误（401、413 等）没有 `reqShape`；§24.22 的取证对象是转发请求。
+- **未覆盖**：`"messages": null` 视为缺失，记 `unparsable:`。
+
+## 41. 第二十轮：流式「无内容」超时与流阶段可观测性（§24.23 M70–M80）
+
+### 41.1 实现
+
+- 新增第二个流内定时器：`internal/proxy/proxy.go` 的 `copySSE` 现在维护 `phaseTimer`（首块/空闲共用，语义不变）与 `contentTimer`（无内容超时，§24.23 M70）。两者独立重置、独立触发，先到者通过 `timeoutReason.CompareAndSwap` 记录原因，保证 M78 的原因行与客户端处置一致。
+- 计时锚点与重置条件：
+  - `contentTimer` 在第一块数据到达时启动（此时响应头已提交），此后只有 `sseState.contentDeltas` 增量大于 0 的块才重置它；`event: ping`、空 delta、`message_start`/`content_block_start`/`content_block_stop`、`[DONE]` 等非内容事件一律不重置（M70/M71）。
+  - 内容判定直接复用 `sseState` 已在统计的 `contentDeltas`（Anthropic `content_block_delta`、OpenAI 非空 `content`/`reasoning_content`/`tool_calls.arguments`），没有第二套解析（M71）。
+- 超时时长取 `cand.inst.timeout`（默认 15s）：`tryCandidate` 把它作为 `contentIdle` 参数传给 `copySSE`。没有新增 `Options` 字段、没有新增 `fallback` 配置项（M72）。选择从 `instanceRuntime.timeout` 取值而不是扩充 `Options`，是因为实例超时本来就随实例配置存在，`config.Duration.Duration()` 保证正值（默认 15s），这是最小侵入且语义最贴近「实例 timeout 对已提交的流也生效」。
+- 触发后的处置完全复用既有 `outcome.idle` 分支（`tryCandidate` 中 `outcome.idle || outcome.contentIdle`）：Anthropic 未 `finished` 时写 `pause_turn` 尾巴、OpenAI 走 `truncateClientConnection`、`recordFailure` 计一次失败、`return true`（已 committed 不再降级），没有新增分支（M73）。
+- 既有 `idle_timeout` 保持「每块重置」不变（M74），`min_tokens_per_second` 的判定逻辑与阈值均未调整（M75）。
+- `parse == false`（§20.2 不可解码压缩编码）时不启动无内容定时器：这类流无法识别内容，启动会误杀健康流；其行为保持改动前。
+- 可观测性（只加日志，M76–M78）：
+  - `tryCandidate` 在每次 `copySSE` 返回后调用 `logStreamPhases`，固定打印一行：`stream <实例> hdr=<到响应头> first_block=<头→首块> first_content=<头→首内容块> blocks=<读块数> pings=<非内容事件数> content=<内容事件数> last_gap=<最后一块距结束>`；未到达的相位打印 `-`。`hdr` 从本次尝试开始（`tryCandidate` 入口）计到响应头；其余相位从 `copySSE` 起点（≈响应头）计。
+  - 超时触发时额外打印一行原因行：`instance <实例> timeout: content-idle for <实例 timeout> (no content block); stream terminated`、`instance <实例> timeout: first-token for <阈值>; stream terminated`、`instance <实例> timeout: slow for <实测>B/s (min <阈值>t/s); stream ...`；`idle` 沿用既有 `instance <实例> idle for <阈值>; stream terminated` 行。
+  - 阶段计数口径：`blocks` 等于 `outcome.chunks`（32 KiB 读块数），`content` 等于 `sseState.contentDeltas`（内容事件数），`pings` 等于「成功解析的数据事件数 − 内容事件数」。SSE 注释行（`: keepalive`）不属于数据事件，只计入 `blocks`（与既有 `idle_timeout` 的重置口径一致）。
+  - 日志不进 `/api/stats`、不进 WS 事件（M77）。
+- 转发行为零改变（M79）：写客户端、写上游、状态机迁移、定时器阈值均未改动；新增代码只在 `copySSE` 返回后读 `sseOutcome` 并 `log.Printf`。
+
+### 41.2 决策与未覆盖
+
+- **D-M20-1 无内容定时器以第一块数据为锚点**：若从响应头起算，一个完全静默的上游会同时命中 `first_token_timeout` 与无内容定时器，改变 M15by 要求的既有语义。以第一块数据为锚点后，静默上游仍只由 `first_token_timeout` 处置；一旦上游开始发数据（哪怕是心跳），无内容保护即接管。
+- **D-M20-2 首块即启动、无内容不重置**：第一块数据即使本身是心跳也会启动计时，这覆盖了生产事故中「持续 ping、零内容」的形态；SSE 注释流同样被约束，代价是既有 §19 慢流测试的 fixture 需要把实例 `timeout` 提高到 30s 才能在 10s 慢窗口之前保持原行为（只改 fixture，不改断言）。
+- **D-M20-3 先到者优先**：两个 idle 定时器可能在上游读阻塞期间先后触发；用 CAS 记录第一个触发者，避免 `contentHit` 与 `idleHit` 同时为真时把原因归错。
+- **未覆盖**：不可解码编码（`parse == false`）的流没有无内容保护，仍只受 `idle_timeout` 约束；§24.23 未要求此类流可解析。
+- **未覆盖**：一次请求若在多个候选上各发生一次流式尝试（首块超时后重试），每次尝试各打印一行阶段摘要；M76 的「每个流式请求」按上游流式尝试解释。
+- **未覆盖**：M80 明确不修「确定 4xx 后继续降级」，§24.21 语义保持不变。
+
+## 42. 第二十一轮：流式空 signature 归一化（§24.24 M81–M91）
+
+### 42.1 实现
+
+- 触发位置：`internal/proxy/proxy.go` 的 `copySSE`。`tryCandidate` 只在 `proto == protocolAnthropic && parseable` 时传入 `normalizeSignature=true`；OpenAI 流式、非流式与不可解码编码（`parse == false`）一律走原路径（M81）。
+- 事件切分：新增 `internal/proxy/signature_normalize.go` 的 `sseSignatureNormalizer`。它按空行（LF/CRLF）切分完整事件，单事件缓冲上限 32 KiB（与 `copySSE` 现有读块一致）；事件超限、非 JSON、多行 `data:` 或结构不符时整段原样转发，并在下一个事件边界后恢复判定（M86/M88）。流结束、超时或写失败时，未形成完整事件的尾字节由 `flush` 原样补写，不丢字节。
+- 判定与改写：只处理恰好一条 `data:` 行的事件；JSON 顶层 `type == "content_block_start"` 且 `content_block.type == "thinking"`、`signature` 为 `""` 或字段缺失时，仅替换/插入 `signature` 的值，固定为 `model-router-placeholder`。改写采用字节级拼接：已有字段的顺序、空白、其它字段与事件其它行全部保持不变；缺失 `signature` 时插入在 `content_block` 对象开头，字段集合只增加 `signature` 本身（M82/M83/M84/M87）。
+- 统计隔离：`sseState.feed`、`tracker.chunk`、usage 解析与吞吐计算继续使用上游读到的**原始** chunk；改写只作用于 `w.Write` 的客户端字节（M85/M90）。
+- 日志：`sseSignatureNormalizer.blocks` 统计本次流式尝试改写的块数，`copySSE` 返回时若 `blocks > 0` 打印恰好一行 `thinking signature normalized: blocks=%d inst=<实例名>`；未改写不打印（M89）。
+- 版本：不 bump，CHANGELOG 并入 `[0.1.6]`（M91）。
+
+### 42.2 决策与未覆盖
+
+- **D-M21-1 单事件上限**：M88 只要求“沿用 §20.2 的流式缓冲策略”，未给具体字节数；实现取 `copySSE` 现有的 32 KiB 读块作为单事件缓冲上限。超限事件整段透传，不截断；下一事件恢复判定。
+- **D-M21-2 缺失 signature 的插入位置**：M87 要求不引入额外字段且保留原字段顺序；缺失字段没有原位置，实现插在 `content_block` 对象开头，因此原有字段相对顺序不变，字段集合只增加 `signature`。
+- **D-M21-3 多行 data 一律透传**：按任务约束与 M86，事件含多于一条 `data:` 行时不做拼接解析，整段逐字节转发。
+- **未覆盖**：`signature` 存在但为 `null`、非字符串、非空串或仅空白串时，M82 未定义；实现按“不命中”原样透传。
+- **未覆盖**：§24.24.3 中 M15cn 编号缺失（验收表从 M15cm 直接到 M15co）；本轮不猜测其语义。
+- **未覆盖**：同一事件含重复 `signature` 键时按键值最后一次出现判定；JSON 重复键语义未在 §24.24 规定。
+- **未覆盖**：`parse == false`（不可解码压缩编码）的 Anthropic 流不做归一化，因无法解析 SSE 文本；§24.24 未要求。
+
+## 43. 第二十二轮：锁定实例超时豁免、无内容转交与映射统一（§24.25 M92–M102）
+
+### 43.1 实现
+
+- **锁定专用 client（M95）**：`instanceRuntime` 在构造时同时创建 `client`（按实例 `timeout`）与 `lockedClient`（`newClient(0)`，`DialContext` 连接超时、`TLSHandshakeTimeout`、`ResponseHeaderTimeout` 全为 0）。`serveChain` 每次尝试前按当前 `lockedIndex()` 计算 `lockedExempt`，`tryCandidate` 据此选择 client。锁/解锁因此在下一次尝试立即生效，不需要重建 Handler，也不会把 0 超时写回未锁定路径。两个 client 各自持有独立连接池，解锁后恢复正常超时与连接池。
+- **锁定链（M93）**：`lockedMode` 下候选链为「锁定实例（`lockedCandidate`）+ 其余实例按配置顺序（`mappedCandidate`）」。锁定候选**恒排第一且不因 open 被跳过**（延续 M15ao）；其余实例仍按 §24.17 规则先试 closed，全部 open 时整组兜底。旧语义「锁定实例失败即 502」被替换为「锁定失败后继续尝试其余实例，最后一次真实上游响应按 §24.20 透传」（M96/M15da）。
+- **熔断豁免（M92）**：新增 `Handler.isLockedInstance(inst)`，按 `protocolRuntime.lockedIndex()` 与实例指针比较。`recordFailure` 只对**锁定实例**跳过记账；锁定期间非锁定实例的失败照常累加（M94b 的「只对非锁定实例计数」）。`recordSuccess` 保持原有「协议锁定时跳过」行为不变。
+- **无内容转交（M94/M94a–M94d）**：
+  - `copySSE` 新增 `handoffBeforeContent`（锁定存在且当前不是锁定实例）与 `exemptLocked`（当前是锁定实例）两个参数。
+  - `sseState` 新增 `realContentDeltas`，只统计携带实际负载的增量：Anthropic `text_delta`/`thinking_delta`/`input_json_delta` 的文本非空，OpenAI 非空 `content`/`reasoning_content`/非空 tool arguments。`signature_delta` 不计入。该计数与 §24.23 的 `contentDeltas` **分开维护**，避免改变既有无内容定时器与阶段日志口径（M94a）。
+  - 判定点在读循环内、`sseState.feed` 之后、`commit()` 之前：每次读入的 chunk 解析后，若 `handoffBeforeContent && parse && realContentDeltas == 0`，立即 `body.Close()`、置 `outcome.handoff=true` 并返回。由于尚未 `commit()`，客户端没有收到响应头或任何字节；§24.24 的签名归一化器在 handoff 时也跳过尾块补写，防止未提交的缓冲字节泄漏（M94c）。
+  - `tryCandidate` 在 handoff 时对非锁定实例执行 `recordFailure` 并返回哨兵错误 `errLockedHandoff`；`serveChain` 用 `handoffUsed` 保证只转交一次：把计划截断为「当前失败项 + 锁定候选」，随后若锁定候选也失败则结束，不再回到非锁定实例（M94d）。
+  - 若计划的尾部全部是非锁定实例、且它们都在提交前失败（连接错误或非 2xx），`serveChain` 在循环结束后给锁定实例一次最终尝试，从而覆盖 M15de「非锁定实例首字节阶段失败 → 改发锁定实例」；这次重试同样受 `handoffUsed` 与「只打一次」约束。
+- **提交后不掐断（M97）**：锁定实例的流式尝试把 `idle`、`firstToken`、`contentIdle`、`minTokensPerSecond` 全部传 0，并关闭 `slowInterrupt`。因此 first-token/idle/无内容/实时慢流都不会关闭锁定流；客户端拿到上游真实流直到自然结束。非 2xx 仍走 §24.20 的候选失败与透传逻辑（M96）。
+- **日志（M101）**：`copySSE` 的 defer 中，仅当 `exemptLocked && outcome.committed` 时打印一次 `instance <name> locked; stream not interrupted`；锁定流不再打印 `timeout: content-idle`/`first-token`/`idle`/`slow` 原因行。未提交（连接失败/非 2xx）的锁定尝试不打该行。
+- **映射统一（M99/M100）**：新增 `resolveInstanceModel(proto, inst, body) (model, rewrite, ok)`，承载「精确模型 → 请求角色 → `*` → 首个角色映射（Anthropic）／精确模型 → `models[0]`（OpenAI）」的完整解析。`fallbackCandidate` 复用它并在 `ok=false` 时返回 nil（§24.21 禁止使用客户端原始模型名）；`lockedCandidate` 通过 `mappedCandidate` 复用它，在 `ok=false` 时保持客户端原模型名且 `rewrite=false`（M99 不猜）。`lockedCandidate` 不再先走 `buildChainFrom`，避免命中 R5 兜底/链外候选时拿到无 model/rewrite 的 candidate 而跳过角色映射。
+- **版本（M102）**：`internal/version/version.txt` 保持 `0.1.6`，CHANGELOG 并入已有 `[0.1.6]` 段落。
+
+### 43.2 决策与未覆盖
+
+- **D-M22-1 锁定 client 独立而非改字段**：M95 要求锁/解锁可来回切换且立刻生效。若在锁定/解锁时修改 `instanceRuntime.client`，会与并发中的 `tryCandidate` 竞争，也会污染未锁定路径。独立 `lockedClient` 让选择成为每次尝试的只读判断，锁状态切换天然即时。
+- **D-M22-2 转交判定按读块而非按解析后的 SSE 事件**：实现沿用「每次 chunk 解析后判一次」。同一 chunk 若同时含非内容事件与真实内容事件，`realContentDeltas` 已大于 0，不会中断——这与 M94「已产出内容后绝不中断」一致，也避免把同一 chunk 中已到达的内容丢掉。完全静默（零字节）的上游没有判定点，仍由既有 `first_token_timeout` 处置；M94 的「不设时间预算」在首个字节到达后生效。
+- **D-M22-3 独立 realContentDeltas**：§24.23 M71 明确把 `contentDeltas` 用于无内容定时器与阶段日志，且当前 `contentDeltas` 会把 `signature_delta` 计为内容事件；M94a 明确 `signature_delta` 不算「有 token」。复用同一个计数器会改变 §24.23 行为，因此新增独立字段，`contentDeltas` 语义保持不变。
+- **D-M22-4 锁定失败后的最终重试**：M93 的 `[锁定, 其余...]` 在其余实例也失败时已经包含锁定实例的一次尝试；M15de 仍要求「非锁定实例首字节阶段失败 → 改发锁定实例」，因此保留循环结束后的最终锁定重试。`handoffUsed` 保证该重试最多一次，之后不再回到非锁定实例（M94d）。
+- **D-M22-5 锁定日志的触发条件**：M101 的「仅在确实因锁定而豁免时有内容才打」未定义精确判据。实现按「本次锁定流式尝试已提交（`outcome.committed`）」打印一次；未提交的 400/连接失败不打。快速自然结束的锁定流也会打印，因为其计时器确实处于豁免状态。
+- **未覆盖**：锁定实例若在解锁前一直 open，`lockedExempt` 仍使其不参与 open 跳过（M93/M15ao）；解锁后该状态按 `unlock` 清零。
+- **未覆盖**：非锁定实例在锁定期间被转交中断时，`recordFailure` 会累计其失败；当协议只有 1 个实例时 `singleInstanceProtocol` 仍阻止其转 open，沿用 §24.16 M32。
+- **未覆盖**：非流式响应不参与 M94 转交（没有「内容块」概念），锁定实例的非 2xx 仍按 M93/M96 继续尝试其余实例。
+- **未覆盖**：`parse == false`（不可解码压缩编码）的非锁定流无法识别内容，`handoffBeforeContent` 判定被 `parse` 条件关闭，保持原透传行为；§24.25 未要求此类流可转交。
+
+## 44. 第二十三轮：thinking 补位、响应头前总预算与诊断埋点（§24.26 M103–M120）
+
+### 44.1 实现
+
+- **thinking 补位（M103–M109）**：新增 `internal/proxy/thinking_inject.go` 的 `sseThinkingInjector`，只在 Anthropic 流式且 `parseable=true` 时创建。它在客户端字节副本上按空行切分完整事件，复用 `findSSEEventEnd`；事件超过 32 KiB 时进入透传模式到下一个事件边界，避免为改写把整条流读入内存。判定依据是 `sseState` 已消费的**原始**字节：`toolUseBlocks > 0 && thinkingBlocks == 0` 且当前事件是 `message_delta` 或 `message_stop` 时，在该事件**之前**插入一对 `content_block_start`/`content_block_stop`（`content_block` 为 `{"type":"thinking","thinking":"","signature":""}`，`index` 取流中出现过的最大 index + 1）。既有事件字节原样转发，不重排、不重新序列化。注入后本轮不再注入（`injected`）。
+- **与 §24.24 的分层**：`sseState.feed(原始 chunk)` 先执行，token/usage/吞吐/响应形态都基于原始字节；签名归一化与注入只作用于写给客户端的副本。注入在签名归一化之后执行（注入块 signature 固定为空串，不经过 §24.24 改写）。两者是独立开关（加入 `copySSE` 的 `injectThinking` 参数），任一单独开启都不改变另一条路径；当前调用点两者都取 `proto == protocolAnthropic && parseable`。
+- **注入日志（M108）**：`sseThinkingInjector` 在实际插入时打印一次 `thinking block injected: inst=<名> tool_use=<n> index=<i>`；`tool_use` 为本次流已见的 tool_use 块数。
+- **响应头前总预算（M110–M113）**：`tryCandidate` 在非锁定且实例 `timeout > 0` 时，用 `context.WithCancel(r.Context())` 派生请求上下文，并用 `time.AfterFunc(remaining, cancel)` 实现「从 `attemptStart` 起、到 `client.Do()` 返回为止」的预算；`remaining = attemptStart + timeout - now`。`client.Do()` 返回后立即 `budgetTimer.Stop()`，**不调用 cancel**，因此 deadline 不会继续作用于 SSE body；函数返回时再 `cancel()` 做清理。`budgetFired` 原子标记区分预算超时与客户端取消：前者返回 `response header budget exceeded after <d>: ...` 并走既有 `recordFailure`/换候选路径，后者保持原 `upstream request: ... context canceled` 文本。锁定实例（`lockedExempt`）完全不建预算（M112）。没有使用 `http.Client.Timeout`。
+- **诊断埋点（M114–M120）**：
+  - `reqShape` 统计段改为 `tool_use_msgs`/`paired_msgs`/`unpaired_idx`；`paired_msgs` 把 `redacted_thinking` 计入配对，段列表里的 `!!tool_use_without_thinking` 同样不再标记 redacted 块。`unpaired_idx` 最多列 10 个下标，超出追加 `+`；无未配对时为 `-`。
+  - `serveChain` 的 defer 在失败或 `requestMayHaveToolUse(body)` 时计算一次 `reqShapeSummary`：失败时写入 `finalMetrics.reqShape`（沿用 §24.22）；含 tool_use 的成功请求只打印 M116 日志，不写 stats。`requestMayHaveToolUse` 用 `bytes.Contains` 做廉价负向预检（`"tool_use"`/`"tool_calls"`），避免普通请求每次全量解析 body。
+  - M116 行：`reqshape msgs=<n> tool_use_msgs=<n> paired_msgs=<n> unpaired_idx=<...> thinking=<declared> last=<类型> session=<8hex>`。`session` 对 `metadata.user_id` 做两层解析（外层对象 → user_id 字符串 → 内层 JSON 的 `session_id`），sha256 前 4 字节转 8 位小写十六进制；任一层失败打 `-`。`last` 对 Anthropic 取最后一个 content 块是否 `tool_result`，对 OpenAI 取 `role:"tool"`，否则取消息 role。
+  - M117 行紧随 §24.23 M76 阶段摘要：`resp_shape thinking_blocks=<n> tool_use_blocks=<n> signature_empty=<n> injected=<0|1>`。`thinking_blocks`/`tool_use_blocks` 按 `content_block_start` 的 `content_block.type` 统计（仅 `thinking`，不含 `redacted_thinking`）；`signature_empty` 统计 start 时 signature 为空/缺失、且该 index 之后没有收到非空 `signature_delta` 的 thinking 块。
+  - M118 行由 `internal/proxy/hdr_profile.go` 的 `headerProfile` 采集：`httptrace.ClientTrace` 记录 `ConnectDone`、`TLSHandshakeDone`、`WroteHeaders`、`WroteRequest`、`GotFirstResponseByte`、`GotConn`，回调与读取都用互斥锁保护。只有 `hdr > instance timeout/2` 时打印 `hdrprof inst=<名> connect=<d> tls=<d> upload=<d> server_wait=<d> body_bytes=<n> reused=<0|1> remote=<addr> budget=<d>`；未到达的阶段打印 `-`；锁定实例的 `budget` 打印 `0s`。阶段定义严格按 M118：connect=ConnectDone−attemptStart、tls=TLSHandshakeDone−ConnectDone、upload=WroteRequest−WroteHeaders、server_wait=GotFirstResponseByte−WroteRequest。
+  - 所有新增日志只写进程日志，不进 `/api/stats`、不进 WS 事件；成功请求不写 `reqShape`（M119）。版本保持 `0.1.6`（M102 沿用）。
+
+### 44.2 决策与未覆盖
+
+- **D-M23-1 注入判定按原始 `sseState`**：注入器只负责事件边界与 `message_delta`/`message_stop` 定位，是否注入由 `sseState` 的块计数决定，避免维护第二套流解析而与统计/定时器口径分叉。
+- **D-M23-2 注入只在看到尾部事件时发生**：没有 `message_delta`/`message_stop` 的截断流（客户端断开、超时、EOF）不注入，避免产生没有 message_stop 的非法尾块。§24.26 未覆盖此情形。
+- **D-M23-3 `redacted_thinking` 不抑制注入**：M103 的措辞是「从未出现任何 `thinking` 块」，实现按字面只统计 `type=="thinking"`；`redacted_thinking` 只按 M114 计入请求侧 paired。若上游返回 redacted_thinking + tool_use，DeepSeek 会先以 422 拒绝（unknown variant），注入也不能修复该 422。
+- **D-M23-4 预算用可停止的 timer 而非 context deadline**：直接 `context.WithDeadline` 在 `Do` 返回后无法「只取消 deadline、保留 body」，调用 cancel 会杀死 SSE 流。实现用 `WithCancel` + `AfterFunc`，`Do` 返回后停表、函数返回时再 cancel；`budgetFired` 区分预算与客户端取消。极小竞态窗口内 timer 与 `Do` 返回同时发生时，body 可能被取消，表现为一次可重试的读错误。
+- **D-M23-5 `last` 的取值**：M116 只写「消息类型」，未定义枚举；实现取最有诊断价值的 `tool_result`（Anthropic 块 / OpenAI role tool），否则取 role。
+- **D-M23-6 `unpaired_idx` 空值**：M114 未规定零个未配对时的表示；实现打印 `-`，与阶段日志的未到达标记一致。
+- **未覆盖**：`parse=false`（br/zstd 等不可解码编码）不做注入、不做响应形态统计；M105 只要求不注入，响应形态行仍会打印全 0。
+- **未覆盖**：`signature` 为 `null` 或非字符串时按缺失处理（计入 signature_empty）；M117 只写「空串或缺失」。
+- **未覆盖**：预算不覆盖 `rewriteModel` 之外的本地处理？实现从 `attemptStart` 起算，因此包含 `rewriteModel` 的 CPU 时间；M110 的「从 attemptStart 起」按字面执行。
+- **未覆盖**：平台生成的 `pause_turn` 尾巴（idle/content-idle/slow）由 `writePauseTurnTail` 直接写出，不经过注入器；这类被中断的流不注入 thinking 块。
+- **未覆盖**：实例 `timeout=0` 时不设预算（无正数预算），`hdrprof` 也不打印；配置默认 15s。
+
+## 45. 第二十四轮：预算触发时补打 hdrprof（§24.27 M121–M126）
+
+### 45.1 实现
+
+- `tryCandidate` 的 `client.Do` 错误分支先判断 `budgetHit`：命中时在返回前调用 `trace.log(cand.inst.name, attemptStart, time.Now(), cand.inst.timeout, len(attemptBody), budget)`。观测点取预算触发时刻，`hdr` 约为实例 `timeout`，因此必然通过 §24.26 M118 的 `hdr > timeout/2` 门槛（M121/M122）。
+- 补打行字段与 M118 完全一致，不新增字段；正常拿到响应头的路径仍以 `headersAt` 判定并沿用原门槛（M123）。
+- 补打只写日志：`recordFailure`、错误文本 `response header budget exceeded after <d>: <err>`、重试链、候选计数与转发字节均不变（M124）。
+- 锁定实例（`lockedExempt`）没有预算，`budgetHit` 恒为 false，不会补打（M125）。版本保持 `0.1.6`（M126）。
+
+### 45.2 决策与未覆盖
+
+- **D-M24-1 观测点用 `time.Now()`**：M122 指定触发时刻而非 `attemptStart+budget`；两者只差调度延迟，都大于 `timeout/2`。`hdrprof` 本身不输出原始 `hdr`，门槛由补打入口的可达性保证。
+- **未覆盖**：`client.Do` 返回非预算错误（`budgetHit=false`）时不补打，保持 §24.26 原行为。
+- **未覆盖**：timer 与 `Do` 返回的极小竞态导致 `budgetHit=true` 但错误并非 budget cancel 引起时，仍按预算错误处理并补打（M124 要求错误文本不变）。
+
+## 46. 第二十五轮：连接标识观测（§24.28 M127–M134）
+
+### 46.1 实现
+
+- `headerProfile` 新增 `localPort int`（零值表示未知）。`GotConn` 回调在既有互斥锁内从 `info.Conn.LocalAddr()` 断言 `*net.TCPAddr` 取 `.Port`；`RemoteAddr()` 为空时不写 `remote`。没有扩大锁范围，也没有新增阻塞。
+- 新增 `connID()`（加锁读一次）与 `connLabel()`（调用方已持锁）：只返回十进制端口或 `-`，不输出 IP、指针或任何连接对象信息（M131）。
+- `hdrprof` 在 `remote=` 与 `budget=` 之间插入 `conn=%s`，其余字段名称、顺序与取值口径不变（M128/M129）。
+- `logStreamPhases` 增加 `conn string` 参数，在 `last_gap=` 之后追加 ` conn=%s`；唯一调用点 `tryCandidate` 传入同一次尝试的 `trace.connID()`（M130）。`GotConn` 未触发（连接尚未取得）时两处都打印 `-`。
+- 只改日志：预算、候选链、熔断计数、转发字节、`/api/stats` 与 WS 事件均未改变；未新增配置；版本保持 `0.1.6`（M132–M134）。
+
+### 46.2 决策与未覆盖
+
+- **D-M26-1 端口而非连接对象**：M131 明确禁止输出指针或可反推进程内存布局的信息。端口数字足以回答「慢请求是否集中在少数连接」，且在并发连接同时存活时唯一。
+- **D-M26-2 未知用 `-`**：`GotConn` 未触发（预算在取得连接前触发、DNS/TCP 失败）时 `localPort` 为零值，两处日志都打印 `conn=-`；`remote` 同样为 `-`。
+- **未覆盖**：端口在连接关闭后可被操作系统复用；本观测不能区分不同时刻复用同一端口的两条连接。M15eh 只要求同时存活的不同连接取值不同。
+- **未覆盖**：HTTP/2 下 `GotConn` 的本地端口是底层 TCP 连接端口，多条逻辑流共享同一值——这正是本条要观测的「是否集中在少数连接」。
+- **未覆盖**：配置了 HTTP 代理时，`LocalAddr` 是到代理的连接端口，不是到上游的端口。
+
+## 47. 第二十六轮：监控页强行取消活跃请求（§24.29 M135–M149）
+
+### 47.1 实现
+
+- **请求级 context**：`serveChain` 在 `trackRequest` 之后派生 `context.WithCancel(r.Context())`，用 `r.WithContext` 替换请求，并把 `cancelRequest` 注册到该请求的 `requestMonitor`；`defer cancelRequest()` 在请求结束时释放。`tryCandidate` 里的上游请求、响应体读取都继承这个 context，因此取消只影响目标请求，不关闭共享的 transport 连接（M137/M138）。
+- **取消入口与生命周期**：`requestMonitor` 在既有 `mu` 下保存 `cancel` 与 `cancelledByOperator`；`setCancel` 注册，`cancelByOperator` 对未结束且有 cancel 的请求置位并调用 cancel，`operatorCancelled` 供转发链查询。`end` 在 `finished=true` 的同一临界区把 `cancel` 置空，保证取消能力只存在于进行中的请求（M137）。
+- **按 id 定位**：`monitorHub.cancelRequest(id)` 在 `activeMu` 下复制 `h.active` 后释放锁，再逐个匹配 id 调用 `cancelByOperator`。复制是必要的：取消会同步结束请求并触发 `removeActive`，持锁调用会死锁。未知/已结束 id 静默返回 false（M136）。
+- **WebSocket 命令**：`monitorClient.readLoop` 新增 `0x1` 文本帧分支，`handleTextCommand` 解析 `{"type":"cancel","id":"..."}`；JSON 非法、type 非 `cancel`、id 为空一律忽略，不写回包、不断开连接。取消本身是非阻塞的（M135/M136）。
+- **取消后的转发链**：
+  - `tryCandidate` 内定义 `recordFailure()`，先查 `operatorCancelled`，命中则跳过 `h.recordFailure`；tryCandidate 内所有实例失败记账都走它（M142）。
+  - `client.Do` 返回错误时优先判取消并返回 `errRequestCancelledByOperator`；非 2xx 错误体读取后、流式 `copySSE` 返回后、非流式 body 复制后都检查取消。
+  - 流式检查放在 `outcome.handoff`、first-token、idle/content-idle、slow 分支**之前**；idle/slow 分支内部再查一次，确保即便定时器与取消同时发生也不会写 `pause_turn` 尾巴（M141）。
+  - `serveChain` 在每次 `tryCandidate` 返回后、候选循环结束后都检查 `operatorCancelled`；命中即调用 `finishCancelled` 并返回，不再尝试后续候选或补漏（M139）。
+- **终止语义（M140/M141/M143/M144）**：`finishCancelled` 按 `committed` 分流：
+  - 未提交：写 502，正文用 `writeProtocolError` 生成该协议的错误格式，文本 `request cancelled by operator`；
+  - 已提交：先打印日志再 `truncateClientConnection(w)` 关闭客户端连接，不追加 `pause_turn`；
+  - 两种路径都记录 `finalStatus`（502 或已提交的上游状态码）与 `finalErr=errRequestCancelledByOperator`，`tracker.end` 照常执行；日志固定为 `request <id> cancelled by operator inst=<名|-> phase=<pre-header|streaming>`，先于任何客户端可见的关闭/写响应，避免客户端先观察到结束而日志尚未落盘。
+- **前端（M145/M146）**：`colgroup`/`thead` 在 `col-timeline` 之后新增 32px 的 `col-cancel`（时间线列是自动剩余宽度，因此从时间线让出 32px，不改其他固定列）；`addMonitorRow` 在时间线后追加 `td.req-cancel`，内含 `×` 按钮，`cancelBtn.hidden = !!req.ended`。仅进行中的行显示按钮；点击后不确认，立即置 `req.cancelSent`、按钮变禁用并显示「已取消」，通过现有 `monitor.ws` 发送文本帧，不自行改行状态，等待既有 `end` 事件收尾。快照恢复的进行中行与实时行共用 `addMonitorRow`，id 不变（M15eq）。
+- 不新增 HTTP 路由、配置项或 WS 事件字段；`/api/stats` 与既有事件结构不变；版本保持 `0.1.6`（M147–M149）。
+
+### 47.2 决策与未覆盖
+
+- **D-M27-1 取消的是 context 而非连接**：这是 §24.29 的核心约束。HTTP/2 下 `Close()` transport 连接会连带其他请求；request context 取消由 Go transport 转为对应 stream 的取消。
+- **D-M27-2 `committed` 判定**：使用 `copySSE` 的 `outcome.committed`（首个数据块写入前调用 commit）。非流式在 `writeResponseHead` 后即视为已提交，取消时同样截断客户端连接。
+- **D-M27-3 日志先于客户端可见动作**：已提交路径先 log 再 hijack/close，未提交路径先 log 再写 502；否则客户端（尤其测试）可能在日志落盘前观察到 EOF/响应，形成竞态。
+- **未覆盖**：M15eo「同一 HTTP/2 连接上的其他请求不受影响」没有直接的 h2+TLS 端到端测试（网关实例 client 使用默认证书校验，测试需自签证书注入），但实现没有关闭 transport 连接，取消只作用于 request context。
+- **未覆盖**：`cancel` 到达时请求已结束（`end` 已置 `finished` 并清空 cancel）会被忽略，符合 M137；此时不会有取消日志。
+- **未覆盖**：WebSocket 文本帧不支持分片（沿用现有 `readClientFrame` 限制）；浏览器正常发送的取消命令是单帧。
+
+## 48. 第二十七轮：MiniMax 国内供应商预设（§24.30 M150–M152）
+
+### 48.1 实现
+
+- **M150 预设数据**：`internal/providers/providers.go` 的 `presets` 末尾追加一条 `ID: "minimax"`、`Name: "MiniMax"`、`OpenAIBaseURL: "https://api.minimax.cn/v1"`、`AnthropicBaseURL: "https://api.minimax.cn/anthropic"`；`ModelsOverride` 留空。预设仍是纯数据，不参与路由与转发，实例自己的 `base_url`/`api_key` 依旧权威。
+- **M151 编号与数量**：`minimax` 只含小写字母，与既有 11 个 id 不冲突；`providers.List()` 因此返回 12 条，`GET /api/providers` 直接返回该列表（`internal/proxy/proxy.go` 的 `PathProviders` 分支调用 `providers.List()`）。国际站（`api.minimax.io` / `www.minimaxi.com`）不内置，按自定义实例处理（`provider` 留空）。
+- **不需要 models_override 的依据**：实测 `GET https://api.minimax.cn/anthropic/v1/models` 与 `GET https://api.minimax.cn/v1/models` 均返回 200（前者是 Anthropic 格式、后者是 OpenAI 格式），两个协议各自带模型列表端点；`providers.ModelsSource(providerID, protocol, fallbackBaseURL, fallbackAuth)` 只在该 provider+protocol 声明了 override 时返回覆盖值，否则回落调用方传入的 fallback，因此「查询模型」直接用实例自己的 base_url/auth。
+- **M15eu 添加实例自动填充**：可视化配置页沿用既有的「选中内置供应商即按当前协议自动填 `base_url`、并记录 `provider`」路径（`internal/web/index.html` 的供应商选择逻辑），MiniMax 作为普通预设自动获得两个协议的正确地址，没有新增交互。
+- **M152 版本**：并入 `0.1.7`，`internal/version/version.txt` 不变。
+
+### 48.2 决策与未覆盖
+
+- **D-M28-1 只加数据、不加分支**：MiniMax 与其它无 override 的供应商走完全相同的代码路径，`internal/providers` 没有为它增加任何特殊判断。
+- **D-M28-2 两个协议同时填**：一个预设同时给出 `openai_base_url` 与 `anthropic_base_url`，避免用户在某个协议下选了 MiniMax 后还要手改地址。
+- **未覆盖**：国际站不内置；用 `api.minimax.io` 的用户按自定义实例填写即可，`provider` 留空不影响路由。
+- **未覆盖**：`TestMiniMaxPreset` 对 `ModelsSource` 的断言取「无 override 时回落到调用方 fallback」这一真实语义；preset 自身的 Anthropic base_url 由同一用例前面的字段断言覆盖，不重复断言。
+
+## 49. 第二十八轮：余额与配额查询、余额列与配额耗尽自动禁用（§24.31 M153–M172）
+
+### 49.1 配置与查询（M153–M159）
+
+- **M153 配置模型**：`internal/config/config.go` 的 `config.Instance` 新增可选字段 `Balance *Balance`；`config.Balance` 含 `kind`（必填）、`url`（可选）、`interval`（可选）。`(*Balance).UnmarshalJSON` 先用 `map[string]json.RawMessage` 拒绝未知子字段，再用 `DisallowUnknownFields` 解码并检查尾随数据；`kind` 只接受 `minimax_plan` / `deepseek`（大小写不敏感，解析后归一化为小写），`url` 非空时必须是绝对 http(s) URL。`PollInterval()` 实现「缺省 `5m`（`DefaultBalanceInterval`）、显式 `0` 关闭周期轮询」。
+- **M153 不按 provider 推断**：`kind` 必须显式声明，配置校验（`internal/config/config.go` 的实例校验）与运行时构造（`internal/proxy/proxy.go` 的 `NewWithOptions`）都只读 `inst.Balance`，`provider` 与 `balance` 完全独立；用户可能用按量计费 Key，M Plan 接口不适用。
+- **M154 端点与认证**：`internal/proxy/balance.go`（新建）的 `defaultBalanceURL` 给出两个默认端点（`https://api.minimax.cn/v1/api/openplatform/coding_plan/remains`、`https://api.deepseek.com/user/balance`）；`queryInstanceBalance` 统一 `Authorization: Bearer <实例 api_key>`，使用独立的 `newBalanceClient()`（`balanceQueryTimeout = 10s`，连接/握手/响应头/总超时统一），与实例 `timeout` 无关；余额查询不参与熔断计数，不调用 `recordFailure`/`recordSuccess`。
+- **M155 统一结构**：`balanceInfo` 含 `kind`、`interval5hPercent`、`weekly7dPercent`（未知为 `-1`）、`amount`、`currency`、`exhausted`、`checkedAt`（毫秒时间戳）、`err`。MiniMax 取 `model_remains` 中 `model_name == "general"` 的项，百分比四舍五入为整数；DeepSeek 优先取 `currency == "CNY"` 的一项，没有 CNY 则取数组第一项并在 `currency` 中如实写明实际币种；金额同时接受字符串与数字写法（`balanceValue`）。
+- **M156 耗尽判定**：`quotaExhausted()` 对 MiniMax 用「5 小时或 7 天窗口任一 `<= 0` 即耗尽」（未知 `-1` 不算耗尽），对 DeepSeek 用 `is_available == false` 或 `total_balance <= 0`。字段缺失/无法解析时按「未耗尽」处理，原因写进 `err`，不由解析不确定就禁用节点。
+- **M157 周期轮询与启动首查**：`internal/proxy/proxy.go` 的 `Server.startBalanceChecks` 在 `NewServer` 与 `reload` 后（state 重建后）构建 `balancePoller`，为每个声明了 `balance` 的实例起一个 goroutine；`balancePoller.run` 先执行一次 `check`（启动首查，避免上线后数分钟状态未知），再按 `inst.balanceInterval` 起 ticker（`<= 0` 时只查一次）。`Close` 与下一次 reload 会 `stop()` 旧 poller（cancel + WaitGroup 等待），不泄漏 goroutine。
+- **M158 查询失败不改状态**：`queryInstanceBalance` 在网络错误、非 2xx、读体失败、JSON 解析失败时返回 `balanceResult{failed: true}`；`applyBalance` 对失败结果只更新 `balanceInfo.Err`，保留上次成功的金额/百分比/`checkedAt` 与 `quotaExhausted`；`logBalanceOutcome` 打印 `balance check failed: inst=<名> err=<原因>`。
+- **M159 手动刷新接口**：`internal/proxy/balance.go` 的 `serveInstanceBalance` 处理 `POST /api/instances/balance`（路由常量 `PathInstancesBalance`），鉴权与 `/api/instances/lock`、`/api/instances/unlock` 完全一致；请求体 `{"protocol","name"}`，`name` 为空表示该协议下全部声明了 balance 的实例。接口同步执行查询并返回 `{"instances":[{name,protocol,kind,state,balance}]}`；协议非法 400，实例不存在或未声明 balance 404。
+- **落盘边界**：余额信息只进 `internal/proxy/stats.go` 的 `statsInstance.Balance *balanceInfo`（`omitempty`），不进入 `stats.json` 的持久化结构。
+
+### 49.2 状态机与路由（M160–M164）
+
+- **M160 第 5 个状态**：`internal/proxy/circuit.go` 新增 `stateExhausted = "exhausted"` 与 `reasonQuotaExhausted = "quota_exhausted"`；`instanceRuntime` 新增 `quotaExhausted` 与 `quotaExhaustedSince`；`instanceRuntime.state()` 与 `displayState()` 在 `quotaExhausted` 为真时返回 `exhausted`（`displayState` 同时给出 `quotaExhaustedSince` 与 `quota_exhausted` 原因），`protocolRuntime.stateFor` 让 `exhausted` 与 `open` 一样回传 `degradedSince`。`applyBalance` 只在 `exhausted` 翻转时置位/清除 `quotaExhausted` 与时间戳，不触碰 `consecutiveFailures` / `degradedUntil`；配额恢复不会清除熔断的 `open`，熔断仍按 `degrade_duration` 到期自动回 `closed`。
+- **M161 路由跳过**：`internal/proxy/proxy.go` 的 `serveChain` 在非锁定分支把 `isExhausted()` 的候选收集进 `exhaustedCands` 并排除出 `attempts`；「全部候选都不可用时整条链都试一遍」的兜底只服务于熔断 `open`，对 exhausted 候选同样跳过；§24.21 补漏段的实例遍历也跳过 `isExhausted()` 的实例。
+- **M162 全耗尽 502**：`allExhausted := len(attempts) == 0 && len(exhaustedCands) > 0` 时，`serveChain` 写 502，正文为 `all instance quotas exhausted: <耗尽实例名列表>`（常量 `errAllQuotasExhausted`），`finalErr` 为该文本、`finalMetrics.instName` 取第一个耗尽实例，并调用 `tracker.begin(exhaustedCands[0])`；defer 中的 `tracker.end` 照常执行，`stats.finish` 因此把这条失败写进 `recentErrors`（`instName` 为耗尽实例名之一、`error` 为固定文本）。
+- **M163 锁定优先**：锁定分支里锁定候选恒进 `attempts` 且不检查 `isExhausted()`；`protocolRuntime.stateFor` 在协议锁定时先返回 `locked`（锁定实例）或 `-`（其余实例），因此锁定实例展示为「已锁定」而不是「配额耗尽」。余额列仍读取实例快照，锁定行同样显示耗尽值与查询失败原因。
+- **M164 日志**：`internal/proxy/balance.go` 的 `logBalanceOutcome` 在状态翻转时打印 `instance <名> quota exhausted` / `instance <名> quota restored`，在余额值变化时打印 `balance changed: inst=<名> 5h=<p>% 7d=<p>% amount=<金额> exhausted=<bool>`（未变化不打印），查询失败按 M158 打印。
+
+### 49.3 统计与前端（M165–M172）
+
+- **M165 `/api/stats`**：`internal/proxy/stats.go` 的 `statsInstance` 新增可选字段 `balance`（`omitempty`）；`Server.statsSnapshot` 在合并配置行时对声明了 balance 的实例调用 `instance.balanceSnapshot()` 写回最近一次快照，不支持余额查询的实例不带该字段。`state` 取值域新增 `exhausted`、`reason` 新增 `quota_exhausted`，既有字段一个不改；removed 行没有运行实例，不带余额。
+- **M166 余额不落盘**：余额值与 `quotaExhausted` 只存在 `instanceRuntime` 内存；`statsStore` 的持久化结构不包含任何余额字段，重启后由首查重建（带着陈旧的耗尽标记启动会导致节点被误跳过）。
+- **M167 余额列**：`internal/web/index.html` 的 OpenAI 与 Anthropic 两张实例表在「状态」列之前新增「余额」列（`colgroup`、`<thead>` 与行渲染 `appendStatInstanceRow` 三处同步，列宽 10%）；`statBalanceText` 按 kind 渲染 `5h 90% · 7d 97%`（minimax_plan）或 `51.01 CNY`（deepseek），不支持余额查询显示 `-`，最近一次查询失败时保留上次成功的展示值并在单元格 `title` 中追加错误原因。
+- **M168 点击刷新**：余额单元格可点击（`stat-balance-clickable`，`title` 含「点击刷新余额」）；`refreshInstanceBalance` 调用 `POST /api/instances/balance`（带该行 protocol 与 name），用响应就地更新余额文本与状态文本；请求进行中显示「刷新中…」并置 `data-refreshing=1` 阻止重复点击，完成后恢复。刷新同样会触发 M160 的状态切换。
+- **M169 状态展示**：`statStateText` / `statStateClass` 新增 `exhausted` → 文案「配额耗尽」、配色 `stat-exhausted`（橙/黄系，区别于熔断 `open` 的红色）；`statStateTitle` 追加 `quota_exhausted` 原因与查询错误。
+- **M170 不新增 WS 事件**：既有 `stats` 帧已经携带 `instances[]`，余额与 `exhausted` 状态随该帧下发，不新增事件类型、不改既有字段结构。
+- **M171/M172 范围与版本**：本期只支持在 JSON 配置文件里写 `balance` 字段，可视化配置页暂不提供 balance 编辑项（已知限制）；但该页的 `normalizeInstance` 会原样保留 `raw.balance`，`buildConfigWithoutFallback` 再把它写回实例对象，避免在可视化页面保存配置时静默丢掉 `balance`（否则 M153 声明的检查会被无声关闭）。版本保持 `0.1.7`。
+
+### 49.4 决策与未覆盖
+
+- **D-M29-1 查询失败绝不改状态**：M158 的「查不到就保留」优先于「尽快禁用」；失败只记录 `err`，状态与上次成功值不变，避免余额接口抖动导致节点被误跳过。
+- **D-M29-2 `exhausted` 独立于熔断**：余额查询不调用 `recordFailure`/`recordSuccess`；恢复时只清 `quotaExhausted`，熔断 `open` 仍按 `degrade_duration` 到期恢复（M160）。
+- **D-M29-3 锁定优先的两个位置**：展示侧由 `protocolRuntime.stateFor` 在读取实例状态前返回 `locked`/`-`；路由侧锁定候选不参与 `isExhausted()` 过滤。余额列独立于状态列，仍显示实例自己的余额与查询错误（M163）。
+- **D-M29-4 首查在 goroutine 内同步执行**：`balancePoller.run` 的第一个 `check` 先于 ticker 执行，`NewServer` 不等待它完成，因此启动不会被慢余额端点阻塞；状态在数十毫秒到 10s（查询超时上限）内收敛。
+- **D-M29-5 全耗尽记录进 `recentErrors`**：走 `tracker.begin(exhaustedCands[0])` 与既有 defer `tracker.end`，与其它失败共用 `stats.finish`；`instName` 取第一个耗尽实例，正文额外列出全部耗尽实例名。
+- **未覆盖**：多实例共用同一 `api_key` 时余额查询各自独立，未做去重。
+- **未覆盖**：`interval` 没有下限校验，配置成极小值（如 `1ms`）会按该周期持续查询，由使用者自行控制。
+- **未覆盖**：MiniMax 的 `current_interval_status` / `current_weekly_status` 未参与判定，只按 M156 的百分比规则；官方状态字段语义未在需求中定义。
+- **未覆盖**：余额充足不代表调用一定成功（M Plan 官方说明「额度充足仍可能因速率限制被限流」），本功能只覆盖配额/余额维度。

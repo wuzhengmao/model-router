@@ -1143,3 +1143,686 @@ if len(attempts) == 0 && len(chain) > 0 {
 ### 24.19.5 版本
 
 本次改动 bump dev 版本：`0.1.4` → `0.1.5`（`internal/version/version.txt`），CHANGELOG 新增 `[0.1.5]` 段落。
+
+## 24.20 上游非 2xx 响应按状态码分类处置（0.1.6）
+
+### 24.20.1 现状与问题
+
+`internal/proxy/proxy.go` 的 `tryCandidate` 拿到上游响应后，**只读状态码、不做分类**：只要响应头到达（`cand.inst.client.Do` 未报错），无论状态码是 200 还是 400/500，一律继续把响应体转给客户端，并在结束时调用 `h.recordSuccess(cand.inst)`。后果三条：
+
+1. **熔断失效。** 上游持续返回 5xx 错误时，实例连续失败计数不增加，熔断器永远不打开，请求会一直砸向坏实例。
+2. **不会换实例。** 上游返回 4xx/5xx 时，客户端（如 Claude Code）看到的是错误 JSON，而不是被转发到链上下一个健康实例。
+3. **错误不可观测。** `recentErrors` 里只记录网关自己产生的 502（`error: "upstream request failed"`），上游返回的错误体不落任何日志；生产环境排查「为什么思考块 missing」这类问题时，网关日志里一条线索都没有。
+
+一次真实事故（2026-11-18，生产 10.168.4.160）暴露了这一点：客户端报 `The content[].thinking in the thinking mode must be passed back to the API`，但网关侧 `grep -c thinking` 结果为 **0**，`recentErrors` 里只有 `status: 400 / error: ""` 的空白记录，无法判断是哪个上游、因为什么拒收。
+
+用户原话：
+
+> 「我在 10.168.4.160 上跑的容器，前面在降级的时候导致claude code报错，这是分析的报告，你让claude code确认下是实现层面有什么问题么？」
+
+### 24.20.2 M 组决策
+
+| 编号 | 决策 |
+| --- | --- |
+| M49 | 上游状态码 ≥ 400 且 < 500 时：**响应头尚未提交给客户端**，该候选判为失败，按既有链路换下一个候选；同时记录该实例失败（与连接错误同等对待） |
+| M50 | 上游状态码 ≥ 500 或 < 200 时：同上，判为失败并换实例；记录实例失败 |
+| M51 | 上游 3xx：Go 客户端默认跟随重定向；最终仍未落在 2xx 的按 M49/M50 处理 |
+| M52 | 不可换实例的例外：响应头已经提交（流式已写出首块、非流式已 `WriteHeader`），或候选列表已耗尽。此时原样转发上游响应体，并记 `finalStatus = 上游状态码`，不得改写状态码 |
+| M53 | 实时监控与 `recentErrors` 必须记下上游非 2xx 的**状态码 + 实例名 + 上游模型 + 响应体前 N 字节**（用于定位错误原因），且 `error` 字段不得为空串 |
+| M54 | 换实例时重试原因新增取值 `upstream_status`；该值出现在实时监控的重试标记与统计中 |
+| M55 | 该分类**只作用于真实转发路径**（`tryCandidate`）。本地生成响应（models 列表、管理面、鉴权失败等）不受影响 |
+
+### 24.20.3 接口
+
+- `/api/stats` 的 `recentErrors[]` 追加字段 `upstreamBody`（字符串，截断），既有字段语义不变。
+- 实时监控的重试原因枚举增加 `upstream_status`。
+
+### 24.20.4 验收
+
+| 编号 | 验收标准 |
+| --- | --- |
+| M15ba | 上游返回 400 且响应头未提交时，请求换到链上下一个候选；该实例失败计数 +1 |
+| M15bb | 上游返回 500 且响应头未提交时，同上 |
+| M15bc | 上游返回 400 且候选列表已耗尽时，客户端收到上游原始的 400 与原始响应体，`recentErrors` 中该条 `status=400` 且 `error`/`upstreamBody` 非空 |
+| M15bd | 流式请求已写出首个数据块后上游再返回错误（不应发生，但需防回归）：客户端收到已提交的响应，不再换实例 |
+| M15be | 上游连续返回 5xx 达到 `failure_threshold` 次后，实例进入 open |
+| M15bf | 本地生成的错误响应（如 401 未带凭据）不触发实例失败计数 |
+| M15bg | `go build ./...`、`go vet ./...`、`gofmt -l .`（无输出）、`go test ./... -race` 全绿 |
+
+### 24.20.5 版本
+
+本次改动 bump dev 版本：`0.1.5` → `0.1.6`（`internal/version/version.txt`），CHANGELOG 新增 `[0.1.6]` 段落。
+
+## 24.21 全候选失败时的补漏尝试与错误透传（0.1.6）
+
+### 24.21.1 现状与问题
+
+§24.15 M8 与 §24.19 M45–M48 都只描述「尝试哪些候选」，没有规定**尝试完之后的兜底动作**。当前实现的兜底是统一的 `502 upstream request failed`：
+
+```go
+log.Printf("%s %s -> (%s) total=%ss status=502 all candidates failed", ...)
+finalStatus = http.StatusBadGateway
+finalErr = errors.New("upstream request failed")
+writeProtocolError(w, proto, http.StatusBadGateway, "upstream request failed")
+```
+
+这带来两个问题：
+
+1. **上游的真实拒绝原因丢失。** 上游用 4xx 明确说明了原因（例如参数不合法、思考块缺失、内容审核），网关却换成一句 `upstream request failed`。客户端拿不到可行动的线索，运维也无法从客户端侧判断。
+2. **有实例一次都没被打过。** 候选链由模型匹配决定，某些实例可能因为模型不匹配（或被 `open` 跳过）完全不进链。链上候选全部失败后，这些实例**一次都没试过**，请求直接 502。
+
+用户原话（2026-11-18）：
+
+> 「all open 的时候，都向后重试一次，如果你向后重试之后，依然都没有效果呢？那是不是应该用原模型，用所有实例再向后重试一次？」
+
+随后用户两次明确收窄口径：
+
+> 「不要这样改，BC失败了可以再试下A，但是依然用映射名。」
+> 「不需要额外的用原始名重试的逻辑」
+
+即：**补漏仍然使用各实例自己的映射模型名，不引入「客户端原始模型名重跑」这一层。**
+
+### 24.21.2 M 组决策
+
+| 编号 | 决策 |
+| --- | --- |
+| M56 | 补漏实例集 = 该协议全部实例中**本次请求尚未被调用过**的实例，按配置顺序；与实例的闭包/开断状态无关 |
+| M57 | 第 1 段：候选链按 §24.17–§24.19 的既有规则走完（closed 按链序、全 open 时整条链）。链上候选全部失败后进入补漏段 |
+| M58 | 补漏段对每个漏掉实例发送的请求，模型名一律使用**该实例自己的映射模型**（`roles` 映射或 `models` 直连），与第 1 段完全一致；**不得**回退到客户端原始模型名 |
+| M59 | 全部失败后返回最后一个候选的真实上游状态码与响应体；若所有候选都停在「未拿到响应头」阶段（连接失败/超时），才返回 502 |
+| M60 | 补漏尝试的每一次失败与成功都照常记账（`recordFailure` / `recordSuccess`），实时监控中其重试原因为 `fallback_retry` |
+| M61 | 每个实例在一次请求中最多被真实调用一次（第 1 段已调用过的实例不再进入补漏段） |
+| M62 | 候选链已覆盖全部实例时不产生补漏尝试；锁定协议仍只打被锁定实例 |
+
+### 24.21.3 接口
+
+- 实时监控的重试原因枚举增加 `fallback_retry`。
+- 无新增 HTTP 接口。
+
+### 24.21.4 验收
+
+| 编号 | 验收标准 |
+| --- | --- |
+| M15bh | 三实例闭包 + 二实例开断，闭包三实例全失败后，两个开断实例被依次调用 |
+| M15bi | 全部实例失败且最后一个实例返回 400 时，客户端收到该 400 与其原始响应体，而不是 502 |
+| M15bj | 全部实例都返回连接失败/超时时，客户端收到 502 `upstream request failed`（保持现有行为） |
+| M15bk | 补漏段发出的请求体 `model` 字段等于**该实例的映射模型名**，不是客户端原始模型名 |
+| M15bl | 五实例协议下每个实例的真实调用次数恰好 ≤ 1 次（不重复打同一实例）；链已覆盖全部实例时补漏不发生 |
+| M15bm | 补漏尝试中的失败仍会让对应实例累计失败次数 |
+| M15bn | `go build ./...`、`go vet ./...`、`gofmt -l .`（无输出）、`go test ./... -race` 全绿 |
+
+### 24.21.5 版本
+
+与 §24.20 合并到同一次 dev bump：`0.1.5` → `0.1.6`。
+
+## 24.22 失败请求的客户端请求体取证（并入 0.1.6）
+
+### 24.22.1 现状与问题
+
+§24.20 只把**上游返回了什么**记进了 `recentErrors.upstreamBody`，**没有记客户端发来了什么**。这导致一个关键判据缺失。
+
+2026-11-18 的 400 事故（`The content[].thinking in the thinking mode must be passed back to the API`）已经查明触发条件，但这些结论全部来自**主代理手工构造**的请求：
+
+- 助手消息**不含 `tool_use`** 时，丢掉 `thinking` 块、签名置空、签名改成 bogus、`thinking` 文本置空、`thinking` 开↔关任意组合，DeepSeek 官方**一律 200，不校验**。
+- 助手消息**含 `tool_use`** 时，丢掉 `thinking` 块**必定 400**，且**与 `thinking` 开关无关**（关掉也 400）；保留 `thinking` 块原样回传则 200。
+
+而生产上真实失败的请求，其历史里究竟**有没有** `tool_use`、**有没有** `thinking` 块，网关**一条都没记**。于是无法区分三种可能：
+
+1. 客户端发来的历史里，含 `tool_use` 的助手消息确实缺 `thinking` 块 —— 问题在客户端侧，网关可以补救；
+2. 客户端发来的历史是完整的，是网关转发时弄丢了 —— 网关有 bug；
+3. 客户端历史完整、网关也没丢，但官方仍 400 —— 还有未发现的触发条件。
+
+**在拿到这条证据之前动手修，等于在没验证的情况下再猜一次。** 用户拍板先取证：
+
+> 「第一步先做，确定了问题才能修对」
+
+### 24.22.2 M 组决策
+
+| 编号 | 决策 |
+| --- | --- |
+| M63 | 当一个请求**最终以失败结束**（`status >= 400` 或为空）时，网关必须记录该请求**客户端原始请求体**的结构摘要 `reqShape` |
+| M64 | `reqShape` 必须是**结构摘要**，不得记录请求体原文或任何消息正文。仅允许包含：消息条数、每条消息的 role、每条消息 content 的**块类型序列**、以及每条助手消息是否**同时**含 `tool_use` 与 `thinking` 块 |
+| M65 | `reqShape` 总长受限（默认 1024 字符，超出截断并加省略标记），且**无论请求体多大**都不允许超过该上限 |
+| M66 | `reqShape` 必须能在 `/api/stats` 的 `recentErrors[]` 中读取（字段名 `reqShape`），并随实时监控终态快照一并下发 |
+| M67 | 请求体已解析失败（非 JSON）时，`reqShape` 记录为能表达的尽力摘要（如 `unparsable: <前 64 字符>`），不得使请求本身失败 |
+| M68 | 取证**只记录、不改变任何转发行为**：不得丢弃、改写、补充任何消息或块，不得因此改变状态码、候选链或熔断计数 |
+| M69 | `reqShape` 只在请求失败时采集；成功请求不新增该字段，避免常态开销与信息冗余 |
+
+`reqShape` 的文本格式（可机械校验）：
+
+```
+msgs=4 | 0:user[text] | 1:assistant[thinking,text,tool_use] | 2:user[tool_result] | 3:user[text]
+```
+
+当某条助手消息同时含 `tool_use` 而**不含** `thinking` 时，该条必须追加标记 `!!tool_use_without_thinking`：
+
+```
+msgs=2 | 0:user[text] | 1:assistant[text,tool_use]!!tool_use_without_thinking
+```
+
+### 24.22.3 接口
+
+- `/api/stats` 的 `recentErrors[]` 追加字段 `reqShape`（字符串，omitempty）。
+- WS `end` 事件与 `snapshot` 事件中的请求记录追加 `reqShape`（字符串，omitempty）。
+- 无新增 HTTP 路由。
+
+### 24.22.4 验收
+
+| 编号 | 验收标准 |
+| --- | --- |
+| M15bo | 失败请求的 `recentErrors[]` 条目含 `reqShape`，且其中列出的消息条数与请求体一致 |
+| M15bp | 助手消息含 `tool_use` 但不含 `thinking` 块时，`reqShape` 该条带 `!!tool_use_without_thinking` 标记 |
+| M15bq | 助手消息同时含 `tool_use` 与 `thinking` 块时，**不**带该标记 |
+| M15br | 请求体为 1 MB、20 条消息时，`reqShape` 长度仍 ≤ 1024 字符 |
+| M15bs | 请求体不是合法 JSON 时，请求的转发行为不受影响，`reqShape` 为 `unparsable:` 摘要 |
+| M15bt | 成功请求的 `recentErrors` 中不出现 `reqShape` |
+| M15bu | 同一请求转发到上游的请求体与不开启取证时**逐字节相同**（取证不修改请求体） |
+| M15bv | `go build ./...`、`go vet ./...`、`gofmt -l .`（无输出）、`go test ./... -race` 全绿 |
+
+### 24.22.5 版本
+
+用户拍板不单独 bump：本次改动并入 `0.1.6`（`internal/version/version.txt` 保持 `0.1.6`），CHANGELOG 条目并入 `[0.1.6]` 段落。
+
+### 24.22.6 后续（不在本次范围）
+
+拿到真实 `reqShape` 后再定修复方案，三种病因对应三种修法，**本次不实现任何修复逻辑**。
+
+## 24.23 流式「无内容」超时与流阶段可观测性（并入 0.1.6）
+
+### 24.23.1 现状与问题
+
+2026-11-18 19:38 生产 10.168.4.160 实测到一次**卡死**：一条 `/anthropic/v1/messages` 请求耗时 **316.519s** 才结束，日志片段为
+
+```
+19:33:53  candidate MTI/deepseek failed: ... timeout awaiting response headers
+19:38:54  candidate DeepSeek     failed: Post "https://api.deepseek.com/anthropic/v1/messages?beta=true": context canceled
+19:38:54  candidate MTI/qwen      failed: ... context canceled
+19:38:54  -> MTI/qwen/qwen3.8-flash (claude-sonnet-5) in 316.519s
+19:38:54  -> (anthropic) total=316.519s status=502 all candidates failed
+```
+
+`DeepSeek` 那一行不是「等待响应头超时」，而是 **`context canceled`** —— 说明**响应头早已收到、连接已建立**，之后一直等不到可用的数据，直到 HTTP/2 客户端放弃。
+
+根因三条，全部在 `internal/proxy/proxy.go`：
+
+- **R1｜流式请求的实例 `timeout` 只管到响应头。** `newClient` 只设 `ResponseHeaderTimeout: timeout`；上游一旦返回 200 响应头，该超时即失效（§24.23 实测：`deepseek-chat` 流式 **0.12s** 就返回响应头）。此后整条流没有任何与实例 `timeout` 挂钩的保护。
+- **R2｜`idle_timeout` 被任意数据重置。** `copySSE` 在 `proxy.go:2161` 每读到**一块数据**就 `arm(idle, true)`。上游在思考阶段持续发送 `event: ping` 心跳时，`idle_timeout`（生产 30s）被无限顺延，**永远触发不了**。
+- **R3｜`first_token_timeout` 在 committed 之后失效。** `proxy.go:2167` 的判定是 `if firstHit.Load() && outcome.chunks == 0`；只要收到过哪怕一个字节，`chunks > 0`，此后首块超时不再生效。
+
+三者叠加出一个**真空**：上游在发数据、但发的是空数据（心跳/无 delta 的块），`idle_timeout` 看不见、`min_tokens_per_second` 只能统计内容块也看不见、实例 `timeout` 已失效 —— 请求无限期挂着。
+
+生产同一时段还存在另一种形态：`total=152.987s`、`total=259.862s` 同样返回 400，说明卡顿不是孤例。
+
+另：日志当前缺流阶段信息 —— 只有一个总耗时 `in X.XXXs`，无法区分「连接慢」「出字慢」「thinking 阶段空转」，也无法判断流里到底有多少心跳。**下次再卡住仍然只能靠猜**。
+
+### 24.23.2 M 组决策（承 §24.22 编号）
+
+| # | 决策 |
+| --- | --- |
+| M70 | **新增「无内容超时」（content idle timeout）**，语义是「距离上一个**内容块**多久没到」，而不是「距离上一块数据多久」。只有**内容块**到达才重置该定时器；`event: ping`、空 delta、`message_start` / `content_block_start` / `content_block_stop` 等**非内容事件一律不重置**。 |
+| M71 | **内容块的判定**沿用现有 token 统计口径：Anthropic 协议为 `content_block_delta` 且 `delta.type` 属于 `text_delta` / `thinking_delta` / `input_json_delta`；OpenAI 协议为流式 chunk 中 `choices[].delta` 含非空 `content` 或 `reasoning_content`（即现有 `sseState` 已经在统计的那些块）。**复用现有解析结果，不另起一套判定**。 |
+| M72 | **超时时长 = 该实例的 `timeout`（默认 15s）**，不新增配置项、不扩展现有 `fallback` 字段。理由：用户要求「实例超时对 committed 后的流也生效」，直接复用 `timeout` 语义最贴近直觉；新增配置项会让 §24.23 变成又一个可调旋钮，超出本次范围。 |
+| M73 | **无内容超时触发后的处置与 `idle_timeout` 完全一致**（复用 `outcome.idle` 分支，`proxy.go:1656-1668`）：Anthropic 且未 `finished` 时写 `pause_turn` 尾巴、OpenAI 时 `truncateClientConnection`、计一次实例失败、日志打印、`return true`（已 committed，**不再降级**）。**不新增分支、不改变既有语义**。 |
+| M74 | **原有 `idle_timeout` 保留不变**：它仍是「块间隔」超时，仍然每块重置。两个定时器**同时存在、先到先触发**。`idle_timeout` 管「上游彻底不吭声」，无内容超时管「上游一直在吭声但没内容」。 |
+| M75 | **`min_tokens_per_second` 的低速判定逻辑不改**（§19 已定义），仅在其判定基于内容块这一点上与本方案天然一致。本次**不调整任何吞吐阈值**。 |
+| M76 | **流阶段可观测性**（只加日志，**不改任何行为**）。每个流式请求结束时（无论成功/失败/超时）打**一行**阶段摘要，字段固定为：`hdr=<到响应头耗时>`、`first_block=<响应头→第一块数据>`、`first_content=<响应头→第一个内容块>`、`blocks=<数据块数>`、`pings=<心跳/非内容事件数>`、`content=<内容块数>`、`last_gap=<最后一块数据距今>`。任一值为「未到达」时打印 `-`。 |
+| M77 | 阶段摘要**只在流式请求上打印**，非流式不打印。**不进入 `/api/stats`、不进 WS 事件**（用户明确「统计字段先不加」，本轮只做日志）。 |
+| M78 | **超时触发时额外补打一行原因行**，写明触发了哪个定时器（`content-idle` / `idle` / `first-token` / `slow`）、该实例名、及其对应阈值。内容与 M76 的阶段摘要**分开打印**，便于 grep。 |
+| M79 | **转发行为零改变**：M76/M77/M78 的日志不得影响写入客户端的数据、不得改变 timing、不得改变任何状态机迁移。**转发字节必须与改动前逐字节相同**（复用 §24.22 M15bu 的验收方式）。 |
+| M80 | 本方案**不修**「拿到确定 4xx 后仍继续降级、白付 15s×N」的问题（用户 m02891 明确「1不做」），§24.21 的补漏语义**保持不变**。 |
+
+### 24.23.3 接口
+
+无新增 HTTP 接口、无新增配置字段、无新增 `/api/stats` 字段。
+
+新增内部字段（`internal/proxy/proxy.go` 的 `sseOutcome`）：
+
+```go
+type sseOutcome struct {
+    // ... 既有字段 ...
+    contentIdle      bool          // M70：无内容超时是否触发
+    firstBlockDelay  time.Duration // M76：响应头→第一块数据
+    firstContentDelay time.Duration // M76：响应头→第一个内容块
+    blockCount       int           // M76：数据块数
+    pingCount        int           // M76：心跳/非内容事件数
+    contentCount     int           // M76：内容块数
+    lastGap          time.Duration // M76：最后一块数据距结束
+}
+```
+
+日志样例（M76，固定字段顺序、`=` 分隔、空格分隔键值对）：
+
+```
+stream MTI/qwen/qwen3.8-flash hdr=0.15s first_block=0.42s first_content=- blocks=37 pings=36 content=0 last_gap=30.0s
+```
+
+日志样例（M78）：
+
+```
+instance MTI/qwen timeout: content-idle for 15s (no content block); stream terminated
+```
+
+### 24.23.4 验收
+
+| 编号 | 验收标准 |
+| --- | --- |
+| M15bw | 上游只发心跳（`event: ping`）不发任何内容块时，到达实例 `timeout`（默认 15s）后流被终止，客户端收到 `pause_turn` 尾巴（Anthropic）或连接被截断（OpenAI），该实例计一次失败；**不得**出现「无限期挂起」 |
+| M15bx | 上游心跳正常且持续发送内容块时，流**不被**无内容超时打断（正常长回答不受影响） |
+| M15by | 上游彻底不吭声（一个字节都不发）时，仍由既有 `first_token_timeout` / `idle_timeout` 生效，行为与改动前一致 |
+| M15bz | 上游发 `message_start` / `content_block_start` / `content_block_stop` 等非内容事件但不发任何 delta 时，按 M70 不重置无内容定时器，超时正常触发 |
+| M15ca | 无内容超时触发后的对外表现与 `idle_timeout` 完全一致（Anthropic 写 `pause_turn`、OpenAI 截断连接、计一次失败），断言两者产生相同的客户端可见字节 |
+| M15cb | 每个流式请求结束打**恰好一行** M76 阶段摘要，字段名与顺序固定；未到达的字段打印 `-` |
+| M15cc | 非流式请求**不**打印 M76 阶段摘要 |
+| M15cd | 超时时额外打印 M78 原因行，写明触发的定时器名与实例名 |
+| M15ce | 开启日志前后，转发到上游的请求体与返回给客户端的响应体**逐字节相同**（M79） |
+| M15cf | 既有全部测试不改断言通过；`go build ./...`、`go vet ./...`、`gofmt -l .`（无输出）、`go test ./... -race` 全绿 |
+
+### 24.23.5 版本
+
+用户拍板不单独 bump：本次改动并入 `0.1.6`（`internal/version/version.txt` 保持 `0.1.6`），CHANGELOG 条目并入 `[0.1.6]` 段落。
+
+### 24.23.6 不在本次范围
+
+- 「拿到确定 4xx 后短路降级」（用户 m02891 明确「1不做」）
+- 实例 `timeout` 与 `first_token_timeout` / `idle_timeout` 的职责重新划分（§24.2 定义保持）
+- 流阶段统计进入 `/api/stats` 或 WS 事件（M77 明确不做）
+
+## 24.24 流式响应中空 signature 的归一化（并入 0.1.6）
+
+### 24.24.1 背景与问题
+
+MTI（`10.168.4.230:30000`）在 Anthropic 协议下返回 thinking 块时，`signature` 有相当一部分是**空串 `""`**：
+
+- `mti-flash` / `mti-pro`：返回 UUID 形态签名；
+- `deepseek-v4.1-flash` / `qwen3.8-flash`：返回**空串**。
+
+SDK 与上层客户端普遍把 `signature` 当作 thinking 块的有效性凭据。空签名可能导致两种后果之一：客户端**不把该 thinking 块写入历史**，或写入后在回传时被丢弃。无论哪种，都会让接下来的请求在「要求回传 thinking 块」的上游（DeepSeek 官方在思考开启时）上 400。
+
+**注意**：本条**不声称**已证实「空签名是 400 的根因」。§24.23 已记录 dsh 走 MTI 后仍能正常降级的反例，因果链尚未闭合。本条目只做一件**独立成立**的改进：网关不应向下游输出语义不完整的字段。
+
+### 24.24.2 M 组决策（承 §24.23 编号）
+
+| # | 决策 |
+| --- | --- |
+| M81 | 只处理 **Anthropic 协议**的 **SSE 流式响应**。OpenAI 协议、非流式响应、请求侧一律不动。 |
+| M82 | 识别对象：SSE 事件 `content_block_start` 中 `content_block.type == "thinking"` 且 `content_block.signature` **存在且为空串**（`""`），或 `signature` **字段缺失**。 |
+| M83 | 命中时把 `signature` 改写为固定占位值 **`"model-router-placeholder"`**（常量 `placeholderThinkingSignature`）。**不生成随机值**，避免同一 history 每轮签名不同。 |
+| M84 | 只改 `content_block_start` 事件。`content_block_delta` 的 `signature_delta` **不改**；`message_start` / `message_stop` / `ping` / `content_block_stop` **不改**。 |
+| M85 | 改写**只发生在转发给客户端的字节上**；上游响应体本身、token 统计、usage 解析、吞吐计算一律使用**原始**字节，不得受改写影响。 |
+| M86 | 每条 SSE 事件（以空行分隔的完整事件）**单独判定**：事件原文若能解析为 JSON 且命中 M82，则重写该事件的 `data:` 行；否则**逐字节原样转发该事件**。**不得**因解析失败而丢弃、截断或重排事件。 |
+| M87 | 改写后的 JSON 必须**保留原字段顺序**且不引入额外字段；值为字符串时需正确转义。允许键顺序与上游不同，但同一个 thinking 块内的字段集合必须与原 JSON 相同。 |
+| M88 | 解析开销与内存：单事件上限沿用 §20.2 的流式缓冲策略，**不得**为改写而把整条流读入内存；事件超长或解析失败一律走 M86 的透传分支。 |
+| M89 | 日志：**每个请求最多一行**，仅当本次请求至少改写了一个 thinking 块时打印，形如 `thinking signature normalized: blocks=3 inst=<实例名>`。不改写则不打日志。 |
+| M90 | 统计：不改 `/api/stats`、不进 WS 事件、不计入 `recentErrors`。 |
+| M91 | 版本：**用户拍板不 bump**，继续用 `0.1.6`，CHANGELOG 并入 `[0.1.6]`。 |
+
+### 24.24.3 验收（M15cg–M15cp）
+
+| # | 验收点 |
+| --- | --- |
+| M15cg | `content_block_start`（thinking、signature 为空串）→ 客户端收到的 `signature` 为 `model-router-placeholder`。 |
+| M15cp | `content_block_start`（thinking、signature 缺失）→ 客户端收到的 `signature` 为 `model-router-placeholder`。 |
+| M15ch | `content_block_start`（thinking、signature 非空）→ **逐字节原样**转发，不改写。 |
+| M15ci | `content_block_start`（`type != "thinking"`）→ 逐字节原样转发。 |
+| M15cj | 非 thinking 的其它事件（`message_start`、`content_block_delta`、`ping`、`content_block_stop`、`message_stop`）→ 逐字节原样转发。 |
+| M15ck | 无法解析的事件（半行、非 JSON、多行 data）→ **逐字节原样**转发，不丢字节、不改顺序。 |
+| M15cl | usage / token 统计 / 吞吐不受改写影响：改写前后 `inTokens`、`outTokens`、`tps` 必须一致。 |
+| M15cm | 日志：一次请求内改写 2 个 thinking 块 → 只打印 **1 行** `thinking signature normalized: blocks=2 inst=...`；未改写 → 不打印。 |
+| M15co | OpenAI 协议流式响应、Anthropic 非流式响应 → 完全不受影响（与改动前逐字节一致）。 |
+
+---
+
+## §24.25 锁定实例的超时豁免与降级前模型映射修正（并入 0.1.6）
+
+### 24.25.1 背景
+
+用户报了三个叠加的现象（2026-11-18）：
+
+1. **锁定后仍被 15s 强行掐断**：锁定语义（§24.15 M10）写明「熔断策略暂停——不计数、不探测、不回退」，但实例自己的 `timeout`（生产全为 15s）依然生效，`newClient` 把它同时用作 `DialContext` 连接超时、`TLSHandshakeTimeout`、`ResponseHeaderTimeout`。用户原话：「**锁定以后不应该熔断了，现在锁定了15s超时还是会强行掐断。一并改掉再部署**」。
+2. **锁定后无兜底**：§24.15 M10 说「该协议的所有请求都发往该实例」，于是锁定实例一旦慢到 60s 以上，客户端只能干等，没有任何回退。
+3. **降级请求打的是未映射的模型名**：`lockedCandidate`（`internal/proxy/circuit.go:228`）里 `buildChainFrom` 找不到该实例时走兜底分支，只对 OpenAI 写 `cand.model`，**Anthropic 分支只对 `fable`/`opus` 角色做映射，其余（含 `sonnet`、`haiku`、`*`）直接返回 `cand` 且 `rewrite=false`**——于是锁定场景下 `claude-sonnet-5` 被**原样**发往实例，违反 §21.2 模型名映射。同一类漏映射也存在于 §24.21 补漏轮（`fallbackCandidate`，`internal/proxy/proxy.go:1176`）。
+
+三者叠加的实际后果：锁定 DeepSeek 时，官方模型可能因收到不认识的 `claude-sonnet-5` 而报错，而 15s 掐断又让用户没有别的路可走。
+
+### 24.25.2 M 组决策（承 §24.24 编号）
+
+| 编号 | 决策 |
+|---|---|
+| M92 | **锁定实例不计熔断**：沿用 §24.15 M10 的「不计数、不探测、不回退」。锁定实例上的任何失败（超时、非 2xx、连接错误）**一律不调用 `recordFailure`**，`consecutiveFailures` 保持原值、`degradedUntil` 不被设置。`recordSuccess` 行为不变。 |
+| M93 | **锁定实例走「先锁定兜底链」**：请求到来时若某实例被锁定，尝试顺序改为 **`[锁定实例, 其余实例按配置顺序]**，锁定实例**恒排第一**。 |
+| M94 | **锁定期间非锁定实例的流只在「拿到内容前」容忍**（用户 m03147「如果锁定的时候，未完成的请求如果不是锁定实例的，并且没有token响应的直接中断直接发往锁定的实例，不管有没有超时」）：当协议存在锁定实例时，任何**非锁定实例**的流式尝试，只要在**拿到第一个内容块之前**没有产出内容，就**立即中断**该上游并改发锁定实例；不设时间预算、不等超时。已产出过至少一个内容块的非锁定实例流**不中断**，继续跑到自然结束。 |
+| M94a | **「有 token 响应」的口径沿用 §24.23 M71**：必须是真实内容块（`text_delta`/`thinking_delta`/`input_json_delta`），`ping`、`message_start`、`content_block_start`/`_stop`、空 delta 一律不算。**注意**：`signature_delta` 不算内容块（与 §24.24 M84 的改写范围无关，仅用于此处判定）。 |
+| M94b | **触发时机 = 每次判定点**，不引入新定时器：在每次有 SSE 事件到达时判定一次（即现有 `copySSE` 的事件处理循环内），一旦判定「锁定存在 + 非锁定实例 + 尚未产出内容块」，立即关上游、本次尝试计失败（按 M92 只对非锁定实例计数）、把请求转交锁定实例。 |
+| M94c | **转交语义**：改发锁定实例时，客户端尚未收到任何字节（因为内容块未到达，§24.20/§24.23 的响应头延迟提交保证了这点），因此转交对客户端**不可见**，不能出现重复响应头或半截响应；body 按 M99 使用锁定实例的映射模型名。 |
+| M94d | **转交只发生一次**：一旦请求已经发往锁定实例，即使锁定实例自己也没内容，也**不再**回到非锁定实例，也不再中断，符合 M97「提交后不降级不掐断」。 |
+| M95 | **锁定实例彻底豁免超时**（用户 m03136 拍板「M95 也豁免，锁定的时候所有熔断特性都不要，这种情况下就等客户端自己控制超时」）：锁定实例的 `DialContext` 连接超时、`TLSHandshakeTimeout`、`ResponseHeaderTimeout` **全部设为 0（不设超时）**。该实例的 `timeout` 对锁定请求**完全不生效**。代价：上游卡死时网关会一直挂住，由客户端自己的超时控制兜底。 |
+| M96 | **非连接类失败仍可降级**：锁定实例返回**非 2xx 状态码**时（响应头已到达，不属于超时范畴），按 M93 的兜底链继续尝试其余实例；终态按 §24.20 语义处置。连接层面的失败既然没有超时，就只剩「客户端主动断开」和「TCP 层报错」两种，前者结束请求，后者按 M93 降级。 |
+| M97 | **锁定实例提交响应头后不降级、不掐断**（锁定实例自身豁免全部时间预算；M94 的中断规则只针对非锁定实例）：一旦响应头提交（`outcome.committed == true`），即使后续 `content-idle` 想触发也不再关流；客户端拿到的是上游真实流，直到自然结束。若上游真的永久静默，客户端只能等到自己断开——这是 M94 的必然代价，接受。 |
+| M98 | **解锁行为不变**：解锁后全部实例状态清零、重新计数（沿用 §24.15 M10），锁定期间累积的失败**不追溯计入**。 |
+| M99 | **锁定场景必须使用实例自己的映射模型名**：`lockedCandidate` 的 Anthropic 分支必须与 `fallbackCandidate` 一致——按 `*` / `sonnet` / `fable` / `opus` / `haiku` 角色 + 能力申明解析出该实例应使用的模型，**解析不出就保持原模型名且 `rewrite=false`**（不猜）。 |
+| M100 | **抽公共函数**：`lockedCandidate` 与 `fallbackCandidate` 必须走**同一个**「解析实例映射模型」函数，禁止各写一份；该函数签名与语义由实现方定，但两处行为必须一致（见验收 M15cy）。 |
+| M101 | **日志**：锁定实例豁免超时后，原本会打印的 `instance <name> timeout: content-idle for <d>; stream terminated` 在锁定实例上**不再打印**；改为在流结束时打一行 `instance <name> locked; stream not interrupted`（每请求最多一行，仅在确实因锁定而豁免时有内容才打）。 |
+| M102 | **不 bump 版本**：并入 `[0.1.6]`。 |
+
+### 24.25.3 验收（M15cq–M15cz）
+
+| 编号 | 验收点 |
+|---|---|
+| M15cq | 锁定实例流式响应只发 `ping`、无内容块，时长超过该实例 `timeout` 3 倍 → 客户端**收到完整上游字节**，无 `pause_turn` 尾巴，连接正常关闭。 |
+| M15cr | 同上场景，断言日志**不含** `timeout: content-idle`，含 `locked; stream not interrupted`。 |
+| M15cs | 锁定实例返回非 2xx（如 400）→ **不**记失败（`consecutiveFailures` 保持 0，`degradedUntil` 零值），且请求**继续**走其余实例；其余实例成功则客户端拿到 200。 |
+| M15ct | 锁定实例**连接层彻底不设超时**：上游接受 TCP 连接后长时间不返回响应头（远超该实例 `timeout`）→ 网关**不主动断开**，客户端连接保持；断言网关日志无 `timeout awaiting response headers`、无 `instance <name> timeout`。（TCP 层直接报错时按 M93 降级到其余实例，不再断言超时相关行为。） |
+| M15cu | 锁定时请求**第一步就发往锁定实例**（断言上游收到的第一个请求落在锁定实例）。 |
+| M15cv | 锁定实例成功 → 其余实例一次都不被调用。 |
+| M15cw | 解锁后：所有实例状态清零、`consecutiveFailures == 0`；锁定期间的失败不追溯。 |
+| M15cx | 锁定 + 客户端发 `claude-sonnet-5`，该实例 `sonnet` 角色映射到 `deepseek-flash` → 上游收到的 body 中 `"model"` 为 `deepseek-flash`。 |
+| M15cy | `lockedCandidate` 与 `fallbackCandidate` 对同一组 (实例, 请求体) 解析出的模型名**完全相同**（表驱动，覆盖 `*`/`sonnet`/`fable`/`opus`/`haiku` 五种角色 × 有无能力申明）。 |
+| M15cz | 未锁定路径完全不受影响：所有既有锁定/熔断/降级测试保持通过，`§24.19`/`§24.20`/`§24.21` 语义不变。 |
+| M15da | 锁定实例上游返回非 2xx（如 400）：**不记失败**（`consecutiveFailures` 保持原值，`degradedUntil` 零值），且请求**继续**走其余实例；其余实例成功则客户端拿到 200，其余全失败则透传最后一次真实状态码与响应体。 |
+| M15db | 锁定存在 + 非锁定实例已回响应头但**一个内容块都没产出**（只发 `ping`）→ 网关**立即**中断该上游并改发锁定实例，客户端最终拿到锁定实例的完整响应；断言非锁定实例的上游请求被提前关闭。 |
+| M15dc | 同上场景，断言**不依赖超时**：把该非锁定实例的 `timeout` 设为很大（如 10 分钟），仍必须立刻中断（测试总耗时远小于该 `timeout`）。 |
+| M15dd | 非锁定实例**已产出至少一个内容块**后再静默 → **不中断**，流继续（与 M94c 的「已产出不中断」一致），客户端拿到该实例的完整响应。 |
+| M15de | 锁定存在 + 非锁定实例首字节阶段就失败（连接错误/非 2xx）→ 改发锁定实例；客户端只看到锁定实例的响应，无重复响应头、无半截字节。 |
+| M15df | 未锁定协议完全不受影响：没有锁定实例时，非锁定实例的流行为与改动前逐字节一致（回归断言）。 |
+| M15dg | `ping`/`message_start`/`content_block_start`/空 delta 不算「有 token」：只发这些事件的非锁定实例必须被判为「无内容」并中断（M94a）。 |
+
+---
+
+## §24.26 上游响应缺 thinking 块时的自动补位与「响应头前」总预算（并入 0.1.6）
+
+### §24.26.0 背景（已由实验证实的结论，供实现方参考）
+
+DeepSeek 官方 Anthropic 兼容端点对 `content[].thinking` 的校验规则（实测）：
+
+- **只校验 thinking 块是否存在，完全不校验 `signature` 内容**：`placeholder`、空串、`bogus`、UUID 在块存在时全部 200。
+- 触发 400 的**充分条件**：思考模式开启（`adaptive` 被接受）、请求最后一条消息是 `tool_result`、且历史中**任意一条含 `tool_use` 的 assistant 消息没有 thinking 块**。
+- 同一 assistant 消息里多个 `tool_use` **只配一个 thinking** 即足够。
+
+Claude Code 客户端行为（本地 mock 实测 2.1.323）：
+
+- **完全忽略 `content_block_start.content_block.signature`，只把 `signature_delta` 写入历史**。
+- 无论 signature 是 placeholder / 空 / bogus，**都会保留 thinking 块并原样带回**，不会因格式丢弃。
+- **如果上游某轮 tool_use 响应完全没有 thinking 块，客户端会忠实保存并回传 `assistant[tool_use]`（无 thinking）**——这正是污染源。
+
+因此 §24.24 的 signature 归一化对 Claude Code 是无效操作（改的是它不读的字段）。**本条不删除 §24.24**（对其它可能读该字段的客户端仍有意义），但本条的补位才是针对该 400 的正面处置。
+
+Go `net/http` 的 `ResponseHeaderTimeout` 契约（实测 + 源码核对）：
+
+- 计时**从请求 body 完全写完之后才开始**，不覆盖连接获取、HTTP/2 流控/槽位等待、body 上传。
+- 16 MiB body + 上游延迟读取时，200ms 的 `ResponseHeaderTimeout` **完全不触发**，`Do` 在 2.03s 后成功返回（httptrace `upload=2.03s`、`server_wait=0s`）。
+- 故 `hdr=63–344s` 且 `first_block=0.00s` 的组合，只能是「body 写完前卡了几百秒，上游一拿到完整请求就立刻响应」。
+
+### §24.26.1 决策
+
+| 编号 | 决策 |
+|---|---|
+| M103 | **上游响应 thinking 补位（A2）**：Anthropic 协议 SSE 流式响应中，若**同一次尝试**的响应里出现了 `tool_use` 内容块但**从未出现任何 `thinking` 块**，在该流的末尾、`message_stop` 之前，向客户端注入一个空 thinking 块（`content_block_start` + `content_block_stop`）。 |
+| M104 | 注入的 thinking 块内容：`{"type":"thinking","thinking":"","signature":""}`；`index` 取该流中出现过的最大 `index` 再加 1（避免与既有块冲突）；`content_block_start` 与 `content_block_stop` 成对出现。 |
+| M105 | **只在流式且 parse 成功时注入**；非流式 JSON 响应不注入（非流式不产生会话历史，无污染风险）。`parse=false`（不可解码编码）不注入。 |
+| M106 | 注入位置：`message_delta` 之前（若存在），`message_stop` 之前；`message_delta` 里的 `usage` 与 `stop_reason` **一个字节都不改**。 |
+| M107 | 注入**不得改变已有的任何字节**：只允许在指定位置**插入**新事件，不重排、不改写、不删除既有事件。既有事件必须逐字节原样转发。 |
+| M108 | 每个发生注入的尝试打印**一行**日志：`thinking block injected: inst=<实例名> tool_use=<n> index=<i>`。未注入不打印。 |
+| M109 | 注入只作用于转发给客户端的字节；`sseState` 的 token/usage/吞吐统计仍只看原始字节（沿用 §24.24 M85 的分层原则）。 |
+| M110 | **响应头前总预算**：对每一次上游尝试，从 `attemptStart` 起加一个独立 deadline，到 `client.Do()` 返回（拿到响应头）即取消。该预算 = 该实例的 `timeout`（默认 15s）。**不使用 `http.Client.Timeout`**（会杀 SSE 流）。 |
+| M111 | 该预算**覆盖**连接获取、HTTP/2 流控/槽位等待、body 上传全过程；超时后按既有「候选失败」路径处理（`recordFailure`、换下一个候选），错误文本以 `response header budget exceeded` 标识。 |
+| M112 | 锁定实例（`lockedClient`，三项超时为 0）**不施加该预算**——§24.25 M95 语义不变，锁定期间完全由客户端控制。 |
+| M113 | 注入与预算是**两个独立开关**，互不依赖；任一单独生效都不得改变另一方所在的代码路径行为。 |
+
+### §24.26.2 诊断埋点（用户明确要求：下次异常能直接抓到原因）
+
+| 编号 | 决策 |
+|---|---|
+| M114 | **`reqShape` 统计段改名更精确**：`tool_use=N paired=M` 改为 `tool_use_msgs=N paired_msgs=M`，并新增 `unpaired_idx=<逗号分隔的消息下标，最多 10 个，超出加 +>`。语义：`tool_use_msgs` = 含至少一个 `tool_use` 块的 assistant 消息条数；`paired_msgs` = 其中同时含 thinking 块（`thinking` 或 `redacted_thinking` 都算）的条数。 |
+| M115 | `reqShape` 的采集条件从「仅失败请求」放宽为「失败请求 **或** 请求体含 tool_use 的请求」。目的：可在同一会话内跨轮比较 `paired_msgs` 是否掉数。成功请求的 `reqShape` **不进 `recentErrors`**，只进一条新日志行（见 M116）。 |
+| M116 | 每轮请求打印一行**请求形态摘要**（仅当请求体含 `tool_use` 时）：`reqshape msgs=<n> tool_use_msgs=<n> paired_msgs=<n> unpaired_idx=<...> thinking=<declared> last=<消息类型> session=<sha256 前 8 位>`。`session` 取自请求体 `metadata.user_id` 中的 `session_id`（JSON 字符串内嵌），取不到时打 `-`。**绝不打印消息正文。** |
+| M117 | **上游响应侧形态摘要**（每个流式尝试一行，与 §24.23 M76 的阶段摘要合并输出或紧随其后）：`resp_shape thinking_blocks=<n> tool_use_blocks=<n> signature_empty=<n> injected=<0|1>`。`signature_empty` 统计 `content_block_start` 中 `signature` 为空串或缺失的 thinking 块数（含 `signature_delta` 全程为空的情况）。 |
+| M118 | **响应头前耗时拆解**：新增一行日志 `hdrprof inst=<名> connect=<d> tls=<d> upload=<d> server_wait=<d> body_bytes=<n> reused=<0|1> remote=<addr> budget=<d>`。各阶段由 `httptrace.ClientTrace` 采集：`connect`=`ConnectDone`−开始，`tls`=`TLSHandshakeDone`−`ConnectDone`，`upload`=`WroteRequest`−`WroteHeaders`，`server_wait`=`GotFirstResponseByte`−`WroteRequest`；`reused` 取 `GotConnInfo.Reused`；未到达的阶段打 `-`。**仅当 `hdr` 超过该实例 `timeout` 的一半时才打印**，避免刷屏。 |
+| M119 | 上述所有日志**只写 stderr/日志文件**，不进 `/api/stats`、不进 WS 事件、不改变任何转发字节。 |
+| M120 | `session` 哈希固定 8 位小写十六进制，全局一致；同一会话的多轮请求必须打到同一个值（用于跨轮关联）。 |
+
+### §24.26.3 验收
+
+| 编号 | 用例 |
+|---|---|
+| M15dh | 流式响应只有 `tool_use` 没有 `thinking` → 客户端收到的字节**以注入的 thinking 块结尾**（在 `message_stop` 之前），且原响应的其余事件逐字节不变。 |
+| M15di | 流式响应既有 `thinking` 又有 `tool_use` → **不注入**，客户端字节与上游**完全一致**。 |
+| M15dj | 流式响应只有 `thinking` 没有 `tool_use` → **不注入**。 |
+| M15dk | 注入的 thinking 块 `index` 不与任何既有块冲突（取最大 index+1），`content_block_start` 与 `content_block_stop` 成对。 |
+| M15dl | 注入不影响 `message_delta.usage`：注入前后客户端收到的 usage 数值一致（`sseState` 统计仍按原始字节）。 |
+| M15dm | 非流式 JSON 响应（无 thinking 有 tool_use）→ **不注入**，响应体逐字节不变。 |
+| M15dn | `parse=false` 时**不注入**，转发字节逐字节不变。 |
+| M15do | 注入日志每个尝试**最多一行**，字段为 `thinking block injected: inst=<名> tool_use=<n> index=<i>`。 |
+| M15dp | 小 body 正常请求 → 响应头预算不触发，无额外延迟（回归）。 |
+| M15dq | 上游接受 TCP 后**迟迟不读** body（模拟大 body 上传阻塞）→ 在实例 `timeout` 到点后候选失败，错误含 `response header budget exceeded`，客户端不会看到响应头。 |
+| M15dr | 同上场景但实例处于**锁定**状态 → **不施加预算**，长时间等待不被网关掐断（§24.25 M95 语义）。 |
+| M15ds | 预算触发后照常 `recordFailure` 并按链路换下一个候选；后续候选成功则客户端拿到后续候选的正常响应。 |
+| M15dt | `reqShape` 统计段输出 `tool_use_msgs`/`paired_msgs`/`unpaired_idx`，且 `redacted_thinking` 计入 paired。 |
+| M15du | 请求含 tool_use 但成功 → 打印 M116 的请求形态摘要行，且**不进** `recentErrors`。 |
+| M15dv | 响应含 thinking 块且 `signature` 全程为空 → M117 的 `signature_empty` 计数正确；含 `signature_delta` 非空则不计。 |
+| M15dw | `hdr` 超过实例 `timeout` 一半时打印 M118 的 `hdrprof` 行，各阶段数值可解析；`hdr` 正常时不打印。 |
+| M15dx | `metadata.user_id` 含 `session_id` 时 M116 的 `session` 为 8 位小写十六进制，同一 session 多轮请求取值一致；`user_id` 缺失或非 JSON 时打 `-`。 |
+| M15dy | **回归**：无 tool_use 的普通请求，转发字节与改动前逐字节一致；`/api/stats` 与 WS 事件结构不发生任何变化。 |
+
+### §24.26.4 版本
+
+- 并入 `0.1.6`，**不单独 bump**（用户 m02596「版本不用bump ，继续用0.1.6就行」）。
+
+---
+
+## §24.27 响应头预算触发时补打 `hdrprof`（并入 0.1.6）
+
+### §24.27.0 背景
+
+§24.26 上线后生产实测（2026-11-19，容器 uptime 约 11 小时）：
+
+- `response header budget exceeded` **触发 8 次**（`MTI/deepseek` 5 次、`MTI/aliyun` 3 次），说明上游卡「响应头之前」的问题真实存在，M110 的总预算确实在拦截。
+- 但 `hdrprof` 日志 **0 次**。
+
+原因：`internal/proxy/proxy.go` 里 `client.Do(outReq)` 返回 `err` 时，代码在 `if err != nil` 分支里直接 `return`，而 `trace.log(...)`（M118 的唯一输出点）位于该分支之后。**预算一触发就恰好跳过了打印 `hdrprof` 的那行**，导致最需要诊断信息的时刻反而没有信息。
+
+这正是「偶发 200–344s 超长请求」排查中最缺的那一块：无法区分卡在 `upload`（我们发不出去）还是 `server_wait`（上游不搭理）。
+
+### §24.27.1 决策
+
+| 编号 | 决策 |
+| --- | --- |
+| M121 | **预算触发（`budgetHit == true` 且 `client.Do` 返回错误）时，必须补打一行 `hdrprof`**，字段与 M118 完全一致，不新增字段。 |
+| M122 | 补打时的时间基准取**超时触发时刻**（`time.Now()`），使 `hdr` 约为该实例 `timeout`，从而必然通过 M118 的「超过 `timeout` 一半」门槛。 |
+| M123 | 除上述入口外，M118 的既有行为不变：正常拿到响应头时仍按 `headersAt` 判定，未超过 `timeout` 一半则不打印。 |
+| M124 | 补打只写日志，**不得改变返回值、错误文本、熔断计数、重试链与转发字节**。错误文本 `response header budget exceeded after <d>: <err>` 保持原样。 |
+| M125 | 锁定实例（§24.25 M95，`lockedExempt`）没有预算，因此不存在 M121 的补打场景；此处行为不变。 |
+| M126 | 并入 `0.1.6`，**不单独 bump 版本**。 |
+
+### §24.27.2 验收
+
+| 编号 | 验收 |
+| --- | --- |
+| M15dz | 上游接受 TCP 但不返回响应头、且超过实例 `timeout` → 日志同时出现 `response header budget exceeded` 与**一行** `hdrprof inst=<该实例名>`；`hdrprof` 含 `connect=` `tls=` `upload=` `server_wait=` `body_bytes=` `reused=` `remote=` `budget=` 全部字段。 |
+| M15ea | 上述场景中 `hdr` 值 ≥ 该实例 `timeout`（即补打不受「超过 `timeout` 一半」门槛影响）。 |
+| M15eb | **回归**：响应头快速返回的请求不打印 `hdrprof`（沿用 M15dw 既有断言）。 |
+| M15ec | **回归**：预算触发时的错误文本仍为 `response header budget exceeded after <d>: <err>`，候选失败计数 +1，链条继续按 §24.21 换下一个候选；客户端最终状态码与改动前一致。 |
+| M15ed | **回归**：锁定实例（`lockedExempt`）路径不产生 `hdrprof`，且不施加预算。 |
+
+## §24.28 连接标识观测（并入 `0.1.6`）
+
+### §24.28.1 背景
+
+生产在 2026-11-19 12:16–12:18 出现三次 `total≈60s status=502`：请求体 1473982 字节（730 条消息、约 42 万 token），四个上游逐个撞满 15s 响应头预算。
+
+`hdrprof` 显示两种截然不同的卡法：
+
+- `MTI/deepseek`、`MTI/aliyun`、`MTI/qwen`：`connect=20~41ms upload=2~24ms server_wait=- reused=0`——请求体已发完，上游不返回响应头。
+- `DeepSeek`（官方）：`connect=- tls=- upload=- server_wait=- reused=1`——请求体未写完。
+
+现有字段无法回答一个关键问题：**卡住的请求是否集中在少数几条 TCP 连接上**。`reused=1` 只能说明「复用了连接」，不能说明「是否同一条」。若卡住的全在一条连接、而该连接上其他请求正常，则与连接无关；若某条连接上的请求普遍偏慢，才指向连接层（例如 HTTP/2 单连接多路复用的队头阻塞）。
+
+本条的观测结果用于**决定是否值得改动传输层**，本身不改变任何转发行为。
+
+### §24.28.2 决策
+
+| 编号 | 决策 |
+| --- | --- |
+| M127 | 观测目标：用连接标识判断同一实例上「响应头慢」的请求是否集中在少数几条连接上。 |
+| M128 | `hdrprof` 行新增字段 `conn=<port>`，取值来自 `httptrace.GotConnInfo.Conn.LocalAddr()` 的端口数字；`GotConn` 回调未触发（连接尚未取得）时打 `conn=-`。 |
+| M129 | 字段位置固定在 `remote=` 与 `budget=` 之间：`... reused=<0\|1> remote=<addr> conn=<port\|-> budget=<d>`。其余字段的名称、顺序、取值口径一律不变。 |
+| M130 | `stream` 阶段摘要行（§24.23 M76）在 `last_gap=` 之后追加 `conn=<port\|->`，取值口径与 M128 相同，取自同一次尝试的连接。 |
+| M131 | `conn` **只输出端口数字**，不输出 IP、不输出连接对象的指针或任何可反推进程内存布局的信息。 |
+| M132 | 上述两条日志**只写日志**：不得改变转发字节、超时判定、熔断计数、重试链、候选顺序、统计字段，也不得因为取连接信息而增加额外阻塞或加锁范围。 |
+| M133 | 不新增配置项，不改 `/api/stats`、WS 事件与 `recentErrors`。 |
+| M134 | 并入 `0.1.6`，**不单独 bump 版本**。 |
+
+### §24.28.3 验收
+
+| 编号 | 验收 |
+| --- | --- |
+| M15ee | 正常情况下，`hdrprof` 行同时包含 `remote=<host:port>` 与 `conn=<数字端口>`，且两者属于同一条连接。 |
+| M15ef | 连接尚未取得（`GotConn` 未触发）时，`conn` 打印为 `-`，该行其余字段格式不变。 |
+| M15eg | `stream` 行在 `last_gap=` 之后带 `conn=<端口\|->`；其余字段名称与顺序不变。 |
+| M15eh | 同一连接上连续发起的多个请求，日志中的 `conn` 值相同；不同连接的值不同（含端口复用后重新分配的情况）。 |
+| M15ei | **回归**：新增字段不改变客户端收到的字节、状态码、超时、熔断计数与 `/api/stats` 结构。 |
+
+## §24.29 监控页强行取消活跃请求（并入 `0.1.6`）
+
+### §24.29.1 背景
+
+生产出现过「上游卡在响应头之前、请求挂十几分钟不返回」的现场（§24.26/§24.27 记录）。排查期间只能在服务器上重启容器或等客户端自己断开，运维侧缺少一个「针对单个请求」的止损手段。
+
+本条在监控页的活跃请求行尾加一个 `×`，点一下让**该请求**立刻失败。**取消的是请求，不是 TCP 连接**：HTTP/2 下多条请求共享一条连接，掐连接会连带杀掉同一连接上的其他请求，因此实现必须走请求级取消（取消该请求的 context），只影响目标行。
+
+### §24.29.2 决策
+
+| 编号 | 决策 |
+| --- | --- |
+| M135 | 取消通道复用现有 `/ws` WebSocket，方向为浏览器 → 服务端，载荷为 UTF-8 **文本帧**，内容 `{"type":"cancel","id":"<请求id>"}`。 |
+| M136 | `id` 取自该请求在快照与 `start` 事件里已有的 `id` 字段，格式不变；服务端按 `id` 精确定位，未知 `id` 直接忽略（不报错、不断开连接、不回包）。 |
+| M137 | 服务端为每个请求保留一个取消入口：请求进入候选链之前派生可取消 context，取消入口随该请求的生命周期注销。取消能力只对**尚未结束**的请求存在。 |
+| M138 | 取消作用于该请求所有在途进度：正在等待的上游响应头、正在传输的响应体一律中断；**不区分当前处于哪个候选**。 |
+| M139 | 取消后**不再尝试后续候选**（不再按 §24.21 降级、不做补漏），该请求直接终止。 |
+| M140 | 响应头尚未提交时，向客户端返回状态码 **502**，正文按该协议的既有错误格式（Anthropic / OpenAI 各自格式），错误文本固定为 `request cancelled by operator`。 |
+| M141 | 响应头已提交（流式已开始写）时无法改状态码，直接关闭客户端连接，行为与现有 `truncateClientConnection` 一致；不追加 `pause_turn` 尾巴。 |
+| M142 | 取消**不计入实例失败**（不计熔断计数、不改变实例状态、不影响 `degradedUntil`），因为是运维动作而非上游故障。 |
+| M143 | 取消计入该请求的结束统计，`status` 为该请求实际写出的状态码（M140 的 502 或 M141 时客户端连接已断），`error` 字段记录 `request cancelled by operator`。 |
+| M144 | 每次取消打印一行日志：`request <id> cancelled by operator inst=<实例名\|-> phase=<pre-header\|streaming>`。 |
+| M145 | 前端：活跃请求表格在**最右**新增一列（时间线列之后），列宽固定且不挤压时间线；仅「进行中」的行在该列显示 `×` 按钮，已结束的行该列留空。 |
+| M146 | 前端点击 `×` **不做二次确认**；点击后该按钮立即禁用并变为「已取消」态，避免重复发送。该行随后按既有 `end` 事件流程结束。 |
+| M147 | 只有已通过管理面鉴权的连接能发取消命令（`/ws` 本身就在鉴权之后），不新增鉴权入口、不新增 HTTP 路由。 |
+| M148 | 不新增配置项，不改 `/api/stats` 字段与结构，不改现有 WS 事件格式（`start` / `end` / `snapshot` / `stats` 字段一律不变）。 |
+| M149 | 并入 `0.1.6`，**不单独 bump 版本**。 |
+
+### §24.29.3 验收
+
+| 编号 | 验收 |
+| --- | --- |
+| M15ej | 活跃请求行尾出现 `×` 按钮；已结束的行不出现按钮。 |
+| M15ek | 点击 `×` 后，该请求在 `end` 事件前就被终止，客户端收到 502 且错误文本为 `request cancelled by operator`（响应头尚未提交时）。 |
+| M15el | 流式响应已提交后取消 → 客户端连接被关闭，不追加 `pause_turn`，该请求以失败结束。 |
+| M15em | 取消后不再发起任何新候选：日志中不出现该请求后续的 `candidate ... failed` 或补漏尝试。 |
+| M15en | 取消的请求**不增加**目标实例的失败计数，实例 `state` 与 `degradedUntil` 不变。 |
+| M15eo | 同一连接上的其他活跃请求不受影响（各自正常结束或继续传输）。 |
+| M15ep | 发送未知 `id` 的取消命令 → 服务端忽略，不产生错误响应，不中断任何请求，WS 连接保持可用。 |
+| M15eq | 页面刷新后用快照恢复的「进行中」行，其 `×` 同样可用（`id` 与快照一致）。 |
+| M15er | 日志出现 `request <id> cancelled by operator inst=<名\|-> phase=<pre-header\|streaming>`，且每个请求最多一条。 |
+| M15es | **回归**：不点 `×` 时，`/api/stats`、WS 事件、转发字节、超时与熔断行为与改动前完全一致。 |
+
+## §24.30 MiniMax 国内供应商预设（并入 0.1.7）
+
+### §24.30.1 背景
+
+用户 m04668 原话：「供应商增加MiniMax 国内的支持，可参考www.minimax.cn的官网，支持openai/anthropic的」。
+
+现状：`internal/providers/providers.go` 内置 11 个纯数据预设，无 MiniMax。用户手工添加 MiniMax 实例需要自己填 base_url（`https://api.minimax.cn/anthropic` 或 `https://api.minimax.cn/v1`）。
+
+实测结论（2026-11-20，本机直连 `api.minimax.cn`）：
+- `GET https://api.minimax.cn/anthropic/v1/models` → 200，返回 Anthropic 格式模型列表（`MiniMax-M3.1-Flash` / `MiniMax-M3` / `MiniMax-M2.7` …）。
+- `GET https://api.minimax.cn/v1/models` → 200，返回 OpenAI 格式模型列表（`owned_by: "minimax"`）。
+- 因此 MiniMax **不需要** `models_override`（与 DeepSeek 不同：DeepSeek 的 anthropic 入口没有 `/v1/models`，才需要覆盖到 OpenAI 端点）。
+- 官方文档（`platform.minimax.cn/docs/guides/text-generation`）给出的两个 base_url：Anthropic 兼容 `https://api.minimax.cn/anthropic`（官方推荐）、OpenAI 兼容 `https://api.minimax.cn/v1`。国际站为 `api.minimax.io` / `www.minimaxi.com`，本期不内置。
+
+### §24.30.2 决策
+
+| 编号 | 决策 |
+| --- | --- |
+| M150 | `internal/providers` 的 `presets` 新增一条：`ID: "minimax"`、`Name: "MiniMax"`、`OpenAIBaseURL: "https://api.minimax.cn/v1"`、`AnthropicBaseURL: "https://api.minimax.cn/anthropic"`。`ModelsOverride` 留空（两个协议都自带模型列表端点）。 |
+| M151 | 预设编号只允许小写字母、数字与连字符；`minimax` 不得与既有 11 个 id 冲突（`GET /api/providers` 返回 12 条）。国际站不内置，按自定义实例处理（`provider` 留空）。 |
+| M152 | 并入 `0.1.7`，不额外 bump 版本。 |
+
+### §24.30.3 验收
+
+| 编号 | 验收 |
+| --- | --- |
+| M15et | `GET /api/providers` 返回 12 条预设，其中一条 `id == "minimax"`，其 `openai_base_url == "https://api.minimax.cn/v1"`、`anthropic_base_url == "https://api.minimax.cn/anthropic"`，且无 `models_override`。 |
+| M15eu | 在「添加提供商」界面选中 MiniMax 后，OpenAI 页签自动填入 `https://api.minimax.cn/v1`、Anthropic 页签自动填入 `https://api.minimax.cn/anthropic`（沿用既有「选择供应商即自动填 base_url」行为，不新增交互）。 |
+| M15ev | **回归**：`GET /api/providers` 既有 11 条预设的 id、base_url、`models_override` 一字未改；用既有预设新建实例的行为与改动前完全一致。 |
+
+## §24.31 余额与配额查询、余额列与配额耗尽自动禁用（并入 0.1.7）
+
+### §24.31.1 背景
+
+用户 m04668 原话：「另外支持MPlan订阅配额的查询，并在实例的状态前增加一栏余额显示 5h/7d的剩余配额，配额用完后，节点自动设置为不可用，并自动跳过，直到查询到有配额再恢复；同样的deepseek的实例也能查询余额，用完后节点自动设置为不可用；支持余额查询的实例的余额列点击可以刷新余额显示，同样也会触发节点状态的切换；」
+
+接口均已实测可用（2026-11-20）：
+
+- **MiniMax M Plan 额度**：`GET https://api.minimax.cn/v1/api/openplatform/coding_plan/remains`，`Authorization: Bearer <订阅 Key>` → 200。响应核心字段：`model_remains[]` 中 `model_name == "general"` 的一项，含 `current_interval_remaining_percent`（**5 小时窗口剩余百分比**，实测 90）、`current_weekly_remaining_percent`（**7 天窗口剩余百分比**，实测 97）、`current_interval_status` / `current_weekly_status`（1 = 正常）、`remains_time` / `weekly_remains_time`（毫秒）、`start_time` / `end_time` / `weekly_start_time` / `weekly_end_time`。**注意 `current_interval_usage_count` 实为「剩余量」不是「已用量」**（已用量 = `current_interval_total_count - current_interval_usage_count`），因此判定必须用 percent 字段，不能用 count 字段。
+- **DeepSeek 余额**：`GET https://api.deepseek.com/user/balance`，`Authorization: Bearer <API Key>` → 200。响应：`is_available`（布尔）+ `balance_infos[]`（每项含 `currency`（CNY/USD）、`total_balance`、`granted_balance`、`topped_up_balance`）。实测 `{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"51.01",...}]}`。
+
+M Plan 额度机制（官方文档 `platform.minimax.cn/docs/m-plan/usage-rules`）：**5 小时窗口**（图片/视频模型除外，首次使用起算 5 小时）与**周窗口**（7 天，所有模型）**各自独立刷新**；非视频模型需要**两个窗口都有剩余额度**才能使用；未用完的额度不累积、不结转。
+
+### §24.31.2 决策（配置与查询）
+
+| 编号 | 决策 |
+| --- | --- |
+| M153 | `config.Instance` 新增**可选**字段 `balance`（对象）。缺省整个对象 = 该实例不参与余额检查，行为与改动前完全一致。对象字段：`kind`（必填，只接受 `"minimax_plan"` 与 `"deepseek"`，其它值一律报配置错误）、`url`（可选，覆盖默认端点）、`interval`（可选，轮询周期，默认 `5m`，`0` 表示关闭周期轮询、只保留手动刷新）。未知字段报错（沿用既有 `DisallowUnknownFields` 严格风格）。**不按 provider 自动推断**——用户可能用按量计费 Key（不是订阅 Key），M Plan 接口不适用，必须显式声明。 |
+| M154 | 默认端点：`kind == "minimax_plan"` → `https://api.minimax.cn/v1/api/openplatform/coding_plan/remains`；`kind == "deepseek"` → `https://api.deepseek.com/user/balance`。认证统一 `Authorization: Bearer <实例的 api_key>`。查询超时固定 **10s**（与实例 `timeout` 无关，余额查询是轻量请求，不参与熔断计数、不触发 `recordFailure`/`recordSuccess`）。 |
+| M155 | 查询结果在内部统一为 `balanceInfo` 结构：`kind`、`interval5hPercent`（5 小时窗口剩余百分比，-1 = 未知）、`weekly7dPercent`（7 天窗口剩余百分比，-1 = 未知）、`amount`（金额字符串，如 `"51.01"`，minimax_plan 为空串）、`currency`（如 `"CNY"`）、`exhausted`（是否耗尽）、`checkedAt`（本次查询时刻）、`err`（查询失败原因，成功时为空串）。多币种时取 `balance_infos` 中 `currency == "CNY"` 的一项；没有 CNY 则取数组第一项，并在 `currency` 中如实写明实际币种。 |
+| M156 | **耗尽判定**：`minimax_plan` → `interval5hPercent <= 0` **或** `weekly7dPercent <= 0` 即耗尽（官方规则：非视频模型需两个窗口都有余额，故任一为 0 即不可用）；`deepseek` → `is_available == false` **或** `total_balance <= 0` 即耗尽。字段缺失导致无法判定时按「未耗尽」处理并在 `err` 留说明，不得因解析不确定就禁用节点。 |
+| M157 | **周期轮询**：Server 启动后为每个声明了 `balance` 的实例按其 `interval` 周期查询（默认 5m，`interval == 0` 不轮询）。**启动后立即执行一次**首查，避免上线后数分钟内状态未知。轮询在后台 goroutine 中进行，查询失败不影响服务、不阻塞其它实例。 |
+| M158 | **查询失败不改变状态**：网络错误、非 2xx、JSON 解析失败一律**不改变**该实例的 `exhausted` 状态（不能因为查不到就禁用节点），保留上一次成功的余额值与时间戳，在 `err` 中记原因，并打印一行日志 `balance check failed: inst=<名> err=<原因>`。 |
+| M159 | **手动刷新接口**：新增 `POST /api/instances/balance`，请求体 `{"protocol":"<openai|anthropic>","name":"<实例名>"}`，`name` 可省略（表示该协议下全部声明了 balance 的实例）。鉴权与 `/api/instances/lock`、`/api/instances/unlock` 完全一致（Basic `admin:<admin_password>` 或管理面会话 Cookie）。响应 `{"instances":[{"name","protocol","kind","state","balance":{...}}]}`。协议非法 → 400；`name` 指定的实例不存在或未声明 balance → 404。**接口同步执行查询并返回最新结果**，不等待周期轮询。 |
+
+### §24.31.3 决策（状态机与路由）
+
+| 编号 | 决策 |
+| --- | --- |
+| M160 | 实例状态新增第 5 个取值 `exhausted`（配额/余额耗尽），与既有 `closed` / `open` / `locked` / `-` 并列。触发：一次余额查询判定耗尽即置为 `exhausted`（记录 `degradedSince` 与 `reason == "quota_exhausted"`）；恢复：查询判定有余额即清除 `exhausted` 回到 `closed`。**`exhausted` 与熔断计数完全独立**：余额查询不调用 `recordFailure`/`recordSuccess`；余额恢复**不**强行清除熔断的 `open` 状态（熔断仍按 `degrade_duration` 到期自动回 closed）。 |
+| M161 | **路由跳过**：候选链构建时 `exhausted` 实例与 `open` 实例一样不进入 `attempts`。区别：`exhausted` 实例**不参与**「全部候选都不可用时整条链都试一遍」的兜底（该兜底只服务于熔断的 `open`），因为配额耗尽时上游必然快速失败，试它没有意义。 |
+| M162 | 若过滤掉 `exhausted` 后 `attempts` 为空 → 向客户端返回 **502**，错误文本固定 `all instance quotas exhausted`（并在正文中列出耗尽的实例名），同时写入 `recentErrors`（`inst` 字段为耗尽实例名之一、`error` 为上述文本）。 |
+| M163 | **锁定优先**：实例同时被锁定且配额耗尽时，`locked` 优先（运维显式锁定仍生效，该实例照旧排第一）。余额列仍如实显示耗尽状态，鼠标悬停给出提示。这是既有的「锁定 = 运维强制」语义的延续。 |
+| M164 | 日志两行：状态切换时 `instance <名> quota exhausted` / `instance <名> quota restored`；余额值发生变化时 `balance changed: inst=<名> 5h=<p>% 7d=<p>% amount=<金额> exhausted=<bool>`（未变化不打印）。查询失败按 M158 打印。 |
+
+### §24.31.4 决策（统计与前端）
+
+| 编号 | 决策 |
+| --- | --- |
+| M165 | `/api/stats` 的 `instances[]` 每项新增**可选**字段 `balance`（`omitempty`）：不支持余额查询的实例不带该字段，字段结构 = M155 的 `balanceInfo`（`checkedAt` 用毫秒时间戳，与 `degradedSince` 同口径）。`state` 字段新增取值 `exhausted`，`reason` 新增取值 `quota_exhausted`。既有字段一个不改。 |
+| M166 | **余额信息不落盘**：余额值与 `exhausted` 状态属「当下型」状态，**不写入 `stats.json`**，重启后由首查重建（与「降级状态不持久化」同理——带着陈旧的耗尽标记启动会导致节点被误跳过）。 |
+| M167 | **前端余额列**：OpenAI 与 Anthropic 两张实例表都在**「状态」列之前**新增一列「余额」（表头 + `colgroup` + `statCell` 三处同步），列宽约 10%。展示规则：`minimax_plan` → `5h 90% · 7d 97%`；`deepseek` → `51.01 CNY`；不支持余额查询 → `-`；最近一次查询失败 → 保留上次成功的展示值并在单元格 `title` 中追加错误原因。 |
+| M168 | **点击刷新**：余额单元格可点击（`cursor: pointer`，`title` 含「点击刷新余额」）。点击 → `POST /api/instances/balance`（带该行 protocol 与 name）→ 用响应就地更新该行的余额文本与状态列文本。请求进行中禁用重复点击（显示「刷新中…」），完成后恢复。刷新同样会触发 M160 的状态切换（查到有额度则立刻恢复 `exhausted`）。 |
+| M169 | 状态列新增 `exhausted` 的展示：文案「配额耗尽」，配色与熔断的 `open`（红）**不同**（用橙/黄系），`title` 写明原因（`quota_exhausted` 或上游返回的耗尽原因）。 |
+| M170 | **不新增 WS 事件**：既有 `stats` 帧已经携带 `instances[]`，余额与 `exhausted` 状态随该帧自动下发，不新增事件类型、不改既有字段结构。 |
+| M171 | 本期**只支持在 JSON 配置文件里写 `balance` 字段**；可视化配置页（新增实例表单 / 实例编辑）暂不提供 balance 的可视化编辑项（记为已知限制，见 §24.31.6）。 |
+| M172 | 并入 `0.1.7`，不额外 bump 版本。 |
+
+### §24.31.5 验收
+
+| 编号 | 验收 |
+| --- | --- |
+| M15fw | `config.example.json` 与 README 给出 `balance` 字段的完整示例（两种 kind）；配置里写了未知 `kind` 或未知子字段时启动报错并指明字段名。 |
+| M15fx | 未声明 `balance` 的实例：`/api/stats` 的该行**不带** `balance` 字段，余额列显示 `-`，路由行为与改动前完全一致。 |
+| M15fy | 声明 `kind: "minimax_plan"` 的实例：启动后立即完成一次查询，`/api/stats` 的 `balance` 含 `interval5hPercent` / `weekly7dPercent`（取自 `current_interval_remaining_percent` / `current_weekly_remaining_percent`），余额列显示 `5h <p>% · 7d <p>%`。 |
+| M15fz | 声明 `kind: "deepseek"` 的实例：`balance.amount` / `balance.currency` 取自 `balance_infos`（多币种时取 CNY，无 CNY 取第一项并如实写明币种），余额列显示 `<金额> <币种>`。 |
+| M15ga | 查询判定耗尽 → 该实例 `state` 变为 `exhausted`、`reason` 为 `quota_exhausted`，路由不再选它（发请求时不再出现该实例的转发日志）。 |
+| M15gb | 查询判定有余额 → `state` 回到 `closed`，日志出现 `instance <名> quota restored`。 |
+| M15gc | 全部候选都 `exhausted` → 客户端收到 502 且错误文本为 `all instance quotas exhausted`（含耗尽实例名），`recentErrors` 有对应记录。 |
+| M15gd | 查询失败（网络错误 / 非 2xx / 非法 JSON）→ 该实例**状态不变**（仍为耗尽或正常），余额值保留上一次成功结果，`balance.err` 有原因，日志有 `balance check failed`。 |
+| M15ge | `POST /api/instances/balance` 带合法 protocol+name → 200 且返回该实例**刚查询**的余额与状态；状态随之切换（耗尽↔可用）。 |
+| M15gf | `POST /api/instances/balance` 带非法 protocol → 400；带不存在的 name 或未声明 balance 的实例 → 404；未通过管理面鉴权 → 401/403（与 lock/unlock 同一套鉴权）。 |
+| M15gg | 前端：两张实例表都有「余额」列且排在「状态」列之前；点击余额单元格触发刷新并就地更新余额与状态文本；刷新中按钮/单元格禁用，不可重复点击。 |
+| M15gh | 余额列展示值与 `/api/stats` 的 `balance` 字段一致；统计页与监控页的其它列、格式（K/M、ms/s）不受影响。 |
+| M15gi | **回归**：未声明 `balance` 的实例，其 `state` 取值集合、路由顺序、熔断行为、`/api/stats` 既有字段与改动前完全一致；`stats.json` 里**不出现**任何余额字段（余额不落盘）。 |
+
+### §24.31.6 已知限制
+
+- 可视化配置页暂不支持编辑 `balance` 字段，只能编辑 JSON（§24.31.4 M171）。
+- 只内置 MiniMax 国内站与国际站 DeepSeek 两种检查方式；其它供应商的余额/配额查询需自行扩展 `kind`。
+- `exhausted` 节点不做主动恢复探测：只能等下一次余额查询（周期轮询或手动点击刷新）判定有余额后恢复。
+- M Plan 官方说明「额度充足仍可能因速率限制被限流」，因此余额充足不代表调用一定成功；本功能只覆盖配额/余额维度。

@@ -592,16 +592,33 @@ func TestLockRoutesEverythingAndUnlockResets(t *testing.T) {
 		t.Errorf("second display = %q locked=%v, want locked / true", state, locked)
 	}
 
-	// The breaker is paused: failures while locked do not change state.
+	// §24.25 M92/M93: the breaker is paused for the pinned instance, but a
+	// failing pin now falls through to the remaining instances. second fails,
+	// first serves the request. The locked failure is not counted.
 	second.setFail(true)
-	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusBadGateway {
-		t.Fatalf("locked failing request status = %d, want 502", code)
+	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusOK {
+		t.Fatalf("locked failing request status = %d, want 200 from the next instance", code)
 	}
-	if state, _, _, locked := ps.stateFor(1); state != stateLocked || !locked {
-		t.Errorf("state after locked failure = %q locked=%v, want locked / true", state, locked)
+	if first.calls() != 1 || second.calls() != 2 {
+		t.Errorf("calls = %d/%d, want 1/2 (locked failure falls through)", first.calls(), second.calls())
+	}
+	if got := streamInstanceFailures(handler, protocolOpenAI, 1); got != 0 {
+		t.Errorf("locked instance failures = %d, want 0 (M92)", got)
+	}
+	locked := handler.byProtocol[protocolOpenAI][1]
+	locked.mu.Lock()
+	lockedUntil := locked.degradedUntil
+	locked.mu.Unlock()
+	if !lockedUntil.IsZero() {
+		t.Errorf("locked instance degradedUntil = %v, want zero (M92)", lockedUntil)
+	}
+	if state, _, _, isLocked := ps.stateFor(1); state != stateLocked || !isLocked {
+		t.Errorf("state after locked failure = %q locked=%v, want locked / true", state, isLocked)
 	}
 
-	// Moving the lock is allowed and routes to the new instance.
+	// Moving the lock is allowed and routes to the new instance. Both upstreams
+	// now fail at the connection layer: the pinned first is tried, then second,
+	// then the pinned instance gets one final handoff (§24.25 M94d/M15de).
 	first.setFail(true)
 	if _, ok := ps.lockInstance("first"); !ok {
 		t.Fatal("lock first failed")
@@ -609,8 +626,14 @@ func TestLockRoutesEverythingAndUnlockResets(t *testing.T) {
 	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusBadGateway {
 		t.Fatalf("request to locked first status = %d, want 502", code)
 	}
-	if first.calls() != 1 || second.calls() != 2 {
-		t.Errorf("calls = %d/%d, want 1/2", first.calls(), second.calls())
+	if first.calls() != 3 || second.calls() != 3 {
+		t.Errorf("calls = %d/%d, want 3/3 (locked, peer, locked handoff)", first.calls(), second.calls())
+	}
+	if got := streamInstanceFailures(handler, protocolOpenAI, 0); got != 0 {
+		t.Errorf("locked first failures = %d, want 0 (M92)", got)
+	}
+	if got := streamInstanceFailures(handler, protocolOpenAI, 1); got != 1 {
+		t.Errorf("non-locked second failures = %d, want 1 (M92 only exempts the pin)", got)
 	}
 
 	if !ps.unlock() {
@@ -620,6 +643,9 @@ func TestLockRoutesEverythingAndUnlockResets(t *testing.T) {
 		if state := handler.byProtocol[protocolOpenAI][i].state(); state != stateClosed {
 			t.Errorf("instance %d state after unlock = %q, want closed", i, state)
 		}
+		if got := streamInstanceFailures(handler, protocolOpenAI, i); got != 0 {
+			t.Errorf("instance %d failures after unlock = %d, want 0", i, got)
+		}
 	}
 
 	// Unlocking restarts routing at the first closed instance: first is tried
@@ -628,8 +654,8 @@ func TestLockRoutesEverythingAndUnlockResets(t *testing.T) {
 	if code := cbSend(t, server.URL, protocolOpenAI, "gpt-x"); code != http.StatusOK {
 		t.Fatalf("post-unlock request status = %d, want 200", code)
 	}
-	if first.calls() != 2 || second.calls() != 3 {
-		t.Errorf("calls = %d/%d, want 2/3 (original order restored)", first.calls(), second.calls())
+	if first.calls() != 4 || second.calls() != 4 {
+		t.Errorf("calls = %d/%d, want 4/4 (original order restored)", first.calls(), second.calls())
 	}
 }
 

@@ -897,11 +897,16 @@ func newTrickleSSEBackend(t *testing.T, chunks int, interval time.Duration, tail
 func TestRealtimeSlowAnthropicPauseTurn(t *testing.T) {
 	upstream, _ := newTrickleSSEBackend(t, 40, 300*time.Millisecond, "")
 	fallback, _, fallbackCalls := newBackend(t, http.StatusOK, nil, `{"ok":true}`)
+	// §24.23: the trickle carries no content, so the content-idle timer is
+	// bounded by the instance timeout. Keep it above the 10s slow window so
+	// this test still exercises the realtime verdict.
+	slowInstance := anthropicInstance(upstream.URL, "first-key", map[string]string{"sonnet": "model-a"})
+	slowInstance.Timeout = config.Duration(30 * time.Second)
 	proxyServer := newProxyWithOptions(t, proxy.Options{
 		FailureThreshold: 1,
 		DegradeDuration:  time.Hour,
 	},
-		anthropicInstance(upstream.URL, "first-key", map[string]string{"sonnet": "model-a"}),
+		slowInstance,
 		anthropicInstance(fallback.URL, "second-key", map[string]string{"sonnet": "model-b"}),
 	)
 	logs := captureLogs(t)
@@ -948,11 +953,15 @@ func TestRealtimeSlowOpenAINotInterrupted(t *testing.T) {
 	const chunks = 36
 	upstream, _ := newTrickleSSEBackend(t, chunks, 300*time.Millisecond, "data: [DONE]\n\n")
 	fallback, _, fallbackCalls := newBackend(t, http.StatusOK, nil, `{"ok":true}`)
+	// §24.23: comment-only chunks carry no content; keep the instance timeout
+	// above the 10s slow window so the realtime verdict still wins.
+	slowInstance := openAIInstance(upstream.URL, "first-key", "gpt-x")
+	slowInstance.Timeout = config.Duration(30 * time.Second)
 	proxyServer := newProxyWithOptions(t, proxy.Options{
 		FailureThreshold: 1,
 		DegradeDuration:  time.Hour,
 	},
-		openAIInstance(upstream.URL, "first-key", "gpt-x"),
+		slowInstance,
 		openAIInstance(fallback.URL, "second-key", "gpt-x"),
 	)
 	logs := captureLogs(t)

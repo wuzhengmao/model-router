@@ -2460,8 +2460,9 @@ func TestProvidersAPI(t *testing.T) {
 		if err := json.Unmarshal([]byte(readBody(t, resp)), &list); err != nil {
 			t.Fatalf("providers response is not JSON array: %v", err)
 		}
-		if len(list) != 11 {
-			t.Fatalf("len(providers) = %d, want 11", len(list))
+		// §24.30 M151: the MiniMax preset joined the 11 existing ones.
+		if len(list) != 12 {
+			t.Fatalf("len(providers) = %d, want 12", len(list))
 		}
 		var deepseek *providers.Provider
 		for i := range list {
