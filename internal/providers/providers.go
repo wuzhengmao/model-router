@@ -102,6 +102,14 @@ var presets = []Provider{
 		Name:          "xAI Grok",
 		OpenAIBaseURL: "https://api.x.ai/v1",
 	},
+	{
+		// §24.30 M150: both protocols expose their own model list, so no
+		// models_override is needed.
+		ID:               "minimax",
+		Name:             "MiniMax",
+		OpenAIBaseURL:    "https://api.minimax.cn/v1",
+		AnthropicBaseURL: "https://api.minimax.cn/anthropic",
+	},
 }
 
 func clone(p Provider) Provider {

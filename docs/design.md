@@ -1641,3 +1641,64 @@ body.json-mode main { flex: 1 1 auto; min-height: 0; display: flex; flex-directi
 - **未覆盖**：M15eo「同一 HTTP/2 连接上的其他请求不受影响」没有直接的 h2+TLS 端到端测试（网关实例 client 使用默认证书校验，测试需自签证书注入），但实现没有关闭 transport 连接，取消只作用于 request context。
 - **未覆盖**：`cancel` 到达时请求已结束（`end` 已置 `finished` 并清空 cancel）会被忽略，符合 M137；此时不会有取消日志。
 - **未覆盖**：WebSocket 文本帧不支持分片（沿用现有 `readClientFrame` 限制）；浏览器正常发送的取消命令是单帧。
+
+## 48. 第二十七轮：MiniMax 国内供应商预设（§24.30 M150–M152）
+
+### 48.1 实现
+
+- **M150 预设数据**：`internal/providers/providers.go` 的 `presets` 末尾追加一条 `ID: "minimax"`、`Name: "MiniMax"`、`OpenAIBaseURL: "https://api.minimax.cn/v1"`、`AnthropicBaseURL: "https://api.minimax.cn/anthropic"`；`ModelsOverride` 留空。预设仍是纯数据，不参与路由与转发，实例自己的 `base_url`/`api_key` 依旧权威。
+- **M151 编号与数量**：`minimax` 只含小写字母，与既有 11 个 id 不冲突；`providers.List()` 因此返回 12 条，`GET /api/providers` 直接返回该列表（`internal/proxy/proxy.go` 的 `PathProviders` 分支调用 `providers.List()`）。国际站（`api.minimax.io` / `www.minimaxi.com`）不内置，按自定义实例处理（`provider` 留空）。
+- **不需要 models_override 的依据**：实测 `GET https://api.minimax.cn/anthropic/v1/models` 与 `GET https://api.minimax.cn/v1/models` 均返回 200（前者是 Anthropic 格式、后者是 OpenAI 格式），两个协议各自带模型列表端点；`providers.ModelsSource(providerID, protocol, fallbackBaseURL, fallbackAuth)` 只在该 provider+protocol 声明了 override 时返回覆盖值，否则回落调用方传入的 fallback，因此「查询模型」直接用实例自己的 base_url/auth。
+- **M15eu 添加实例自动填充**：可视化配置页沿用既有的「选中内置供应商即按当前协议自动填 `base_url`、并记录 `provider`」路径（`internal/web/index.html` 的供应商选择逻辑），MiniMax 作为普通预设自动获得两个协议的正确地址，没有新增交互。
+- **M152 版本**：并入 `0.1.7`，`internal/version/version.txt` 不变。
+
+### 48.2 决策与未覆盖
+
+- **D-M28-1 只加数据、不加分支**：MiniMax 与其它无 override 的供应商走完全相同的代码路径，`internal/providers` 没有为它增加任何特殊判断。
+- **D-M28-2 两个协议同时填**：一个预设同时给出 `openai_base_url` 与 `anthropic_base_url`，避免用户在某个协议下选了 MiniMax 后还要手改地址。
+- **未覆盖**：国际站不内置；用 `api.minimax.io` 的用户按自定义实例填写即可，`provider` 留空不影响路由。
+- **未覆盖**：`TestMiniMaxPreset` 对 `ModelsSource` 的断言取「无 override 时回落到调用方 fallback」这一真实语义；preset 自身的 Anthropic base_url 由同一用例前面的字段断言覆盖，不重复断言。
+
+## 49. 第二十八轮：余额与配额查询、余额列与配额耗尽自动禁用（§24.31 M153–M172）
+
+### 49.1 配置与查询（M153–M159）
+
+- **M153 配置模型**：`internal/config/config.go` 的 `config.Instance` 新增可选字段 `Balance *Balance`；`config.Balance` 含 `kind`（必填）、`url`（可选）、`interval`（可选）。`(*Balance).UnmarshalJSON` 先用 `map[string]json.RawMessage` 拒绝未知子字段，再用 `DisallowUnknownFields` 解码并检查尾随数据；`kind` 只接受 `minimax_plan` / `deepseek`（大小写不敏感，解析后归一化为小写），`url` 非空时必须是绝对 http(s) URL。`PollInterval()` 实现「缺省 `5m`（`DefaultBalanceInterval`）、显式 `0` 关闭周期轮询」。
+- **M153 不按 provider 推断**：`kind` 必须显式声明，配置校验（`internal/config/config.go` 的实例校验）与运行时构造（`internal/proxy/proxy.go` 的 `NewWithOptions`）都只读 `inst.Balance`，`provider` 与 `balance` 完全独立；用户可能用按量计费 Key，M Plan 接口不适用。
+- **M154 端点与认证**：`internal/proxy/balance.go`（新建）的 `defaultBalanceURL` 给出两个默认端点（`https://api.minimax.cn/v1/api/openplatform/coding_plan/remains`、`https://api.deepseek.com/user/balance`）；`queryInstanceBalance` 统一 `Authorization: Bearer <实例 api_key>`，使用独立的 `newBalanceClient()`（`balanceQueryTimeout = 10s`，连接/握手/响应头/总超时统一），与实例 `timeout` 无关；余额查询不参与熔断计数，不调用 `recordFailure`/`recordSuccess`。
+- **M155 统一结构**：`balanceInfo` 含 `kind`、`interval5hPercent`、`weekly7dPercent`（未知为 `-1`）、`amount`、`currency`、`exhausted`、`checkedAt`（毫秒时间戳）、`err`。MiniMax 取 `model_remains` 中 `model_name == "general"` 的项，百分比四舍五入为整数；DeepSeek 优先取 `currency == "CNY"` 的一项，没有 CNY 则取数组第一项并在 `currency` 中如实写明实际币种；金额同时接受字符串与数字写法（`balanceValue`）。
+- **M156 耗尽判定**：`quotaExhausted()` 对 MiniMax 用「5 小时或 7 天窗口任一 `<= 0` 即耗尽」（未知 `-1` 不算耗尽），对 DeepSeek 用 `is_available == false` 或 `total_balance <= 0`。字段缺失/无法解析时按「未耗尽」处理，原因写进 `err`，不由解析不确定就禁用节点。
+- **M157 周期轮询与启动首查**：`internal/proxy/proxy.go` 的 `Server.startBalanceChecks` 在 `NewServer` 与 `reload` 后（state 重建后）构建 `balancePoller`，为每个声明了 `balance` 的实例起一个 goroutine；`balancePoller.run` 先执行一次 `check`（启动首查，避免上线后数分钟状态未知），再按 `inst.balanceInterval` 起 ticker（`<= 0` 时只查一次）。`Close` 与下一次 reload 会 `stop()` 旧 poller（cancel + WaitGroup 等待），不泄漏 goroutine。
+- **M158 查询失败不改状态**：`queryInstanceBalance` 在网络错误、非 2xx、读体失败、JSON 解析失败时返回 `balanceResult{failed: true}`；`applyBalance` 对失败结果只更新 `balanceInfo.Err`，保留上次成功的金额/百分比/`checkedAt` 与 `quotaExhausted`；`logBalanceOutcome` 打印 `balance check failed: inst=<名> err=<原因>`。
+- **M159 手动刷新接口**：`internal/proxy/balance.go` 的 `serveInstanceBalance` 处理 `POST /api/instances/balance`（路由常量 `PathInstancesBalance`），鉴权与 `/api/instances/lock`、`/api/instances/unlock` 完全一致；请求体 `{"protocol","name"}`，`name` 为空表示该协议下全部声明了 balance 的实例。接口同步执行查询并返回 `{"instances":[{name,protocol,kind,state,balance}]}`；协议非法 400，实例不存在或未声明 balance 404。
+- **落盘边界**：余额信息只进 `internal/proxy/stats.go` 的 `statsInstance.Balance *balanceInfo`（`omitempty`），不进入 `stats.json` 的持久化结构。
+
+### 49.2 状态机与路由（M160–M164）
+
+- **M160 第 5 个状态**：`internal/proxy/circuit.go` 新增 `stateExhausted = "exhausted"` 与 `reasonQuotaExhausted = "quota_exhausted"`；`instanceRuntime` 新增 `quotaExhausted` 与 `quotaExhaustedSince`；`instanceRuntime.state()` 与 `displayState()` 在 `quotaExhausted` 为真时返回 `exhausted`（`displayState` 同时给出 `quotaExhaustedSince` 与 `quota_exhausted` 原因），`protocolRuntime.stateFor` 让 `exhausted` 与 `open` 一样回传 `degradedSince`。`applyBalance` 只在 `exhausted` 翻转时置位/清除 `quotaExhausted` 与时间戳，不触碰 `consecutiveFailures` / `degradedUntil`；配额恢复不会清除熔断的 `open`，熔断仍按 `degrade_duration` 到期自动回 `closed`。
+- **M161 路由跳过**：`internal/proxy/proxy.go` 的 `serveChain` 在非锁定分支把 `isExhausted()` 的候选收集进 `exhaustedCands` 并排除出 `attempts`；「全部候选都不可用时整条链都试一遍」的兜底只服务于熔断 `open`，对 exhausted 候选同样跳过；§24.21 补漏段的实例遍历也跳过 `isExhausted()` 的实例。
+- **M162 全耗尽 502**：`allExhausted := len(attempts) == 0 && len(exhaustedCands) > 0` 时，`serveChain` 写 502，正文为 `all instance quotas exhausted: <耗尽实例名列表>`（常量 `errAllQuotasExhausted`），`finalErr` 为该文本、`finalMetrics.instName` 取第一个耗尽实例，并调用 `tracker.begin(exhaustedCands[0])`；defer 中的 `tracker.end` 照常执行，`stats.finish` 因此把这条失败写进 `recentErrors`（`instName` 为耗尽实例名之一、`error` 为固定文本）。
+- **M163 锁定优先**：锁定分支里锁定候选恒进 `attempts` 且不检查 `isExhausted()`；`protocolRuntime.stateFor` 在协议锁定时先返回 `locked`（锁定实例）或 `-`（其余实例），因此锁定实例展示为「已锁定」而不是「配额耗尽」。余额列仍读取实例快照，锁定行同样显示耗尽值与查询失败原因。
+- **M164 日志**：`internal/proxy/balance.go` 的 `logBalanceOutcome` 在状态翻转时打印 `instance <名> quota exhausted` / `instance <名> quota restored`，在余额值变化时打印 `balance changed: inst=<名> 5h=<p>% 7d=<p>% amount=<金额> exhausted=<bool>`（未变化不打印），查询失败按 M158 打印。
+
+### 49.3 统计与前端（M165–M172）
+
+- **M165 `/api/stats`**：`internal/proxy/stats.go` 的 `statsInstance` 新增可选字段 `balance`（`omitempty`）；`Server.statsSnapshot` 在合并配置行时对声明了 balance 的实例调用 `instance.balanceSnapshot()` 写回最近一次快照，不支持余额查询的实例不带该字段。`state` 取值域新增 `exhausted`、`reason` 新增 `quota_exhausted`，既有字段一个不改；removed 行没有运行实例，不带余额。
+- **M166 余额不落盘**：余额值与 `quotaExhausted` 只存在 `instanceRuntime` 内存；`statsStore` 的持久化结构不包含任何余额字段，重启后由首查重建（带着陈旧的耗尽标记启动会导致节点被误跳过）。
+- **M167 余额列**：`internal/web/index.html` 的 OpenAI 与 Anthropic 两张实例表在「状态」列之前新增「余额」列（`colgroup`、`<thead>` 与行渲染 `appendStatInstanceRow` 三处同步，列宽 10%）；`statBalanceText` 按 kind 渲染 `5h 90% · 7d 97%`（minimax_plan）或 `51.01 CNY`（deepseek），不支持余额查询显示 `-`，最近一次查询失败时保留上次成功的展示值并在单元格 `title` 中追加错误原因。
+- **M168 点击刷新**：余额单元格可点击（`stat-balance-clickable`，`title` 含「点击刷新余额」）；`refreshInstanceBalance` 调用 `POST /api/instances/balance`（带该行 protocol 与 name），用响应就地更新余额文本与状态文本；请求进行中显示「刷新中…」并置 `data-refreshing=1` 阻止重复点击，完成后恢复。刷新同样会触发 M160 的状态切换。
+- **M169 状态展示**：`statStateText` / `statStateClass` 新增 `exhausted` → 文案「配额耗尽」、配色 `stat-exhausted`（橙/黄系，区别于熔断 `open` 的红色）；`statStateTitle` 追加 `quota_exhausted` 原因与查询错误。
+- **M170 不新增 WS 事件**：既有 `stats` 帧已经携带 `instances[]`，余额与 `exhausted` 状态随该帧下发，不新增事件类型、不改既有字段结构。
+- **M171/M172 范围与版本**：本期只支持在 JSON 配置文件里写 `balance` 字段，可视化配置页暂不提供 balance 编辑项（已知限制）；但该页的 `normalizeInstance` 会原样保留 `raw.balance`，`buildConfigWithoutFallback` 再把它写回实例对象，避免在可视化页面保存配置时静默丢掉 `balance`（否则 M153 声明的检查会被无声关闭）。版本保持 `0.1.7`。
+
+### 49.4 决策与未覆盖
+
+- **D-M29-1 查询失败绝不改状态**：M158 的「查不到就保留」优先于「尽快禁用」；失败只记录 `err`，状态与上次成功值不变，避免余额接口抖动导致节点被误跳过。
+- **D-M29-2 `exhausted` 独立于熔断**：余额查询不调用 `recordFailure`/`recordSuccess`；恢复时只清 `quotaExhausted`，熔断 `open` 仍按 `degrade_duration` 到期恢复（M160）。
+- **D-M29-3 锁定优先的两个位置**：展示侧由 `protocolRuntime.stateFor` 在读取实例状态前返回 `locked`/`-`；路由侧锁定候选不参与 `isExhausted()` 过滤。余额列独立于状态列，仍显示实例自己的余额与查询错误（M163）。
+- **D-M29-4 首查在 goroutine 内同步执行**：`balancePoller.run` 的第一个 `check` 先于 ticker 执行，`NewServer` 不等待它完成，因此启动不会被慢余额端点阻塞；状态在数十毫秒到 10s（查询超时上限）内收敛。
+- **D-M29-5 全耗尽记录进 `recentErrors`**：走 `tracker.begin(exhaustedCands[0])` 与既有 defer `tracker.end`，与其它失败共用 `stats.finish`；`instName` 取第一个耗尽实例，正文额外列出全部耗尽实例名。
+- **未覆盖**：多实例共用同一 `api_key` 时余额查询各自独立，未做去重。
+- **未覆盖**：`interval` 没有下限校验，配置成极小值（如 `1ms`）会按该周期持续查询，由使用者自行控制。
+- **未覆盖**：MiniMax 的 `current_interval_status` / `current_weekly_status` 未参与判定，只按 M156 的百分比规则；官方状态字段语义未在需求中定义。
+- **未覆盖**：余额充足不代表调用一定成功（M Plan 官方说明「额度充足仍可能因速率限制被限流」），本功能只覆盖配额/余额维度。

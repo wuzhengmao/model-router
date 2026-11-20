@@ -17,6 +17,8 @@
     --danger: #ff6b6b;
     --ok: #4ade80;
     --warn: #fbbf24;
+    /* §24.31 M169：配额耗尽用橙色，与熔断的红色区分。 */
+    --orange: #fb923c;
     --border: #2d374d;
     /* 时间轴轨道与统一块高：所有条固定为轨道高的 40%（§24.8 Y5）。 */
     --tl-track-h: 16px;
@@ -259,6 +261,12 @@
   .stat-table tr.stat-muted td.stat-degraded { color: var(--muted); }
   .stat-shadowed { color: var(--muted); }
   .stat-locked { color: var(--warn); font-weight: 600; }
+  /* §24.31 M167/M169：余额列可点击刷新，配额耗尽用橙色。 */
+  .stat-balance { color: var(--muted); }
+  .stat-balance-clickable { cursor: pointer; }
+  .stat-balance-clickable:hover { color: var(--text); }
+  .stat-balance-busy { color: var(--muted); cursor: progress; }
+  .stat-exhausted { color: var(--orange); font-weight: 600; }
   .stat-lock-cell { text-align: center; }
   .lock-button {
     background: transparent;
@@ -599,15 +607,16 @@
       <div class="stat-table-wrap">
         <table class="stat-table" id="stat-instances-openai-table">
           <colgroup>
-            <col style="width:19%">
-            <col style="width:7%">
+            <col style="width:16%">
             <col style="width:6%">
-            <col style="width:6%">
-            <col style="width:6%">
+            <col style="width:5%">
+            <col style="width:5%">
+            <col style="width:5%">
+            <col style="width:9%">
             <col style="width:10%">
+            <col style="width:10%">
+            <col style="width:7%">
             <col style="width:11%">
-            <col style="width:11%">
-            <col style="width:8%">
             <col style="width:10%">
             <col style="width:6%">
           </colgroup>
@@ -622,6 +631,7 @@
               <th class="num">输入 token</th>
               <th class="num">输出 token</th>
               <th class="num">平均 t/s</th>
+              <th>余额</th>
               <th>状态</th>
               <th class="lock-col" title="锁定 / 解锁">锁定</th>
             </tr>
@@ -634,15 +644,16 @@
       <div class="stat-table-wrap">
         <table class="stat-table" id="stat-instances-anthropic-table">
           <colgroup>
-            <col style="width:19%">
-            <col style="width:7%">
+            <col style="width:16%">
             <col style="width:6%">
-            <col style="width:6%">
-            <col style="width:6%">
+            <col style="width:5%">
+            <col style="width:5%">
+            <col style="width:5%">
+            <col style="width:9%">
             <col style="width:10%">
+            <col style="width:10%">
+            <col style="width:7%">
             <col style="width:11%">
-            <col style="width:11%">
-            <col style="width:8%">
             <col style="width:10%">
             <col style="width:6%">
           </colgroup>
@@ -657,6 +668,7 @@
               <th class="num">输入 token</th>
               <th class="num">输出 token</th>
               <th class="num">平均 t/s</th>
+              <th>余额</th>
               <th>状态</th>
               <th class="lock-col" title="锁定 / 解锁">锁定</th>
             </tr>
@@ -1055,6 +1067,9 @@
       roles: {},
       role_names: {},
       capabilities: {},
+      // §24.31 M171: the visual page has no balance editor, so the object is
+      // carried through untouched instead of being dropped on save.
+      balance: null,
       remoteCapabilities: {},
       capErrors: {},
       remoteModels: [],
@@ -1112,6 +1127,9 @@
           inst.capabilities[model] = capability;
         }
       });
+    }
+    if (raw.balance && typeof raw.balance === 'object') {
+      inst.balance = JSON.parse(JSON.stringify(raw.balance));
     }
     return inst;
   }
@@ -2001,6 +2019,9 @@
       });
       if (Object.keys(capabilities).length > 0) {
         item.model_capabilities = capabilities;
+      }
+      if (inst.balance) {
+        item.balance = inst.balance;
       }
     });
     return out;
@@ -3395,6 +3416,8 @@
         }
         return '降级';
       }
+      // §24.31 M169：配额耗尽用独立文案，不与熔断的「降级」混用。
+      case 'exhausted': return '配额耗尽';
       case 'closed': return '正常';
       default:
         return item.degraded === true ? '降级' : '正常';
@@ -3406,9 +3429,119 @@
       case 'locked': return 'stat-locked';
       case '-': return 'stat-shadowed';
       case 'open': return 'stat-degraded';
+      case 'exhausted': return 'stat-exhausted';
       case 'closed': return 'stat-ok';
       default: return '';
     }
+  }
+
+  // §24.31 M169：状态列的悬停提示写明原因。
+  function statStateTitle(state, item) {
+    if (state !== 'exhausted') {
+      return '';
+    }
+    var reason = item && item.reason ? String(item.reason) : 'quota_exhausted';
+    var text = '配额耗尽：' + reason;
+    if (item && item.balance && item.balance.err) {
+      text += ' · ' + String(item.balance.err);
+    }
+    return text;
+  }
+
+  // §24.31 M167：余额展示值。minimax_plan 显示两个窗口的剩余百分比，
+  // deepseek 显示金额与币种，不支持余额查询的实例显示占位符。
+  function statBalanceInfo(item) {
+    var balance = item && item.balance;
+    if (!balance || typeof balance !== 'object') {
+      return null;
+    }
+    return balance;
+  }
+
+  function statBalancePercent(value) {
+    var percent = Number(value);
+    if (!isFinite(percent) || percent < 0) {
+      return '-';
+    }
+    return Math.round(percent) + '%';
+  }
+
+  function statBalanceText(balance) {
+    if (!balance) {
+      return '-';
+    }
+    var kind = String(balance.kind || '');
+    if (kind === 'minimax_plan') {
+      return '5h ' + statBalancePercent(balance.interval5hPercent) +
+        ' · 7d ' + statBalancePercent(balance.weekly7dPercent);
+    }
+    if (kind === 'deepseek') {
+      var amount = String(balance.amount || '');
+      var currency = String(balance.currency || '');
+      if (!amount && !currency) {
+        return '-';
+      }
+      return amount + (currency ? ' ' + currency : '');
+    }
+    return '-';
+  }
+
+  function statBalanceTitle(balance, clickable) {
+    var parts = [];
+    if (balance) {
+      parts.push('类型 ' + String(balance.kind || '-'));
+      if (balance.checkedAt) {
+        parts.push('查询于 ' + formatClock(balance.checkedAt));
+      }
+      if (balance.err) {
+        parts.push('上次查询失败：' + String(balance.err));
+      }
+    }
+    if (clickable) {
+      parts.push('点击刷新余额');
+    }
+    return parts.join(' · ');
+  }
+
+  // §24.31 M168：点击余额单元格刷新余额并就地更新余额与状态文本。
+  function refreshInstanceBalance(protocol, name, balanceCell, stateCell, fallbackBalance) {
+    if (balanceCell.getAttribute('data-refreshing') === '1') {
+      return;
+    }
+    balanceCell.setAttribute('data-refreshing', '1');
+    balanceCell.textContent = '刷新中…';
+    balanceCell.classList.add('stat-balance-busy');
+    var body = JSON.stringify({ protocol: String(protocol), name: String(name) });
+    api('/api/instances/balance', { method: 'POST', body: body }).then(function (raw) {
+      var list = raw && raw.instances;
+      var row = null;
+      if (Array.isArray(list)) {
+        for (var i = 0; i < list.length; i++) {
+          if (list[i] && String(list[i].name) === String(name)) {
+            row = list[i];
+            break;
+          }
+        }
+      }
+      if (!row) {
+        throw new Error('余额响应中没有该实例');
+      }
+      var balance = statBalanceInfo(row);
+      balanceCell.textContent = statBalanceText(balance);
+      balanceCell.title = statBalanceTitle(balance, true);
+      if (stateCell) {
+        var state = String(row.state || '');
+        stateCell.textContent = statStateText(state, { degradedSince: 0, reason: row.reason });
+        stateCell.className = statStateClass(state);
+        stateCell.title = statStateTitle(state, { reason: row.reason, balance: balance });
+      }
+    }).catch(function (err) {
+      balanceCell.textContent = statBalanceText(fallbackBalance);
+      balanceCell.title = statBalanceTitle(fallbackBalance, true) + ' · 刷新失败：' + err.message;
+    }).then(function () {
+      balanceCell.removeAttribute('data-refreshing');
+      balanceCell.classList.remove('stat-balance-busy');
+    });
   }
 
   var LOCK_CLOSED_ICON = '<svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">' +
@@ -3481,10 +3614,24 @@
     row.appendChild(statCell(inTokenCount.text, 'num', inTokenCount.exact));
     row.appendChild(statCell(outTokenCount.text, 'num', outTokenCount.exact));
     row.appendChild(statCell(formatRate(avgTps), 'num'));
+    // §24.31 M167/M168：余额列排在状态列之前，可点击刷新。
+    var balance = statBalanceInfo(item);
+    var balanceCell = statCell(statBalanceText(balance), balance ? 'stat-balance' : '');
+    balanceCell.title = statBalanceTitle(balance, !!balance);
+    var stateCell = null;
     if (removed) {
-      row.appendChild(statCell('已移除', 'stat-removed'));
+      stateCell = statCell('已移除', 'stat-removed');
     } else {
-      row.appendChild(statCell(statStateText(state, item), statStateClass(state)));
+      stateCell = statCell(statStateText(state, item), statStateClass(state));
+      stateCell.title = statStateTitle(state, item);
+    }
+    row.appendChild(balanceCell);
+    row.appendChild(stateCell);
+    if (balance && item.protocol && item.name) {
+      balanceCell.classList.add('stat-balance-clickable');
+      balanceCell.addEventListener('click', function () {
+        refreshInstanceBalance(item.protocol, item.name, balanceCell, stateCell, balance);
+      });
     }
     var lockCell = document.createElement('td');
     lockCell.className = 'stat-lock-cell';

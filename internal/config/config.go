@@ -46,6 +46,19 @@ const (
 	RoleWildcard = "*"
 )
 
+// Balance check kinds (§24.31 M153). The kind is never inferred from the
+// provider: a subscription key and a pay-as-you-go key need different APIs.
+const (
+	// BalanceKindMiniMaxPlan queries the MiniMax M Plan subscription quota.
+	BalanceKindMiniMaxPlan = "minimax_plan"
+	// BalanceKindDeepSeek queries the DeepSeek prepaid balance.
+	BalanceKindDeepSeek = "deepseek"
+)
+
+// DefaultBalanceInterval is the polling period of a balance check when the
+// instance does not declare one (§24.31 M153).
+const DefaultBalanceInterval = 5 * time.Minute
+
 // IsConcreteRole reports whether role is one of the concrete model roles.
 // Callers must pass a normalized (trimmed, lowercased) value.
 func IsConcreteRole(role string) bool {
@@ -342,6 +355,85 @@ type Instance struct {
 	RoleNames map[string]string `json:"role_names,omitempty"`
 	// ModelCapabilities declares metadata keyed by upstream model name (§21.5).
 	ModelCapabilities map[string]ModelCapability `json:"model_capabilities,omitempty"`
+	// Balance enables the balance/quota check of this instance (§24.31 M153).
+	// The whole object is optional: without it the instance never takes part
+	// in a balance check and behaves exactly as before.
+	Balance *Balance `json:"balance,omitempty"`
+}
+
+// Balance declares how an instance's balance/quota is queried (§24.31 M153).
+type Balance struct {
+	// Kind selects the upstream API: "minimax_plan" or "deepseek".
+	Kind string `json:"kind"`
+	// URL overrides the default endpoint of the kind.
+	URL string `json:"url,omitempty"`
+	// Interval is the polling period. A missing interval means the default
+	// (5m); an explicit "0s" disables the periodic poll and leaves only the
+	// manual refresh.
+	Interval *OptionalDuration `json:"interval,omitempty"`
+}
+
+// UnmarshalJSON parses the balance object strictly: unknown fields and unknown
+// kinds are configuration errors (§24.31 M153).
+func (b *Balance) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return fmt.Errorf("balance: %w", err)
+	}
+	for name := range fields {
+		switch name {
+		case "kind", "url", "interval":
+		default:
+			return fmt.Errorf("balance: unknown field %q", name)
+		}
+	}
+
+	var raw struct {
+		Kind     string            `json:"kind"`
+		URL      string            `json:"url,omitempty"`
+		Interval *OptionalDuration `json:"interval,omitempty"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
+		return fmt.Errorf("balance: %w", err)
+	}
+	if err := dec.Decode(new(struct{})); err != io.EOF {
+		return errors.New("balance: unexpected trailing data")
+	}
+
+	kind := strings.ToLower(strings.TrimSpace(raw.Kind))
+	switch kind {
+	case BalanceKindMiniMaxPlan, BalanceKindDeepSeek:
+	default:
+		return fmt.Errorf("balance.kind must be %q or %q, got %q",
+			BalanceKindMiniMaxPlan, BalanceKindDeepSeek, raw.Kind)
+	}
+
+	endpoint := strings.TrimSpace(raw.URL)
+	if endpoint != "" {
+		u, err := url.Parse(endpoint)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return fmt.Errorf("balance.url must be an absolute http(s) URL, got %q", raw.URL)
+		}
+	}
+
+	b.Kind = kind
+	b.URL = endpoint
+	b.Interval = raw.Interval
+	return nil
+}
+
+// PollInterval returns the effective polling period of the balance check: the
+// default when unset, zero when the periodic poll is disabled (§24.31 M153).
+func (b *Balance) PollInterval() time.Duration {
+	if b == nil {
+		return 0
+	}
+	if b.Interval == nil {
+		return DefaultBalanceInterval
+	}
+	return time.Duration(*b.Interval)
 }
 
 // Instances is the flat runtime representation of the grouped JSON
@@ -559,6 +651,18 @@ func (in *Instance) applyDefaults() error {
 		if _, ok := providers.Get(in.Provider); !ok {
 			return fmt.Errorf("unknown provider %q: must be a built-in provider id or empty for custom", in.Provider)
 		}
+	}
+
+	// §24.31 M153: the balance kind is explicit and never inferred.
+	if in.Balance != nil {
+		kind := strings.ToLower(strings.TrimSpace(in.Balance.Kind))
+		switch kind {
+		case BalanceKindMiniMaxPlan, BalanceKindDeepSeek:
+		default:
+			return fmt.Errorf("balance.kind must be %q or %q, got %q",
+				BalanceKindMiniMaxPlan, BalanceKindDeepSeek, in.Balance.Kind)
+		}
+		in.Balance.Kind = kind
 	}
 
 	in.BaseURL = strings.TrimRight(strings.TrimSpace(in.BaseURL), "/")

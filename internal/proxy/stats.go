@@ -63,6 +63,9 @@ type statsInstance struct {
 	DegradedSince int64  `json:"degradedSince"`
 	Reason        string `json:"reason"`
 	Current       bool   `json:"current"`
+	// §24.31 M165: balance/quota snapshot of the instance. The field is
+	// omitted for instances that do not take part in a balance check.
+	Balance *balanceInfo `json:"balance,omitempty"`
 	// Removed marks persisted counters for an instance no longer configured
 	// (§24.7 D11): the row stays visible with a "removed" label.
 	Removed bool `json:"removed"`
@@ -528,6 +531,11 @@ func (s *Server) statsSnapshot(wsClients int) statsSnapshot {
 				row.State, row.DegradedSince, row.Reason, row.Locked = ps.stateFor(i)
 			}
 			row.Degraded = row.State == stateOpen
+			// §24.31 M165: only instances with a balance check carry the field.
+			if info, ok := inst.balanceSnapshot(); ok {
+				snapshot := info
+				row.Balance = &snapshot
+			}
 			rows = append(rows, row)
 		}
 	}

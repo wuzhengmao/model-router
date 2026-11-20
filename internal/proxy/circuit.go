@@ -17,11 +17,14 @@ import (
 // §24.17 M34: an instance is only ever closed or open; protocols additionally
 // render locked and shadowed ("-") rows. The old probe state is gone because
 // there is no active probing subsystem any more.
+// §24.31 M160 adds a fifth state: "exhausted" marks an instance whose
+// quota/balance is used up. It is independent of the breaker.
 const (
-	stateClosed   = "closed"
-	stateOpen     = "open"
-	stateLocked   = "locked"
-	stateShadowed = "-"
+	stateClosed    = "closed"
+	stateOpen      = "open"
+	stateLocked    = "locked"
+	stateShadowed  = "-"
+	stateExhausted = "exhausted"
 )
 
 // reason values reported in GET /api/stats (§24.15.3). The decision table does
@@ -29,6 +32,9 @@ const (
 // breaker.
 const (
 	reasonFailureThreshold = "failure_threshold"
+	// reasonQuotaExhausted marks an instance disabled by its balance check
+	// (§24.31 M160).
+	reasonQuotaExhausted = "quota_exhausted"
 )
 
 // isOpen reports whether the breaker is open. §24.17 M35: the only input is the
@@ -57,6 +63,11 @@ func (inst *instanceRuntime) nowTime() time.Time {
 func (inst *instanceRuntime) state() string {
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
+	// §24.31 M160: a used up quota outranks the breaker state; the quota
+	// recovers on its own, the breaker does not.
+	if inst.quotaExhausted {
+		return stateExhausted
+	}
 	if inst.isOpenAt(inst.nowTime()) {
 		return stateOpen
 	}
@@ -113,6 +124,11 @@ func (inst *instanceRuntime) recordFailure(now time.Time, threshold int, duratio
 func (inst *instanceRuntime) displayState() (state string, since time.Time, reason string) {
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
+	// §24.31 M160: the quota state outranks the breaker state, but recovering
+	// from a quota never clears an open breaker.
+	if inst.quotaExhausted {
+		return stateExhausted, inst.quotaExhaustedSince, reasonQuotaExhausted
+	}
 	if inst.isOpenAt(inst.nowTime()) {
 		return stateOpen, inst.degradedSince, inst.degradeReason
 	}
@@ -158,7 +174,8 @@ func (ps *protocolRuntime) stateFor(index int) (state string, degradedSince int6
 	inst := ps.insts[index]
 	state, since, reason := inst.displayState()
 	var sinceMs int64
-	if state == stateOpen && !since.IsZero() {
+	// §24.31 M160: an exhausted instance reports since when the quota ran out.
+	if (state == stateOpen || state == stateExhausted) && !since.IsZero() {
 		sinceMs = since.UnixMilli()
 	}
 	return state, sinceMs, reason, false

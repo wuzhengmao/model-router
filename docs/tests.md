@@ -1201,3 +1201,58 @@ E1–E5（时间轴对齐/表头图例/客户端列）、E10–E11（四页主�
 - `TestMonitorCancelWebSocketCommands` 直接以 `hub.serveWS` 启动 WS 端，使用一个最小 RFC 6455 客户端完成握手、带掩码文本/控制帧发送与服务器帧读取；非法命令后用 ping/pong 证明连接未断。
 - `TestOperatorCancelCommittedStream` 的上游先写 `message_start`+text 事件并 flush，再阻塞；取消后断言客户端读取错误、状态码仍为已提交的 200、body 中无 `pause_turn`。
 - `TestMonitorCancelUI` 读取 `../web/index.html` 做静态契约断言（列位置、按钮文案、隐藏条件、WS 文本帧内容）；项目暂无浏览器自动化测试。
+
+## 48. 第二十七轮：MiniMax 国内供应商预设（§24.30 M150–M152）
+
+### 48.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-946 | M15et 预设共 12 条且含 minimax | `TestListContainsBuiltinProviders`（`internal/providers/providers_test.go`） | `providers.List()` 长度为 12；id 清单含 `minimax` 且无重复；每条预设的 base_url 都是绝对 http(s) URL；既有 11 条 id 全部仍在 |
+| UT-947 | M150 MiniMax 的两个 base_url | `TestMiniMaxPreset` | `Name == "MiniMax"`、`OpenAIBaseURL == "https://api.minimax.cn/v1"`、`AnthropicBaseURL == "https://api.minimax.cn/anthropic"` |
+| UT-948 | M150 MiniMax 无 models_override | `TestMiniMaxPreset` | `ModelsOverride == nil`；`GetModelsOverride("minimax","openai")` 与 `("minimax","anthropic")` 都 miss |
+| UT-949 | M150 无 override 时 ModelsSource 回落 fallback | `TestMiniMaxPreset` | `ModelsSource("minimax","anthropic","https://fallback.example","bearer")` 返回传入的 fallback 与 auth（preset 自身的 base_url 由上一条覆盖） |
+| UT-950 | M15eu 可视化添加实例自动填 base_url | 设计保证（见 design §48.1） | 沿用既有「选中内置供应商即按当前协议填 base_url」路径，MiniMax 无新增交互；无浏览器自动化测试 |
+| UT-951 | M15ev 回归：既有 11 条预设一字未改 | `TestListContainsBuiltinProviders`、`TestDeepSeekModelsOverride`、`TestModelsSource`（均未改动） | 既有 id、base_url、`models_override` 断言全部保留并通过；本轮 `presets` 只追加一条 |
+| UT-952 | 构建与全量测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` | 全部通过 |
+
+### 48.2 场景说明
+
+- MiniMax 相关用例位于 `internal/providers/providers_test.go`（`package providers_test`）：`TestMiniMaxPreset` 通过 `providers.Get("minimax")` 读取预设，字段断言覆盖名称、两个 base_url 与「无 override」；`ModelsSource` 的断言按其真实语义写成「无 override 时回落到调用方 fallback」。
+- `TestListContainsBuiltinProviders` 的 id 清单本轮追加 `minimax`，长度断言由 11 改为 12；其余断言（URL 合法、id 不重复、override 协议合法）未改。
+- 既有 `TestDeepSeekModelsOverride`、`TestModelsSource` 未做任何改动，作为 M15ev 的回归基线。
+
+## 49. 第二十八轮：余额与配额查询、余额列与配额耗尽自动禁用（§24.31 M153–M172）
+
+### 49.1 用例
+
+| 编号 | 检查项 | 测试 | 判定 |
+|---|---|---|---|
+| UT-953 | M153 balance 对象严格解析 | `TestBalanceObjectParsing`（`internal/config/balance_test.go`）、`TestBalanceConfigParsing`（`internal/proxy/balance_internal_test.go`） | 两种 kind 均可解析；缺省 `balance` 的实例 `Balance == nil`；未知 kind 报 `balance.kind`；未知子字段报字段名；`url` 非绝对地址报 `balance.url`；`interval` 缺省为 5m、显式 `0s` 为 0；配置可 round trip |
+| UT-954 | M15fw 示例与启动报错 | `config.example.json`、`README.md` | 示例文件与 README 各给出 `minimax_plan` 与 `deepseek` 两种 kind；未知 kind / 未知子字段在启动时报错并指明字段名（同上一条用例） |
+| UT-955 | M155/M156 MiniMax 额度解析 | `TestBalanceParsesMiniMaxPlan` | 只取 `model_name == "general"`；`5h/7d` 取自 `current_interval_remaining_percent` / `current_weekly_remaining_percent`；任一窗口为 0 即耗尽；两个百分比缺失时按未知（-1）处理且不耗尽，note 非空 |
+| UT-956 | M155/M156 DeepSeek 余额解析 | `TestBalanceParsesDeepSeek` | 多币种取 CNY；无 CNY 取第一项并如实写明币种；`is_available == false` 或 `total_balance <= 0` 即耗尽；字符串与数字金额都接受；`balance_infos` 为空时按未知处理 |
+| UT-957 | M157 启动首查与认证 | `TestBalanceStartupCheck` | 实例启动后立即完成一次查询；余额快照 `amount == "51.01"`、`currency == "CNY"`、`checkedAt > 0`；上游收到的 `Authorization` 为 `Bearer <实例 api_key>`；`/api/stats` 的实例行带 `balance` 字段 |
+| UT-958 | M157 周期轮询 | `TestBalancePeriodicPoll` | `interval = 50ms` 的实例在 3s 内被查询至少 3 次（首查 + 周期） |
+| UT-959 | M15fy minimax_plan 的余额字段 | `TestBalanceStatsMiniMaxPlan` | `/api/stats` 的 `balance` 含 `kind == "minimax_plan"`、`interval5hPercent == 90`、`weekly7dPercent == 97`；订阅额度不产出金额与币种；未耗尽 |
+| UT-960 | M15fz deepseek 的金额与币种 | `TestBalanceStartupCheck`、`TestBalanceParsesDeepSeek` | `balance.amount == "51.01"`、`balance.currency == "CNY"`；无 CNY 时取第一项并写明实际币种 |
+| UT-961 | M15fx/M165 未声明 balance 的实例 | `TestBalanceStatsOmitsFieldWithoutBalance` | `/api/stats` 的实例行不带 `balance` 字段；路由与熔断行为不变 |
+| UT-962 | M158/M15gd 查询失败不改状态 | `TestBalanceCheckFailureKeepsState` | 上游返回 500 与非法 JSON 后状态仍为 `exhausted`；`balance.err` 有原因；上次成功的金额/币种与 `checkedAt` 保持不变 |
+| UT-963 | M160/M15gb 额度恢复 | `TestBalanceRefreshRestoresInstance` | 手动刷新查到有余额后状态回到 `closed`、响应体金额为新值；该实例重新承接请求并返回 200 |
+| UT-964 | M161/M15ga 耗尽实例被跳过 | `TestExhaustedInstanceIsSkipped` | 耗尽实例不承接请求（健康实例请求数 +1）；耗尽行 `state == "exhausted"`、`reason == "quota_exhausted"`、`degradedSince > 0` |
+| UT-965 | M162/M15gc 全耗尽 502 与 recentErrors | `TestAllExhaustedReturns502` | 客户端收到 502，正文含 `all instance quotas exhausted` 与耗尽实例名；上游调用数为 0；`stats` 快照与 `GET /api/stats` 的 `recentErrors[]` 都有一条记录，`error` 为该固定文本、`instName` 为耗尽实例名之一 |
+| UT-966 | M164 状态/数值/失败日志 | `TestBalanceLogs` | 耗尽时打印 `instance <名> quota exhausted` 与 `balance changed: inst=<名>`；恢复时打印 `instance <名> quota restored`；查询失败打印 `balance check failed: inst=<名> err=` |
+| UT-967 | M159/M15ge/M15gf 手动刷新接口 | `TestBalanceRefreshAPI` | 指定 name 返回 200 与该实例刚查询的余额与状态；不指定 name 刷新该协议全部声明了 balance 的实例；非法 protocol 400；不存在的 name 与未声明 balance 的实例 404；未鉴权 401 |
+| UT-968 | M167/M168/M169/M15gg 前端余额列 | `TestBalanceUI` | 两张实例表都有 `<th>余额</th>` 且排在 `<th>状态</th>` 之前；页面含 `stat-balance-clickable`、`点击刷新余额`、`/api/instances/balance`、`刷新中…`、`配额耗尽`、`stat-exhausted`；可视化页面把 `raw.balance` 原样带回 `item.balance`，保存配置时不丢该对象 |
+| UT-969 | M15gh 余额列与 /api/stats 一致 | `TestBalanceStatsMiniMaxPlan`、`TestBalanceUI` | 前端展示值取自 `/api/stats` 的同一个 `balance` 字段（`item.balance`），后端字段与前端渲染同源 |
+| UT-970 | M166/M15gi 余额不落盘 | `TestBalanceNotPersisted` | `stats.json` 全文不含 `balance` 字段 |
+| UT-971 | 回归：未声明 balance 的实例行为不变 | `go test ./... -race -count=1` 全量既有用例 | 既有 state 取值集合、路由顺序、熔断行为与 `/api/stats` 既有字段断言全部未改并通过 |
+| UT-972 | 构建与全量测试 | `go build ./...`、`go vet ./...`、`gofmt -l .`、`go test ./... -race -count=1` | 全部通过 |
+
+### 49.2 场景说明
+
+- 新增用例位于 `internal/proxy/balance_internal_test.go`（`package proxy`）与 `internal/config/balance_test.go`（`package config_test`）。前者用 `balBackend`（可改 payload/状态码的假余额端点）与 `balServer`（本地 HTTP Server）驱动端到端路径，`balNoPoll()` / `balPoll(d)` 把周期设为 0 或指定值；后者只测配置解析，不依赖网络。
+- `TestAllExhaustedReturns502` 断言到两层：`server.monitor.stats.snapshot(...)` 的 `recentErrors` 与 `GET /api/stats` 的 `recentErrors[]`（`balGetRecentErrors`），后者对应 M15gc 的字面口径。
+- `TestBalanceLogs` 复用 `stream_content_idle_internal_test.go` 的 `captureStreamLogs`（同一 package）捕获标准 logger，断言 M164 的三行日志；日志捕获期间其它测试不并行运行。
+- `TestBalanceUI` 读取 `../web/index.html` 做静态契约断言（列位置、文案、类名、刷新接口）；项目暂无浏览器自动化测试，M15gg 的「刷新中禁用重复点击」由 `data-refreshing` 属性与 `刷新中…` 文案间接覆盖。
+- `TestBalancePeriodicPoll` 用 50ms 周期验证 M157 的重复查询；`balancePoller.stop()` 在 `Server.Close` 中取消并等待 goroutine，测试结束不泄漏。

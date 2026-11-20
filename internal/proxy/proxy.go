@@ -50,6 +50,9 @@ const (
 	// §24.15.3 per-instance breaker controls.
 	PathInstancesLock   = "/api/instances/lock"
 	PathInstancesUnlock = "/api/instances/unlock"
+
+	// §24.31 M159: manual balance refresh of one or all instances.
+	PathInstancesBalance = "/api/instances/balance"
 )
 
 // MaxRequestBodyBytes caps how much of a request body is buffered for
@@ -95,6 +98,10 @@ var errLockedHandoff = errors.New("handoff to locked instance")
 // page (§24.29). It is never treated as an upstream failure.
 var errRequestCancelledByOperator = errors.New("request cancelled by operator")
 
+// errAllQuotasExhausted is the client facing error of a request whose whole
+// candidate chain ran out of quota (§24.31 M162).
+const errAllQuotasExhausted = "all instance quotas exhausted"
+
 // instanceRuntime is one configured instance plus its in-memory fallback state.
 type instanceRuntime struct {
 	name         string
@@ -128,6 +135,18 @@ type instanceRuntime struct {
 	// fail over to, so opening would only pin a red state without diverting
 	// traffic. Set from len(protocolRuntime.insts) at construction.
 	singleInstanceProtocol bool
+
+	// §24.31 M153: the optional balance/quota check of this instance. An
+	// empty balanceKind means the instance never takes part in a balance
+	// check. The fields below are guarded by mu.
+	balanceKind     string
+	balanceURL      string
+	balanceInterval time.Duration
+	balanceInfo     balanceInfo
+	// quotaExhausted marks an instance whose quota/balance is used up
+	// (§24.31 M160). It is independent of the breaker counters.
+	quotaExhausted      bool
+	quotaExhaustedSince time.Time
 }
 
 // Fallback defaults (kept for compatibility; the effective values come from
@@ -244,6 +263,25 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Handler, error) {
 			// timeout. Keeping a second client makes lock/unlock take effect on
 			// the next attempt without mutating the unlocked client.
 			lockedClient: newClient(0),
+		}
+		// §24.31 M153: the balance check is opt-in and never inferred from the
+		// provider.
+		if inst.Balance != nil {
+			kind := strings.ToLower(strings.TrimSpace(inst.Balance.Kind))
+			switch kind {
+			case config.BalanceKindMiniMaxPlan, config.BalanceKindDeepSeek:
+			default:
+				return nil, fmt.Errorf("instances[%d]: balance.kind must be %q or %q, got %q",
+					i, config.BalanceKindMiniMaxPlan, config.BalanceKindDeepSeek, inst.Balance.Kind)
+			}
+			ir.balanceKind = kind
+			ir.balanceURL = strings.TrimSpace(inst.Balance.URL)
+			ir.balanceInterval = inst.Balance.PollInterval()
+			ir.balanceInfo = balanceInfo{
+				Kind:              kind,
+				Interval5hPercent: unknownPercent,
+				Weekly7dPercent:   unknownPercent,
+			}
 		}
 		switch proto {
 		case protocolOpenAI:
@@ -962,7 +1000,10 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 	// skipped. §24.19 M45/M46: when every candidate is open the whole chain is
 	// tried from index 0, so a failing head falls through to the next instance.
 	// §24.25 M93: the pinned candidate is never skipped, even when open.
+	// §24.31 M161: exhausted instances never enter the attempts and never take
+	// part in the all-open fallback.
 	var attempts []*candidate
+	var exhaustedCands []*candidate
 	if lockedMode {
 		if lockedCand != nil {
 			attempts = append(attempts, lockedCand)
@@ -970,6 +1011,10 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		var closed, rest []*candidate
 		for _, cand := range chain {
 			if cand == lockedCand {
+				// §24.31 M163: an operator pin wins over the quota state.
+				continue
+			}
+			if cand.inst.isExhausted() {
 				continue
 			}
 			rest = append(rest, cand)
@@ -984,12 +1029,21 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		}
 	} else {
 		for _, cand := range chain {
+			if cand.inst.isExhausted() {
+				exhaustedCands = append(exhaustedCands, cand)
+				continue
+			}
 			if !cand.inst.isOpen() {
 				attempts = append(attempts, cand)
 			}
 		}
-		if len(attempts) == 0 && len(chain) > 0 {
-			attempts = append(attempts, chain...)
+		if len(attempts) == 0 {
+			for _, cand := range chain {
+				if cand.inst.isExhausted() {
+					continue
+				}
+				attempts = append(attempts, cand)
+			}
 		}
 	}
 
@@ -997,7 +1051,10 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 	// separates the rounds so the monitor reports the right retry reason.
 	plan := attempts
 	fallbackStart := len(attempts)
-	if !lockedMode {
+	// §24.31 M162: every candidate of the chain is out of quota, so the
+	// request cannot be served at all.
+	allExhausted := len(attempts) == 0 && len(exhaustedCands) > 0
+	if !lockedMode && !allExhausted {
 		seen := make(map[*instanceRuntime]bool, len(insts))
 		for _, cand := range attempts {
 			seen[cand.inst] = true
@@ -1015,6 +1072,10 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 				continue
 			}
 			seen[inst] = true
+			// §24.31 M161: an instance without quota is never called.
+			if inst.isExhausted() {
+				continue
+			}
 			cand := byInst[inst]
 			if cand == nil {
 				cand = fallbackCandidate(proto, inst, body)
@@ -1079,6 +1140,25 @@ func (h *Handler) serveChain(w http.ResponseWriter, r *http.Request, proto proto
 		}
 		tracker.end(finalStatus, finalErr, finalMetrics)
 	}()
+
+	// §24.31 M162: no candidate left because every one of them ran out of
+	// quota. The client gets a 502 naming the exhausted instances.
+	if allExhausted {
+		names := make([]string, 0, len(exhaustedCands))
+		for _, cand := range exhaustedCands {
+			names = append(names, cand.inst.name)
+		}
+		finalStatus = http.StatusBadGateway
+		finalErr = errors.New(errAllQuotasExhausted)
+		finalMetrics = attemptMetrics{instName: names[0], reqModel: reqModel}
+		tracker.begin(exhaustedCands[0])
+		writeProtocolError(w, proto, http.StatusBadGateway,
+			errAllQuotasExhausted+": "+strings.Join(names, ", "))
+		log.Printf("%s %s -> (%s) total=%ss status=502 %s", r.Method, r.URL.Path, proto,
+			formatSeconds(time.Since(start)), errAllQuotasExhausted)
+		logRequest(r, finalMetrics, time.Since(start))
+		return
+	}
 
 	// last is the candidate that failed before any response was written. Its
 	// model information goes into the final log line so that a failed routed
@@ -2986,6 +3066,10 @@ type Server struct {
 	monitor    *monitorHub
 	sessions   *sessionStore
 	startedAt  time.Time
+	// §24.31 M157: the periodic balance checks of the current state.
+	balanceMu     sync.Mutex
+	balanceClient *http.Client
+	balances      *balancePoller
 }
 
 type serverState struct {
@@ -3002,6 +3086,8 @@ func NewServer(configPath string, cfg *config.Config) (*Server, error) {
 		monitor:    newMonitorHub(),
 		sessions:   newSessionStore(),
 		startedAt:  startedAt,
+		// §24.31 M154: the balance query has its own fixed timeout.
+		balanceClient: newBalanceClient(),
 	}
 	s.monitor.startedAt = startedAt
 	s.monitor.statsSource = s.statsSnapshot
@@ -3012,7 +3098,25 @@ func NewServer(configPath string, cfg *config.Config) (*Server, error) {
 		return nil, err
 	}
 	s.state.Store(st)
+	s.startBalanceChecks(st)
 	return s, nil
+}
+
+// startBalanceChecks (re)starts the periodic balance checks of st (§24.31 M157).
+// The first check of every instance runs right away so the state is known
+// within seconds of the startup.
+func (s *Server) startBalanceChecks(st *serverState) {
+	s.balanceMu.Lock()
+	defer s.balanceMu.Unlock()
+	if s.balances != nil {
+		s.balances.stop()
+		s.balances = nil
+	}
+	var insts []*instanceRuntime
+	for _, proto := range []protocol{protocolOpenAI, protocolAnthropic} {
+		insts = append(insts, st.handler.byProtocol[proto]...)
+	}
+	s.balances = newBalancePoller(s.balanceClient, insts)
 }
 
 func buildState(cfg *config.Config, monitor *monitorHub) (*serverState, error) {
@@ -3034,6 +3138,13 @@ func (s *Server) StartPersistence() {
 // idempotent.
 func (s *Server) Close() {
 	s.monitor.stats.stopPersistence()
+	// §24.31 M157: the balance checks stop with the server.
+	s.balanceMu.Lock()
+	if s.balances != nil {
+		s.balances.stop()
+		s.balances = nil
+	}
+	s.balanceMu.Unlock()
 }
 
 func (s *Server) reload() error {
@@ -3046,6 +3157,7 @@ func (s *Server) reload() error {
 		return err
 	}
 	s.state.Store(st)
+	s.startBalanceChecks(st)
 	return nil
 }
 
@@ -3160,6 +3272,8 @@ func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request, st *serverSt
 		s.serveInstanceLock(w, r, st)
 	case PathInstancesUnlock:
 		s.serveInstanceUnlock(w, r, st)
+	case PathInstancesBalance:
+		s.serveInstanceBalance(w, r, st)
 	case PathStatsClear:
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodPost)

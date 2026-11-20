@@ -10,13 +10,13 @@ import (
 
 func TestListContainsBuiltinProviders(t *testing.T) {
 	list := providers.List()
-	if len(list) != 11 {
-		t.Fatalf("len(List()) = %d, want 11", len(list))
+	if len(list) != 12 {
+		t.Fatalf("len(List()) = %d, want 12", len(list))
 	}
 
 	wantIDs := []string{
 		"deepseek", "openai", "anthropic", "zhipu", "volcengine", "moonshot",
-		"dashscope", "siliconflow", "groq", "mistral", "xai",
+		"dashscope", "siliconflow", "groq", "mistral", "xai", "minimax",
 	}
 	seen := make(map[string]bool, len(list))
 	for _, provider := range list {
@@ -68,6 +68,39 @@ func TestGet(t *testing.T) {
 	}
 	if _, ok := providers.Get("no-such-provider"); ok {
 		t.Error("Get(no-such-provider) succeeded, want miss")
+	}
+}
+
+// TestMiniMaxPreset covers §24.30 M150: the domestic MiniMax preset carries
+// both base URLs and needs no models_override.
+func TestMiniMaxPreset(t *testing.T) {
+	provider, ok := providers.Get("minimax")
+	if !ok {
+		t.Fatal("Get(minimax) failed")
+	}
+	if provider.Name != "MiniMax" {
+		t.Errorf("minimax name = %q, want MiniMax", provider.Name)
+	}
+	if want := "https://api.minimax.cn/v1"; provider.OpenAIBaseURL != want {
+		t.Errorf("minimax openai_base_url = %q, want %q", provider.OpenAIBaseURL, want)
+	}
+	if want := "https://api.minimax.cn/anthropic"; provider.AnthropicBaseURL != want {
+		t.Errorf("minimax anthropic_base_url = %q, want %q", provider.AnthropicBaseURL, want)
+	}
+	if provider.ModelsOverride != nil {
+		t.Errorf("minimax models_override = %+v, want none", provider.ModelsOverride)
+	}
+	if _, ok := providers.GetModelsOverride("minimax", "openai"); ok {
+		t.Error("minimax has an openai override, want none")
+	}
+	if _, ok := providers.GetModelsOverride("minimax", "anthropic"); ok {
+		t.Error("minimax has an anthropic override, want none")
+	}
+	// §24.30 M150: MiniMax has no models_override, so ModelsSource falls back
+	// to the base URL the caller passes in.
+	url, auth := providers.ModelsSource("minimax", "anthropic", "https://fallback.example", "bearer")
+	if url != "https://fallback.example" || auth != "bearer" {
+		t.Errorf("ModelsSource(minimax, anthropic) = %q/%q, want the fallback", url, auth)
 	}
 }
 
